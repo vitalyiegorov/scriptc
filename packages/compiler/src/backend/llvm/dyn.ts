@@ -1166,10 +1166,13 @@ export class LlDyn {
         `${table} = private unnamed_addr constant [${types.length} x { ptr, ${this.S} }] [${entries.join(", ")}]`,
         ``,
       );
-      this.host.declare(`declare zeroext i1 @scr_dyn_typed_ref_in(ptr, ptr, ${this.S})`);
+      // The last key constant that matched by pointer is remembered per
+      // table: a site mostly sees one class.
+      this.defs.push(`${table}.hit = private global ptr null`, ``);
+      this.host.declare(`declare zeroext i1 @scr_dyn_typed_ref_in_cached(ptr, ptr, ${this.S}, ptr)`);
       const any = B.tmp();
       B.line(
-        `${any} = call zeroext i1 @scr_dyn_typed_ref_in(ptr %d, ptr ${table}, ${this.S} ${types.length})`,
+        `${any} = call zeroext i1 @scr_dyn_typed_ref_in_cached(ptr %d, ptr ${table}, ${this.S} ${types.length}, ptr ${table}.hit)`,
       );
       return any;
     }

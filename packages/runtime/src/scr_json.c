@@ -4287,13 +4287,33 @@ typedef struct {
  * A capsule boxed by the emitting program carries the key constant itself,
  * so the pointers decide it; the bytes are compared only for entries of
  * the capsule's own length (a key from another unit or the runtime). */
+bool scr_dyn_typed_ref_in_cached(const ScrDyn *d, const void *table, size_t n, const char **hit) {
+  if (!d || d->kind != SCR_DYN_TYPED_REF) return false;
+  const char *key = d->v.typed_ref.type_key;
+  /* `*hit` only ever holds a key constant of this table that matched by
+   * pointer, so it stays valid and the answer for it stays true. */
+  if (key == *hit) return true;
+  const ScrTypeKeyEntry *keys = table;
+  for (size_t i = 0; i < n; i++)
+    if (keys[i].key == key) {
+      *hit = key;
+      return true;
+    }
+  return scr_dyn_typed_ref_in(d, table, n);
+}
+
 bool scr_dyn_typed_ref_in(const ScrDyn *d, const void *table, size_t n) {
   if (!d || d->kind != SCR_DYN_TYPED_REF) return false;
   const ScrTypeKeyEntry *keys = table;
   const char *key = d->v.typed_ref.type_key;
   size_t len = d->v.typed_ref.type_key_len;
+  /* Pointer pass first: a capsule boxed by the emitting program carries the
+   * key constant itself, so a hit costs a compare per entry; the byte
+   * comparisons are left for keys from another unit and for misses. */
   for (size_t i = 0; i < n; i++)
-    if (keys[i].key == key || (keys[i].len == len && memcmp(keys[i].key, key, len) == 0)) return true;
+    if (keys[i].key == key) return true;
+  for (size_t i = 0; i < n; i++)
+    if (keys[i].len == len && memcmp(keys[i].key, key, len) == 0) return true;
   return false;
 }
 
@@ -4636,7 +4656,13 @@ static bool scr_typed_ref_record_field(const ScrDynTypedRecordOps *ops, const Sc
 
 /* +1 own field value, or NULL when `key` is not a present field. */
 static ScrDyn *scr_typed_ref_record_get(const ScrDyn *d, const ScrStr *key) {
-  const ScrDynTypedRecordOps *ops = scr_typed_ref_record_ops(d);
+  /* A declared field is read from the native record even when a snapshot
+   * exists: a read refreshes the snapshot from the native value before it
+   * answers, and a write through the snapshot is committed to it, so the
+   * native field is what the refreshed snapshot would hold. */
+  const ScrDynTypedRecordOps *ops = d->v.typed_ref.record
+      ? (const ScrDynTypedRecordOps *)(const void *)d->v.typed_ref.array : NULL;
+  if (ops && ops->select) ops = ops->select(d->v.typed_ref.ptr);
   size_t index;
   if (!ops || !scr_typed_ref_record_field(ops, key, &index)) return NULL;
   if (!ops->fixed && !ops->has(d->v.typed_ref.ptr, index)) return NULL;
@@ -4748,7 +4774,18 @@ ScrDyn *scr_dyn_date_class_member(const ScrDyn *d, const char *key, size_t key_l
 }
 
 ScrDyn *scr_dyn_typed_ref_key_get(const ScrDyn *d, const ScrStr *key) {
-  if (d->v.typed_ref.record) return scr_typed_ref_record_get(d, key);
+  if (d->v.typed_ref.record) {
+    ScrDyn *value = scr_typed_ref_record_get(d, key);
+    if (value) return value;
+    /* A live record (no snapshot, no undeclared properties, the default
+     * prototype) that does not hold the key and whose prototype chain
+     * cannot answer it reads undefined: the snapshot the generic path
+     * would build to learn that costs an object and a copy of every field. */
+    if (scr_typed_ref_record_ops(d) && !d->prototype && !scr_dyn_object_proto_name(key) &&
+        (!scr_record_source_count || !scr_record_source_find(d->v.typed_ref.ptr)))
+      return scr_dyn_retain(scr_dyn_undefined());
+    return NULL;
+  }
   if (scr_event_ref_hooks) {
     ScrDyn *inherited = scr_event_ref_hooks->get(d, key);
     if (inherited) return inherited;

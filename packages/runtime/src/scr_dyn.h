@@ -1107,6 +1107,7 @@ bool scr_dyn_typed_ref_is(
     const ScrDyn *d, const char *type_key, size_t type_key_len);
 /* d is a capsule whose type key is among n {const char *, size_t} entries. */
 bool scr_dyn_typed_ref_in(const ScrDyn *d, const void *table, size_t n);
+bool scr_dyn_typed_ref_in_cached(const ScrDyn *d, const void *table, size_t n, const char **hit);
 bool scr_dyn_typed_ref_is_key(const ScrDyn *d, const ScrStr *type_key);
 void *scr_dyn_typed_ref_unbox(const ScrDyn *d); /* +1 */
 ScrDyn *scr_dyn_class_view_unavailable(void *ptr);
