@@ -1,4 +1,5 @@
 /* Focused LLVM library-call emission extracted from emitter.ts. */
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import { InternalCompilerError } from "../../errors.js";
 import { undefinedArmTag } from "../../ir/analysis.js";
 import { F64, type IrType, RUNTIME_ERROR_CLASSES, STRING, typeKey } from "../../ir/ir.js";
@@ -511,7 +512,7 @@ function boundCallbackThunk(host: LlvmEmitterContext, cbT: IrType & { kind: "fun
     `entry:`,
     `  %cb = call ptr @scr_als_bound_target(ptr %self)`,
     `  %prev = call ptr @scr_als_bound_enter(ptr %self)`,
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     ret === "void" ? `  ${call}` : `  %r = ${call}`,
     `  call void @scr_als_bound_leave(ptr %prev, ptr %cb)`,

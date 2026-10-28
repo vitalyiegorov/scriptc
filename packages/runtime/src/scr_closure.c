@@ -204,6 +204,12 @@ static void scr_closure_trace(void *o, ScrTraceVisit visit, void *ctx) {
     }
   }
   visit(c->props, ctx);
+  /* The boxed view's own edges (ScrDyn.prototype and symbol tables). */
+  if (c->dyn_self != NULL) {
+    if (c->dyn_prototype) visit(c->dyn_prototype, ctx);
+    if (c->dyn_symbol_properties) visit(c->dyn_symbol_properties, ctx);
+    if (c->dyn_symbol_keys) visit(c->dyn_symbol_keys, ctx);
+  }
 }
 
 static void scr_closure_gcfree(void *o) {
@@ -255,6 +261,7 @@ static inline __attribute__((always_inline)) ScrClosure *scr_closure_alloc(void 
     for (size_t i = 0; i < ncaps; i++) c->caps[i] = NULL;
   }
   c->rc = 1;
+  c->dyn_self = NULL; /* not boxed: every other dyn_* field is set at the first boxing */
   c->fn = fn;
   c->ncaps = ncaps;
   c->props = NULL; /* lazily allocated by Object.defineProperties */
@@ -287,8 +294,13 @@ void scr_closure_adopt_identity(ScrClosure *adapter, ScrClosure *original, uint3
   adapter->identity_length = original->identity != NULL ? original->identity_length : length;
 }
 
-static void scr_closure_destroy(void *object) {
+/* Releases the boxed view's prototype and symbol tables (scr_json.c sets
+ * this: a closure that was never boxed needs no dynamic unit). */
+void (*scr_closure_boxed_release)(ScrClosure *);
+
+void scr_closure_destroy(void *object) {
   ScrClosure *c = object;
+  if (c->dyn_self != NULL && scr_closure_boxed_release != NULL) scr_closure_boxed_release(c);
   if (c->embedded == 0) {
     for (size_t i = 0; i < c->ncaps; i++) scr_box_release(c->caps[i]);
   } else {

@@ -850,9 +850,21 @@ static void scr_rgn_walk_closure(ScrRgnWalk *w, ScrClosure *c) {
     else scr_rgn_enter(w, c->caps[i], SCR_RGN_W_BOX, NULL);
   }
   scr_rgn_enter(w, c->props, SCR_RGN_W_BOX, NULL);
+  /* A boxed closure is its own dyn value: its prototype and symbol tables
+   * are edges of this one object. */
+  if (c->dyn_self != NULL) {
+    scr_rgn_enter(w, c->dyn_prototype, SCR_RGN_W_DYN, NULL);
+    scr_rgn_enter(w, c->dyn_symbol_properties, SCR_RGN_W_DYN, NULL);
+    scr_rgn_enter(w, c->dyn_symbol_keys, SCR_RGN_W_DYN, NULL);
+  }
 }
 
 static void scr_rgn_walk_dyn(ScrRgnWalk *w, ScrDyn *d) {
+  /* The boxed view of a closure is the closure: no edge to itself. */
+  if (d->kind == SCR_DYN_FUNC && d->v.fn.clo == (ScrClosure *)d) {
+    scr_rgn_walk_closure(w, (ScrClosure *)d);
+    return;
+  }
   switch (d->kind) {
   case SCR_DYN_ARR:
     for (size_t i = 0; i < d->v.arr.len; i++)

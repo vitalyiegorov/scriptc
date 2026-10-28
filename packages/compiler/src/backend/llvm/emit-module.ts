@@ -1,4 +1,5 @@
 /* LlEmitter's module-level output: module parts, helper definitions, library declarations and FFI callback definitions. */
+import { CLOSURE_FIELD, closureTypeDef } from "./closure-layout.js";
 import { relieveHeapPressure } from "../../heap-pressure.js";
 import { emitWasmModules } from "./wasm-modules.js";
 import { type LlEmitter, ffiCallbackDummyLl, llStrBytes } from "./emitter.js";
@@ -333,12 +334,12 @@ export function emitModuleParts(emitter: LlEmitter): string[] {
       );
     });
     fnValueProps.forEach((name, i) => {
-      // props sits at %ScrClosure field 3; release is NULL-tolerant —
+      // props sits at %ScrClosure field CLOSURE_FIELD.props; release is NULL-tolerant —
       // cleared so a second release path stays idempotent.
       lines.push(
-        `  %${prefix}fp${i} = load ptr, ptr getelementptr inbounds (%ScrClosure, ptr @${mangleFnClosure(name)}, i64 0, i32 3)`,
+        `  %${prefix}fp${i} = load ptr, ptr getelementptr inbounds (%ScrClosure, ptr @${mangleFnClosure(name)}, i64 0, i32 ${CLOSURE_FIELD.props})`,
         `  call void @scr_box_release(ptr %${prefix}fp${i}) ; ${name}.props`,
-        `  store ptr null, ptr getelementptr inbounds (%ScrClosure, ptr @${mangleFnClosure(name)}, i64 0, i32 3)`,
+        `  store ptr null, ptr getelementptr inbounds (%ScrClosure, ptr @${mangleFnClosure(name)}, i64 0, i32 ${CLOSURE_FIELD.props})`,
       );
     });
     for (const name of emitter.classObjs.keys())
@@ -619,7 +620,7 @@ export function emitModuleParts(emitter: LlEmitter): string[] {
     `%ScrLogArg = type { i32, i64 }`,
     `%ScrVt = type { ${emitter.sizeType}, ${emitter.sizeType}, ptr }`,
     `%ScrUnion = type { ${emitter.sizeType}, i32, ptr, ptr, ptr, i64 }`,
-    `%ScrClosure = type { ${emitter.sizeType}, ptr, ${emitter.sizeType}, ptr, i32, i32, ptr, ptr, i32 }`,
+    closureTypeDef(emitter.sizeType),
     `%ScrFfiTable = type { ptr, ${emitter.sizeType}, ${emitter.sizeType}, ptr, i8, ptr, ptr, ${emitter.sizeType}, ${emitter.sizeType}, ${emitter.sizeType}, ptr, ptr }`,
     `%ScrRegex = type { ${emitter.sizeType}, ptr, ptr, ptr, double, ptr, ptr, ptr }`,
     // ScrArr mirrors scr_runtime.h field-for-field: { rc, len (i32), cap
@@ -2252,7 +2253,7 @@ export function emitFfiCallbackDefs(emitter: LlEmitter): { globals: string[]; de
       const dispatchBody: string[] = [
         `define internal void @${dispatch}(ptr %cb, ptr %call) ${FN_ATTRS} {`,
         `entry:`,
-        `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+        `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
         `  %fn = load ptr, ptr %fnp`,
       ];
       for (let i = 0; i < cb.params.length; i++) {
@@ -2413,7 +2414,7 @@ export function emitFfiCallbackDefs(emitter: LlEmitter): { globals: string[]; de
       );
     }
     defs.push(
-      `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+      `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
       `  %fn = load ptr, ptr %fnp`,
     );
     const scriptArgs: string[] = [];

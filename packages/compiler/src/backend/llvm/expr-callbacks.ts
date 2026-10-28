@@ -1,4 +1,5 @@
 /* Focused LLVM expression emission extracted from emitter.ts. */
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import { InternalCompilerError } from "../../errors.js";
 import {
   type IrType,
@@ -497,7 +498,7 @@ export function childExitThunkFor(host: LlvmEmitterContext, param: IrType): stri
     `  br label %go`,
     `go:`,
     `  %u = load ptr, ptr %slot`,
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  call void %fn(ptr %cb, ptr %u)`,
     `  ret void`,
@@ -565,7 +566,7 @@ export function childExitSignalThunkFor(
     `go:`,
     `  %u = load ptr, ptr %uslot`,
     `  %s = load ptr, ptr %sslot`,
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  call void %fn(ptr %cb, ptr %u, ptr %s)`,
     `  ret void`,
@@ -633,7 +634,7 @@ export function execFileThunkFor(host: LlvmEmitterContext, cbT: IrType & { kind:
   if (cbT.params.length < 2) d.push(`  call void @scr_str_release(ptr %out)`);
   if (cbT.params.length < 3) d.push(`  call void @scr_str_release(ptr %stderr)`);
   d.push(
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  call void %fn(ptr %cb${errorParam !== undefined ? ", ptr %e" : ""}${cbT.params.length >= 2 ? ", ptr %out" : ""}${cbT.params.length >= 3 ? ", ptr %stderr" : ""})`,
     `  ret void`,
@@ -683,7 +684,7 @@ export function ipcMessageThunkFor(
     passed = `, ${ty} %value`;
   }
   d.push(
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
   );
   const retTy = host.llType(cbT.ret);
@@ -715,7 +716,7 @@ export function ipcSendThunkFor(host: LlvmEmitterContext, cbT: IrType & { kind: 
     host.declare(`declare void @scr_error_release(ptr)`);
     d.push(
       `  call void @scr_error_release(ptr %error)`,
-      `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+      `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
       `  %fn = load ptr, ptr %fnp`,
       `  call void %fn(ptr %cb)`,
     );
@@ -747,7 +748,7 @@ export function ipcSendThunkFor(host: LlvmEmitterContext, cbT: IrType & { kind: 
       `  br label %invoke`,
       `invoke:`,
       `  %value = load ptr, ptr %slot`,
-      `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+      `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
       `  %fn = load ptr, ptr %fnp`,
       `  call void %fn(ptr %cb, ptr %value)`,
     );
@@ -781,7 +782,7 @@ export function childDataThunkFor(host: LlvmEmitterContext, param: IrType): stri
     `entry:`,
     `  %r = call ptr @scr_bytes_retain_v(ptr %chunk)`,
     `  %u = call ptr @scr_union_new_ref(i32 ${bytesTag}, ptr %r, ptr @scr_bytes_retain_v, ptr @scr_bytes_release_v, ptr null)`,
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  call void %fn(ptr %cb, ptr %u)`,
     `  ret void`,
@@ -808,7 +809,7 @@ export function childDataDynThunkFor(host: LlvmEmitterContext, chunk: "bytes" | 
     `define internal void @${sym}(ptr %cb, ptr %chunk) ${FN_ATTRS} { ; child 'data' → dyn (${chunk})`,
     `entry:`,
     `  %d = call ptr @${box}(ptr %chunk)`,
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  call void %fn(ptr %cb, ptr %d)`,
     `  ret void`,
@@ -865,7 +866,7 @@ export function emitterFixedAdapter(
     }
   });
   d.push(
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %orig, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %orig, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
   );
   const retTy = host.llType(cbT.ret);
@@ -937,7 +938,7 @@ export function emitterOnceAdapter(
     }
   });
   d.push(
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %boxer, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %boxer, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  %arr = call ptr %fn(${passed.join(", ")}) ; the boxed arguments, +1`,
     `  call void @scr_closure_release(ptr %boxer)`,
@@ -1051,7 +1052,7 @@ export function closeBindThunkFor(
       `  %capsp = getelementptr inbounds %ScrClosure, ptr %self, i64 1`,
       `  %bx = load ptr, ptr %capsp`,
       `  %inner = call ptr @scr_box_get_ref(ptr %bx) ; +1`,
-      `  %fnp = getelementptr inbounds %ScrClosure, ptr %inner, i64 0, i32 1`,
+      `  %fnp = getelementptr inbounds %ScrClosure, ptr %inner, i64 0, i32 ${CLOSURE_FIELD.fn}`,
       `  %fn = load ptr, ptr %fnp`,
       `  call void %fn(ptr %inner, ptr ${host.unitInstanceRef(errParam.unionId, undefTag)})`,
       `  call void @scr_closure_release(ptr %inner)`,
@@ -1139,7 +1140,7 @@ export function closeOverrideWrapFor(
     `  %capsp = getelementptr inbounds %ScrClosure, ptr %self, i64 1`,
     `  %bx = load ptr, ptr %capsp`,
     `  %inner = call ptr @scr_box_get_ref(ptr %bx) ; +1`,
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %inner, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %inner, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     ...(retServer
       ? [

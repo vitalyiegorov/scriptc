@@ -1,3 +1,4 @@
+import { immortalClosureInit } from "./closure-layout.js";
 import type { TargetCpu } from "../target-cpu.js";
 import { emitCapsuleLadder } from "./capsule-ladder.js";
 import { relieveHeapPressure } from "../../heap-pressure.js";
@@ -2574,7 +2575,7 @@ export class LlEmitter {
         ret === "void" ? `  ${call}` : `  %r = ${call}`,
         ret === "void" ? `  ret void` : `  ret ${ret} %r`,
         `}`,
-        `@${mangleFnClosure(name)} = internal ${this.mod.workers === true || this.mod.lib?.threadInstances === true ? "thread_local " : ""}global %ScrClosure { ${this.sizeType} -1, ptr @${mangleWrapper(name)}, ${this.sizeType} 0, ptr null, i32 ${(fn.generator ? 1 : 0) + (fn.async ? 2 : 0) + (fn.ownsPrototype ? 4 : 0)}, i32 0, ptr null, ptr ${lending ? `@${mangleBorrowingWrapper(name)}` : "null"}, i32 0 }`,
+        `@${mangleFnClosure(name)} = internal ${this.mod.workers === true || this.mod.lib?.threadInstances === true ? "thread_local " : ""}global %ScrClosure ${immortalClosureInit(this.sizeType, { fn: `@${mangleWrapper(name)}`, functionKind: (fn.generator ? 1 : 0) + (fn.async ? 2 : 0) + (fn.ownsPrototype ? 4 : 0), fnBorrowed: lending ? `@${mangleBorrowingWrapper(name)}` : "null" })}`,
         ``,
       );
       if (lending)

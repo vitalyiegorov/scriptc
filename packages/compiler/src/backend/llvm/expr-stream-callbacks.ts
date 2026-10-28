@@ -1,4 +1,5 @@
 /* Focused LLVM expression emission extracted from emitter.ts. */
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import { InternalCompilerError } from "../../errors.js";
 import { type IrType, isRefCounted, typeKey } from "../../ir/ir.js";
 import { FN_ATTRS, releaseSym, retainSym, traceArg } from "./shapes.js";
@@ -49,7 +50,7 @@ export function streamDataAdapter(
   ];
   const finishTyped = (arg: string, argTy: string): void => {
     d.push(
-      `  %fnp = getelementptr inbounds %ScrClosure, ptr %orig, i64 0, i32 1`,
+      `  %fnp = getelementptr inbounds %ScrClosure, ptr %orig, i64 0, i32 ${CLOSURE_FIELD.fn}`,
       `  %fn = load ptr, ptr %fnp`,
     );
     const retTy = host.llType(cbT.ret);
@@ -68,7 +69,7 @@ export function streamDataAdapter(
   };
   const finish = (arg: string | null): void => {
     d.push(
-      `  %fnp = getelementptr inbounds %ScrClosure, ptr %orig, i64 0, i32 1`,
+      `  %fnp = getelementptr inbounds %ScrClosure, ptr %orig, i64 0, i32 ${CLOSURE_FIELD.fn}`,
       `  %fn = load ptr, ptr %fnp`,
     );
     const retTy = host.llType(cbT.ret);
@@ -415,7 +416,7 @@ export function fsRenameThunkFor(host: LlvmEmitterContext, cbT: IrType & { kind:
     `  br label %go`,
     `go:`,
     `  %arg = load ptr, ptr %slot`,
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  call void %fn(ptr %cb, ptr %arg)`,
     `  ret void`,
@@ -491,7 +492,7 @@ export function cryptoIntThunkFor(
     throw new InternalCompilerError("llvm emitter bug: randomInt callback value param");
   }
   d.push(
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  call void %fn(${passed.join(", ")})`,
     `  ret void`,
@@ -622,7 +623,7 @@ export function zlibBytesThunkFor(
     throw new InternalCompilerError("llvm emitter bug: zlib callback value param");
   }
   d.push(
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
     `  call void %fn(${passed.join(", ")})`,
     `  ret void`,
@@ -940,7 +941,7 @@ export function streamCbThunkFor(
     }
   }
   d.push(
-    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1`,
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     `  %fn = load ptr, ptr %fnp`,
   );
   const retTy = host.llType(cbT.ret);

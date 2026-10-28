@@ -1,3 +1,4 @@
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import { InternalCompilerError } from "../../errors.js";
 import { STRING, type IrType } from "../../ir/ir.js";
 import { mangleRecordNew, mangleRecordStruct } from "../mangle.js";
@@ -43,7 +44,7 @@ function messageAdapter(host: LlvmEmitterContext, type: IrType): string {
     `  %record = call ptr @${mangleRecordNew(type.shapeId)}()`,
     ...lines,
     "  %owned = call ptr @scr_bytes_retain_v(ptr %message)",
-    "  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1",
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     "  %fn = load ptr, ptr %fnp",
     "  call void %fn(ptr %cb, ptr %owned, ptr %record)",
     "  ret void",
@@ -90,7 +91,7 @@ function lookupAdapter(host: LlvmEmitterContext, cb: LlValue): string {
     "join:",
     `  %result = phi ptr [ %boxed, %error ], [ ${host.unitInstanceRef(error.unionId, nullTag)}, %success ]`,
     ...(arity >= 2 ? ["  %owned.address = call ptr @scr_str_retain_v(ptr %address)"] : []),
-    "  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1",
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     "  %fn = load ptr, ptr %fnp",
     `  call void %fn(ptr %cb, ptr %result${arity >= 2 ? ", ptr %owned.address" : ""}${arity >= 3 ? ", double %family" : ""})`,
     "  ret void",

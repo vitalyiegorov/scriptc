@@ -1,3 +1,4 @@
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import { InternalCompilerError } from "../../errors.js";
 import { typeKey } from "../../ir/ir.js";
 import type { LibCallExpr, LlValue, LlvmEmitterContext } from "./expr-context.js";
@@ -32,7 +33,7 @@ function connectAdapter(host: LlvmEmitterContext, cb: LlValue, h2: boolean): str
     "entry:",
     ...(!h2 && !third ? ["  call void @scr_bytes_release(ptr %head)"] : []),
     `  %union = call ptr @scr_union_new_ref(i32 ${tag}, ptr %value, ptr @${retain}, ptr @${release}, ptr null)`,
-    "  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 1",
+    `  %fnp = getelementptr inbounds %ScrClosure, ptr %cb, i64 0, i32 ${CLOSURE_FIELD.fn}`,
     "  %fn = load ptr, ptr %fnp",
     `  call void %fn(ptr %cb, ptr %request, ptr %union${third ? ", ptr %head" : ""})`,
     "  ret void",

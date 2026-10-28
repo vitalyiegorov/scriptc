@@ -35,7 +35,7 @@
   X(cen_o_obj) X(cen_o_arr) X(cen_o_func) X(cen_o_str) X(cen_o_numheap) X(cen_o_numimm)           \
   X(cen_o_boolnull) X(cen_o_other) X(cen_a_obj) X(cen_a_arr) X(cen_a_func) X(cen_a_str)           \
   X(cen_a_numheap) X(cen_a_numimm) X(cen_a_boolnull) X(cen_a_other)                       \
-  X(cen_box_num) X(cen_box_typed) X(cen_box_promise) X(cen_box_handle) X(cen_box_other)
+  X(func_boxed_inline) X(func_reboxed) X(func_side_node) X(cen_box_num) X(cen_box_typed) X(cen_box_promise) X(cen_box_handle) X(cen_box_other)
 
 #ifdef SCR_STATS
 #include <stdint.h>

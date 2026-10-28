@@ -1146,7 +1146,7 @@ static double sort_nan(ScrClosure *self) {
 }
 
 static void test_comparator_sort(void) {
-  ScrClosure floor_fn = {SIZE_MAX, (void *)sort_by_floor, 0, NULL, 0};
+  ScrClosure floor_fn = {.rc = SIZE_MAX, .fn = (void *)sort_by_floor};
   ScrArr *nums = scr_arr_new(SCR_ELEM_F64, 0);
   const double input[] = {3.1, 1.1, 2.1, 1.2, 9.1, 3.2, 0.1, 1.3, 2.2, 8.1, 7.1, 6.1,
                           5.1, 4.1, 3.3, 2.3, 1.4, 0.2, 9.2, 8.2, 7.2, 6.2, 5.2, 4.2};
@@ -1162,8 +1162,8 @@ static void test_comparator_sort(void) {
   check(ordered, "comparator sort orders keys and keeps equal keys stable");
   check_f64(scr_arr_get_f64(nums, (double)n), -1, "comparator sort leaves slots past the count");
 
-  ScrClosure one_fn = {SIZE_MAX, (void *)sort_one_arg, 0, NULL, 0};
-  ScrClosure nan_fn = {SIZE_MAX, (void *)sort_nan, 0, NULL, 0};
+  ScrClosure one_fn = {.rc = SIZE_MAX, .fn = (void *)sort_one_arg};
+  ScrClosure nan_fn = {.rc = SIZE_MAX, .fn = (void *)sort_nan};
   ScrArr *few = scr_arr_new(SCR_ELEM_F64, 0);
   for (int i = 0; i < 5; i++) scr_arr_push_f64(few, 5 - i);
   sort_calls = 0;
@@ -1179,7 +1179,7 @@ static void test_comparator_sort(void) {
   scr_arr_release(nums);
 
   long strings0 = scr_str_live_count();
-  ScrClosure length_fn = {SIZE_MAX, (void *)sort_by_length, 0, NULL, 0};
+  ScrClosure length_fn = {.rc = SIZE_MAX, .fn = (void *)sort_by_length};
   ScrArr *words = scr_arr_new(SCR_ELEM_STR, 0);
   const char *spellings[] = {"ccc", "a", "bb", "dddd", "e", "ff", "ggg", "h",
                              "iiiii", "jj", "k", "llll", "mmm", "n", "oo", "p",
@@ -1262,8 +1262,8 @@ static double dense_observe(ScrClosure *self, double a, double b) {
 }
 
 static void test_dense_comparator_sort(void) {
-  ScrClosure floor_fn = {SIZE_MAX, (void *)sort_by_floor, 0, NULL, 0};
-  ScrClosure observe_fn = {SIZE_MAX, (void *)dense_observe, 0, NULL, 0};
+  ScrClosure floor_fn = {.rc = SIZE_MAX, .fn = (void *)sort_by_floor};
+  ScrClosure observe_fn = {.rc = SIZE_MAX, .fn = (void *)dense_observe};
   ScrArr *nums = scr_arr_new(SCR_ELEM_F64, 0);
   for (int i = 0; i < 100; i++) scr_arr_push_f64(nums, (double)((i * 37) % 100) + (i % 2) * 0.5);
   scr_arr_push_f64(nums, 9); /* keys stay distinct by floor */
@@ -1304,7 +1304,7 @@ static void test_dense_comparator_sort(void) {
   scr_arr_release(nums);
 
   long strings0 = scr_str_live_count();
-  ScrClosure length_fn = {SIZE_MAX, (void *)dense_by_length, 0, NULL, 0};
+  ScrClosure length_fn = {.rc = SIZE_MAX, .fn = (void *)dense_by_length};
   const char *spellings[] = {"ccc", "a", "bb", "dddd", "e", "ff", "ggg", "h", "iiiii", "jj",
                              "k", "llll", "mmm", "n", "oo", "p", "qqq", "r", "ss", "t"};
   const size_t count = sizeof(spellings) / sizeof(*spellings);
@@ -1881,8 +1881,8 @@ static bool keyed_same_numbers(ScrArr *a, ScrArr *b) {
 }
 
 static void test_keyed_sort(void) {
-  ScrClosure ascending = {SIZE_MAX, (void *)keyed_ascending, 0, NULL, 0};
-  ScrClosure descending = {SIZE_MAX, (void *)keyed_descending, 0, NULL, 0};
+  ScrClosure ascending = {.rc = SIZE_MAX, .fn = (void *)keyed_ascending};
+  ScrClosure descending = {.rc = SIZE_MAX, .fn = (void *)keyed_descending};
   const size_t sizes[] = {2, 5, 40, 49, 1000, 70000, 140000}; /* the last takes 11-bit digits */
   const size_t size_count = sizeof(sizes) / sizeof(*sizes);
   bool same = true, uncalled = true;
@@ -1925,9 +1925,9 @@ static void test_keyed_sort(void) {
     scr_arr_release(actual);
   }
 
-  ScrClosure rec_ascending = {SIZE_MAX, (void *)keyed_rec_ascending, 0, NULL, 0};
-  ScrClosure rec_descending = {SIZE_MAX, (void *)keyed_rec_descending, 0, NULL, 0};
-  ScrClosure rec_key = {SIZE_MAX, (void *)keyed_rec_key, 0, NULL, 0};
+  ScrClosure rec_ascending = {.rc = SIZE_MAX, .fn = (void *)keyed_rec_ascending};
+  ScrClosure rec_descending = {.rc = SIZE_MAX, .fn = (void *)keyed_rec_descending};
+  ScrClosure rec_key = {.rc = SIZE_MAX, .fn = (void *)keyed_rec_key};
   long live0 = mock_live;
   bool identical = true, direct = true, fallback = true;
   for (size_t s = 0; s < size_count; s++) {
@@ -2015,9 +2015,9 @@ static double multi_key(ScrClosure *self, void *a, double j) {
 }
 
 static void test_multi_key_sort(void) {
-  ScrClosure two = {SIZE_MAX, (void *)multi_two, 0, NULL, 0};
-  ScrClosure three = {SIZE_MAX, (void *)multi_three, 0, NULL, 0};
-  ScrClosure key = {SIZE_MAX, (void *)multi_key, 0, NULL, 0};
+  ScrClosure two = {.rc = SIZE_MAX, .fn = (void *)multi_two};
+  ScrClosure three = {.rc = SIZE_MAX, .fn = (void *)multi_three};
+  ScrClosure key = {.rc = SIZE_MAX, .fn = (void *)multi_key};
   /* Two keys with the second descending; three with the first and third. */
   const int32_t two_order = 2 | 1 << 9, three_order = 3 | 1 << 8 | 1 << 10;
   const size_t sizes[] = {2, 5, 40, 49, 1000, 70000, 140000};
@@ -2109,10 +2109,10 @@ static void test_typed_sort(void) {
                                 SCR_BYTES_U16, SCR_BYTES_I16, SCR_BYTES_U32,
                                 SCR_BYTES_I32, SCR_BYTES_F32, SCR_BYTES_F64};
   const size_t sizes[] = {0, 1, 2, 7, 48, 49, 1000, 150000};
-  ScrClosure natural = {SIZE_MAX, (void *)typed_default_order, 0, NULL, 0};
-  ScrClosure ascending = {SIZE_MAX, (void *)keyed_ascending, 0, NULL, 0};
-  ScrClosure descending = {SIZE_MAX, (void *)keyed_descending, 0, NULL, 0};
-  ScrClosure by_mod = {SIZE_MAX, (void *)typed_mod_ascending, 0, NULL, 0};
+  ScrClosure natural = {.rc = SIZE_MAX, .fn = (void *)typed_default_order};
+  ScrClosure ascending = {.rc = SIZE_MAX, .fn = (void *)keyed_ascending};
+  ScrClosure descending = {.rc = SIZE_MAX, .fn = (void *)keyed_descending};
+  ScrClosure by_mod = {.rc = SIZE_MAX, .fn = (void *)typed_mod_ascending};
   bool numeric = true, keyed = true, compared = true;
   for (size_t e = 0; e < sizeof(elems) / sizeof(*elems); e++) {
     for (size_t s = 0; s < sizeof(sizes) / sizeof(*sizes); s++) {
@@ -2169,7 +2169,7 @@ static void test_typed_sort(void) {
   scr_bytes_set(three, 0, 3);
   scr_bytes_set(three, 1, 1);
   scr_bytes_set(three, 2, 2);
-  ScrClosure throwing = {SIZE_MAX, (void *)typed_throwing, 0, NULL, 0};
+  ScrClosure throwing = {.rc = SIZE_MAX, .fn = (void *)typed_throwing};
   sort_calls = 0;
   sort_throw_at = 2;
   scr_bytes_sort_compare(three, &throwing, 2);

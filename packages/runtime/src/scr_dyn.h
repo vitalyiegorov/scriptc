@@ -563,6 +563,87 @@ struct ScrDyn {
   struct ScrDyn *symbol_properties;
   struct ScrDyn *symbol_keys;
 };
+/* A boxed closure is its own FUNC value (scr_closure.h): every field a FUNC
+ * reader touches sits at the same offset in ScrDyn and in ScrClosure, and the
+ * closure's private fields live in payload space a function value does not
+ * use. llvm/closure-layout.ts emits the same layout and its unit test pins
+ * the two together. */
+_Static_assert(SCR_CLOSURE_DYN_KIND == SCR_DYN_FUNC, "closure header kind");
+_Static_assert(offsetof(ScrClosure, rc) == offsetof(ScrDyn, rc), "closure/dyn rc");
+_Static_assert(offsetof(ScrClosure, dyn_kind) == offsetof(ScrDyn, kind), "closure/dyn kind");
+_Static_assert(offsetof(ScrClosure, dyn_flags) == offsetof(ScrDyn, buffer) &&
+               offsetof(ScrClosure, dyn_flags) + 3 == offsetof(ScrDyn, non_extensible) &&
+               offsetof(ScrClosure, dyn_flags) + 1 == offsetof(ScrDyn, null_proto),
+               "closure/dyn flag bytes");
+_Static_assert(offsetof(ScrClosure, dyn_self) == offsetof(ScrDyn, v.fn.clo), "closure/dyn fn.clo");
+_Static_assert(offsetof(ScrClosure, dyn_thunk) == offsetof(ScrDyn, v.fn.thunk), "closure/dyn fn.thunk");
+_Static_assert(offsetof(ScrClosure, dyn_sig) == offsetof(ScrDyn, v.fn.sig), "closure/dyn fn.sig");
+_Static_assert(offsetof(ScrClosure, dyn_name) == offsetof(ScrDyn, v.fn.name), "closure/dyn fn.name");
+_Static_assert(offsetof(ScrClosure, dyn_arity) == offsetof(ScrDyn, v.fn.arity), "closure/dyn fn.arity");
+_Static_assert(offsetof(ScrClosure, dyn_class_obj) == offsetof(ScrDyn, v.fn.class_obj), "closure/dyn fn.class_obj");
+_Static_assert(offsetof(ScrClosure, dyn_message) == offsetof(ScrDyn, v.fn.message), "closure/dyn fn.message");
+_Static_assert(offsetof(ScrClosure, dyn_prototype) == offsetof(ScrDyn, prototype), "closure/dyn prototype");
+_Static_assert(offsetof(ScrClosure, dyn_symbol_properties) == offsetof(ScrDyn, symbol_properties), "closure/dyn symbol_properties");
+_Static_assert(offsetof(ScrClosure, dyn_symbol_keys) == offsetof(ScrDyn, symbol_keys), "closure/dyn symbol_keys");
+_Static_assert(offsetof(ScrClosure, fn) >= offsetof(ScrDyn, v.fn.message) + sizeof(void *) &&
+               offsetof(ScrClosure, props) + sizeof(void *) <= offsetof(ScrDyn, prototype),
+               "closure private fields sit in the unused payload space");
+_Static_assert(offsetof(ScrClosure, dyn_prototype) == offsetof(ScrClosure, props) + sizeof(void *),
+               "closure fn/ncaps/props fill the payload up to prototype");
+_Static_assert(offsetof(ScrClosure, identity) == offsetof(ScrDyn, symbol_keys) + sizeof(void *),
+               "closure identity follows the dyn header");
+/* The byte offsets llvm/closure-layout.ts emits (its unit test reads these
+ * lines): change one and the other fails to build or test. */
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(offsetof(ScrClosure, rc) == 0, "closure layout: rc");
+_Static_assert(offsetof(ScrClosure, dyn_kind) == 8, "closure layout: dyn_kind");
+_Static_assert(offsetof(ScrClosure, dyn_flags) == 12, "closure layout: dyn_flags");
+_Static_assert(offsetof(ScrClosure, dyn_self) == 16, "closure layout: dyn_self");
+_Static_assert(offsetof(ScrClosure, dyn_thunk) == 24, "closure layout: dyn_thunk");
+_Static_assert(offsetof(ScrClosure, dyn_sig) == 32, "closure layout: dyn_sig");
+_Static_assert(offsetof(ScrClosure, dyn_name) == 40, "closure layout: dyn_name");
+_Static_assert(offsetof(ScrClosure, dyn_arity) == 48, "closure layout: dyn_arity");
+_Static_assert(offsetof(ScrClosure, dyn_class_obj) == 56, "closure layout: dyn_class_obj");
+_Static_assert(offsetof(ScrClosure, dyn_message) == 64, "closure layout: dyn_message");
+_Static_assert(offsetof(ScrClosure, fn) == 72, "closure layout: fn");
+_Static_assert(offsetof(ScrClosure, ncaps) == 80, "closure layout: ncaps");
+_Static_assert(offsetof(ScrClosure, props) == 88, "closure layout: props");
+_Static_assert(offsetof(ScrClosure, dyn_prototype) == 96, "closure layout: dyn_prototype");
+_Static_assert(offsetof(ScrClosure, dyn_symbol_properties) == 104, "closure layout: dyn_symbol_properties");
+_Static_assert(offsetof(ScrClosure, dyn_symbol_keys) == 112, "closure layout: dyn_symbol_keys");
+_Static_assert(offsetof(ScrClosure, identity) == 120, "closure layout: identity");
+_Static_assert(offsetof(ScrClosure, fn_borrowed) == 128, "closure layout: fn_borrowed");
+_Static_assert(offsetof(ScrClosure, function_kind) == 136, "closure layout: function_kind");
+_Static_assert(offsetof(ScrClosure, identity_length) == 140, "closure layout: identity_length");
+_Static_assert(offsetof(ScrClosure, embedded) == 144, "closure layout: embedded");
+_Static_assert(offsetof(ScrClosure, caps) == 152, "closure layout: caps");
+_Static_assert(sizeof(ScrClosure) == 152, "closure layout: size");
+#else
+_Static_assert(offsetof(ScrClosure, rc) == 0, "closure layout: rc");
+_Static_assert(offsetof(ScrClosure, dyn_kind) == 4, "closure layout: dyn_kind");
+_Static_assert(offsetof(ScrClosure, dyn_flags) == 8, "closure layout: dyn_flags");
+_Static_assert(offsetof(ScrClosure, dyn_self) == 16, "closure layout: dyn_self");
+_Static_assert(offsetof(ScrClosure, dyn_thunk) == 20, "closure layout: dyn_thunk");
+_Static_assert(offsetof(ScrClosure, dyn_sig) == 24, "closure layout: dyn_sig");
+_Static_assert(offsetof(ScrClosure, dyn_name) == 28, "closure layout: dyn_name");
+_Static_assert(offsetof(ScrClosure, dyn_arity) == 32, "closure layout: dyn_arity");
+_Static_assert(offsetof(ScrClosure, dyn_class_obj) == 36, "closure layout: dyn_class_obj");
+_Static_assert(offsetof(ScrClosure, dyn_message) == 40, "closure layout: dyn_message");
+_Static_assert(offsetof(ScrClosure, fn) == 44, "closure layout: fn");
+_Static_assert(offsetof(ScrClosure, ncaps) == 48, "closure layout: ncaps");
+_Static_assert(offsetof(ScrClosure, props) == 52, "closure layout: props");
+_Static_assert(offsetof(ScrClosure, dyn_prototype) == 56, "closure layout: dyn_prototype");
+_Static_assert(offsetof(ScrClosure, dyn_symbol_properties) == 60, "closure layout: dyn_symbol_properties");
+_Static_assert(offsetof(ScrClosure, dyn_symbol_keys) == 64, "closure layout: dyn_symbol_keys");
+_Static_assert(offsetof(ScrClosure, identity) == 68, "closure layout: identity");
+_Static_assert(offsetof(ScrClosure, fn_borrowed) == 72, "closure layout: fn_borrowed");
+_Static_assert(offsetof(ScrClosure, function_kind) == 76, "closure layout: function_kind");
+_Static_assert(offsetof(ScrClosure, identity_length) == 80, "closure layout: identity_length");
+_Static_assert(offsetof(ScrClosure, embedded) == 84, "closure layout: embedded");
+_Static_assert(offsetof(ScrClosure, caps) == 88, "closure layout: caps");
+_Static_assert(sizeof(ScrClosure) == 88, "closure layout: size");
+#endif
+
 /* Compiled class dispatch reads a capsule's instance and key in place. */
 _Static_assert(offsetof(ScrDyn, v.typed_ref.ptr) == 16, "typed_ref.ptr offset");
 _Static_assert(offsetof(ScrDyn, null_proto) == sizeof(size_t) + sizeof(ScrDynKind) + 1,

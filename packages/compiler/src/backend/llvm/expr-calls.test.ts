@@ -117,7 +117,7 @@ test("closures over bodies that borrow every reference parameter carry a lending
 
 test("unknown callbacks borrow stable arguments through the lending entry", () => {
   const lent = body(emitLlvmModule(moduleWith([apply("param"), lambda("lends")])), "sc_bf_apply");
-  expect(lent).toMatch(/getelementptr inbounds %ScrClosure, ptr %[^,]+, i64 0, i32 7/);
+  expect(lent).toMatch(/getelementptr inbounds %ScrClosure, ptr %[^,]+, i64 0, i32 17/);
   const [lending, owning] = lent.split(/^callback\.own\d+:$/m);
   // The lending branch passes the caller's reference; the owned entry
   // receives a reference of its own.

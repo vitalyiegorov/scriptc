@@ -1,4 +1,5 @@
 /* Focused LLVM expression emission extracted from emitter.ts. */
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import { InternalCompilerError } from "../../errors.js";
 import { newValueMayThrow } from "../../ir/analysis.js";
 import {
@@ -775,14 +776,14 @@ export function emitCallExpr(
         (target.generator ? 1 : 0) + (target.async ? 2 : 0) + (target.ownsPrototype ? 4 : 0);
       if (functionKind) {
         const kindPtr = B.tmp();
-        B.line(`${kindPtr} = getelementptr inbounds %ScrClosure, ptr ${c}, i64 0, i32 4`);
+        B.line(`${kindPtr} = getelementptr inbounds %ScrClosure, ptr ${c}, i64 0, i32 ${CLOSURE_FIELD.functionKind}`);
         B.line(`store i32 ${functionKind}, ptr ${kindPtr}`);
       }
       if (host.lendsEveryArgument(e.fnName)) {
         // The body that borrows its reference arguments, for callers that
         // keep them alive across the call (the runtime's comparator sort).
         const entry = B.tmp();
-        B.line(`${entry} = getelementptr inbounds %ScrClosure, ptr ${c}, i64 0, i32 7`);
+        B.line(`${entry} = getelementptr inbounds %ScrClosure, ptr ${c}, i64 0, i32 ${CLOSURE_FIELD.fnBorrowed}`);
         B.line(`store ptr @${mangleBorrowedFunction(e.fnName)}, ptr ${entry}`);
       }
       e.captures.forEach((localId, i) => {
@@ -987,7 +988,7 @@ export function emitCallExpr(
       } else {
         const fnp = B.tmp(),
           fn = B.tmp();
-        B.line(`${fnp} = getelementptr inbounds %ScrClosure, ptr ${callee.name}, i64 0, i32 1`);
+        B.line(`${fnp} = getelementptr inbounds %ScrClosure, ptr ${callee.name}, i64 0, i32 ${CLOSURE_FIELD.fn}`);
         B.line(`${fn} = load ptr, ptr ${fnp}`);
         if (dynamic) {
           const entryp = B.tmp(),
@@ -997,7 +998,7 @@ export function emitCallExpr(
             owning = B.newLabel("callback.own"),
             done = B.newLabel("callback.done");
           B.line(
-            `${entryp} = getelementptr inbounds %ScrClosure, ptr ${callee.name}, i64 0, i32 7`,
+            `${entryp} = getelementptr inbounds %ScrClosure, ptr ${callee.name}, i64 0, i32 ${CLOSURE_FIELD.fnBorrowed}`,
           );
           B.line(`${entry} = load ptr, ptr ${entryp}`);
           B.line(`${has} = icmp ne ptr ${entry}, null`);

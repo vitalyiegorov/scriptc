@@ -87,26 +87,54 @@ void scr_box_set_f64(ScrBox *b, double v);
 void scr_box_set_bool(ScrBox *b, bool v);
 void scr_box_set_ref(ScrBox *b, void *v); /* releases old, owns new */
 
+/* A closure IS its dynamic function value. The header mirrors a ScrDyn of
+ * kind SCR_DYN_FUNC field for field (scr_dyn.h asserts every offset), so a
+ * boxed closure is the same pointer viewed as a ScrDyn: one count, one
+ * cycle header, one trace and one destroy. The dyn_* fields are only
+ * meaningful once the closure was boxed (dyn_self == the closure; NULL
+ * before, and the only field every closure initializes); scr_dyn_new_func
+ * fills them at the first boxing. A later boxing that needs a different
+ * thunk, signature, name or arity gets a separate FUNC node that points at
+ * the closure (the pre-merge representation), which every reader of a FUNC
+ * value tells apart by `v.fn.clo != the node`.
+ *
+ * fn, ncaps and props sit in the part of the ScrDyn payload a function
+ * value does not use. The emitted code addresses all of this through the
+ * %ScrClosure type (llvm/closure-layout.ts), pinned by the asserts in
+ * scr_dyn.h and a compiler unit test. */
+#define SCR_CLOSURE_DYN_KIND 8 /* SCR_DYN_FUNC */
 typedef struct ScrClosure {
   size_t rc; /* SIZE_MAX = immortal (interned top-level function value) */
+  uint32_t dyn_kind;
+  uint32_t dyn_flags; /* buffer, null_proto, copied_from_native, non_extensible */
+#if UINTPTR_MAX == UINT32_MAX
+  uint32_t dyn_align; /* ScrDyn's payload union is 8-aligned (double) */
+#endif
+  struct ScrClosure *dyn_self; /* v.fn.clo of the boxed view: this closure, or NULL */
+  void *dyn_thunk;             /* v.fn.thunk */
+  const char *dyn_sig;         /* v.fn.sig (static literal) */
+  const char *dyn_name;        /* v.fn.name (static literal or NULL) */
+  uint32_t dyn_arity;          /* v.fn.arity */
+  void *dyn_class_obj;         /* v.fn.class_obj */
+  void *dyn_message;           /* v.fn.message */
   void *fn;
   size_t ncaps;
   /* The function's OWN-PROPERTY table: a box whose payload is an OBJ
    * ScrDyn (owned; lazily allocated by Object.defineProperties —
    * test/common copying name/length onto the mustCall wrapper), NULL
-   * until first defined. It lives on the CLOSURE, not the dyn box:
-   * boxing the same function value twice (the declaration's box, the
-   * return's box) yields distinct boxes sharing one closure, and JS has
-   * ONE function object — property writes must be visible through every
-   * box. A ScrBox so this unit stays dyn-free (the payload's release
+   * until first defined. It lives on the CLOSURE, not on a separate dyn
+   * node: a function that was boxed twice for different signatures still
+   * is ONE JS function object — property writes must be visible through
+   * every box. A ScrBox so this unit stays dyn-free (the payload's release
    * rides the box, like every capture). Untraced by the cycle collector
-   * (like the dyn→closure edge): a cycle through it is merely never
+   * (like the old dyn→closure edge): a cycle through it is merely never
    * collected. */
   ScrBox *props;
-  uint32_t function_kind; /* low bits: 0 ordinary, 1 generator, 2 async, 3 async generator; bit 2: ordinary own prototype; bit 3: checked callable adapter in caps[0] */
-  /* The root's `length` as boxed values report it; meaningful only when
-   * identity is set (the root's own boxes carry their arity). */
-  uint32_t identity_length;
+  /* ScrDyn.prototype, symbol_properties and symbol_keys of the boxed view:
+   * owned, traced and released with the closure once it was boxed. */
+  void *dyn_prototype;
+  void *dyn_symbol_properties;
+  void *dyn_symbol_keys;
   /* The JS function this closure stands for. NULL means the closure is
    * its own identity. A signature adapter (the same function viewed
    * through a different native ABI) points at the root of the function
@@ -119,6 +147,10 @@ typedef struct ScrClosure {
    * NULL. Same signature as `fn`; only callers that hold their arguments
    * for the whole call may enter through it. */
   void *fn_borrowed;
+  uint32_t function_kind; /* low bits: 0 ordinary, 1 generator, 2 async, 3 async generator; bit 2: ordinary own prototype; bit 3: checked callable adapter in caps[0] */
+  /* The root's `length` as boxed values report it; meaningful only when
+   * identity is set (the root's own boxes carry their arity). */
+  uint32_t identity_length;
   /* Bit i set: caps[i] points at a box embedded in this closure's own
    * allocation (right after caps[]), holding the value of a binding that
    * never changes after the closure is created. The embedded box is
@@ -146,6 +178,10 @@ static inline ScrClosure *scr_closure_retain(ScrClosure *c) {
 }
 
 void scr_closure_release(ScrClosure *c); /* releases the boxes; NULL-tolerant */
+/* Tears down a closure whose count reached zero (scr_dyn_dispose calls it
+ * for a boxed closure released through its dyn view). */
+void scr_closure_destroy(void *object);
+extern void (*scr_closure_boxed_release)(ScrClosure *);
 
 /* The identity root of a function value (NULL-tolerant). */
 static inline ScrClosure *scr_closure_identity(ScrClosure *c) {

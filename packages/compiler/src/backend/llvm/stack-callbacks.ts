@@ -1,3 +1,4 @@
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import type { IrExpr, IrFunction } from "../../ir/ir.js";
 import { everyStmtList } from "../../ir/traverse.js";
 import type { LlValue, LlvmEmitterContext } from "./expr-context.js";
@@ -27,14 +28,14 @@ export class StackCallbacks {
     B.line(`store %ScrClosure zeroinitializer, ptr ${closure}`);
     B.line(`store ${host.sizeType} -1, ptr ${closure}`);
     const fn = B.tmp();
-    B.line(`${fn} = getelementptr inbounds %ScrClosure, ptr ${closure}, i32 0, i32 1`);
+    B.line(`${fn} = getelementptr inbounds %ScrClosure, ptr ${closure}, i32 0, i32 ${CLOSURE_FIELD.fn}`);
     B.line(`store ptr @${host.callTarget(value.fnName)}, ptr ${fn}`);
     const count = B.tmp();
-    B.line(`${count} = getelementptr inbounds %ScrClosure, ptr ${closure}, i32 0, i32 2`);
+    B.line(`${count} = getelementptr inbounds %ScrClosure, ptr ${closure}, i32 0, i32 ${CLOSURE_FIELD.ncaps}`);
     B.line(`store ${host.sizeType} ${value.captures.length}, ptr ${count}`);
     if (this.functions.get(value.fnName)?.ownsPrototype) {
       const kind = B.tmp();
-      B.line(`${kind} = getelementptr inbounds %ScrClosure, ptr ${closure}, i32 0, i32 4`);
+      B.line(`${kind} = getelementptr inbounds %ScrClosure, ptr ${closure}, i32 0, i32 ${CLOSURE_FIELD.functionKind}`);
       B.line(`store i32 4, ptr ${kind}`);
     }
     value.captures.forEach((localId, index) => {

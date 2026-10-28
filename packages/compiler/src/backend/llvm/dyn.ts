@@ -1,3 +1,4 @@
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import { emitPerKeyOrder } from "./key-orders.js";
 import { typedRefConstructor } from "./shapes.js";
 import { bindLiveArrayOps } from "./expr-stream-bridges.js";
@@ -3112,7 +3113,7 @@ export class LlDyn {
         const functionKind = B.tmp();
         const targetKind = B.tmp();
         B.line(`${functionKind} = call i32 @scr_dyn_function_kind(ptr %d)`);
-        B.line(`${targetKind} = getelementptr inbounds %ScrClosure, ptr ${a}, i64 0, i32 4`);
+        B.line(`${targetKind} = getelementptr inbounds %ScrClosure, ptr ${a}, i64 0, i32 ${CLOSURE_FIELD.functionKind}`);
         const adapterKind = B.tmp();
         B.line(
           `${adapterKind} = or i32 ${functionKind}, 8 ; preserves the checked callable in caps[0]`,
@@ -5339,7 +5340,7 @@ export class LlDyn {
     // The closure CONSUMES its params (+1 each moved in).
     const fnp = B.tmp();
     const fn = B.tmp();
-    B.line(`${fnp} = getelementptr inbounds %ScrClosure, ptr %c, i64 0, i32 1`);
+    B.line(`${fnp} = getelementptr inbounds %ScrClosure, ptr %c, i64 0, i32 ${CLOSURE_FIELD.fn}`);
     B.line(`${fn} = load ptr, ptr ${fnp}`);
     const retTy = t.ret.kind === "void" ? "void" : this.valTy(t.ret);
     const callArgs = [
@@ -5452,7 +5453,7 @@ export class LlDyn {
     // the emitter, as after the thunk.
     const fnp = B.tmp();
     const fn = B.tmp();
-    B.line(`${fnp} = getelementptr inbounds %ScrClosure, ptr %c, i64 0, i32 1`);
+    B.line(`${fnp} = getelementptr inbounds %ScrClosure, ptr %c, i64 0, i32 ${CLOSURE_FIELD.fn}`);
     B.line(`${fn} = load ptr, ptr ${fnp}`);
     const args = `ptr %c, ${this.valTy(param)} ${value}`;
     if (t.ret.kind === "void") B.line(`call void ${fn}(${args})`);

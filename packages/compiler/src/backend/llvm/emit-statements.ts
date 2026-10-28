@@ -1,4 +1,5 @@
 /* LlEmitter's statement emission: the statement switch, try/catch, switch, loop copies, speculative writes and string self-concatenation. */
+import { CLOSURE_FIELD } from "./closure-layout.js";
 import {
   type LlEmitter,
   type LlScopeEntry,
@@ -2097,7 +2098,7 @@ function emitCallbackVersionedLoop(
     const fnp = B.tmp(),
       fn = B.tmp(),
       same = B.tmp();
-    B.line(`${fnp} = getelementptr inbounds %ScrClosure, ptr ${closure}, i64 0, i32 1`);
+    B.line(`${fnp} = getelementptr inbounds %ScrClosure, ptr ${closure}, i64 0, i32 ${CLOSURE_FIELD.fn}`);
     B.line(`${fn} = load ptr, ptr ${fnp}`);
     B.line(`${same} = icmp eq ptr ${fn}, ${direct}`);
     if (ok === "true") ok = same;
