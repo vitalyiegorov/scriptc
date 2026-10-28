@@ -7,6 +7,7 @@
 #define SCR_DYN_H
 
 #include "scr_regex.h"
+#include "scr_stats.h"
 #include "scr_url.h"
 #include "scr_symbol.h"
 #include "scr_bigint.h"
@@ -649,6 +650,31 @@ static inline bool scr_dyn_region_inert(const ScrDyn *value) {
  * `container`. Immortal (published) containers are shared across threads
  * and never released, so their region is left alone. */
 static inline void scr_dyn_region_store(const ScrDyn *container, const ScrDyn *value) {
+#ifdef SCR_STATS
+  if (container && container->kind == SCR_DYN_OBJ) {
+    if (!value) SCR_STAT(cen_o_other);
+    else switch (value->kind) {
+      case SCR_DYN_OBJ: SCR_STAT(cen_o_obj); break;
+      case SCR_DYN_ARR: SCR_STAT(cen_o_arr); break;
+      case SCR_DYN_FUNC: SCR_STAT(cen_o_func); break;
+      case SCR_DYN_STR: SCR_STAT(cen_o_str); break;
+      case SCR_DYN_NUM: if (value->rc == SIZE_MAX) SCR_STAT(cen_o_numimm); else SCR_STAT(cen_o_numheap); break;
+      case SCR_DYN_BOOL: case SCR_DYN_NULL: case SCR_DYN_UNDEF: SCR_STAT(cen_o_boolnull); break;
+      default: SCR_STAT(cen_o_other);
+    }
+  } else if (container && container->kind == SCR_DYN_ARR) {
+    if (!value) SCR_STAT(cen_a_other);
+    else switch (value->kind) {
+      case SCR_DYN_OBJ: SCR_STAT(cen_a_obj); break;
+      case SCR_DYN_ARR: SCR_STAT(cen_a_arr); break;
+      case SCR_DYN_FUNC: SCR_STAT(cen_a_func); break;
+      case SCR_DYN_STR: SCR_STAT(cen_a_str); break;
+      case SCR_DYN_NUM: if (value->rc == SIZE_MAX) SCR_STAT(cen_a_numimm); else SCR_STAT(cen_a_numheap); break;
+      case SCR_DYN_BOOL: case SCR_DYN_NULL: case SCR_DYN_UNDEF: SCR_STAT(cen_a_boolnull); break;
+      default: SCR_STAT(cen_a_other);
+    }
+  }
+#endif
   ScrDynRegion *region = scr_dyn_region_of(container);
   if (region && region->intact && container->rc != SIZE_MAX && !scr_dyn_region_inert(value))
     region->intact = false;

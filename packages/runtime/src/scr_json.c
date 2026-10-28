@@ -1203,7 +1203,12 @@ static void scr_dyn_region_leave(ScrDyn *d) {
    : (kind) == SCR_DYN_ARR  ? SCR_STAT(dyn_alloc_array)                                            \
    : (kind) == SCR_DYN_FUNC ? SCR_STAT(dyn_alloc_closure)                                          \
    : (kind) == SCR_DYN_STR  ? SCR_STAT(dyn_alloc_string)                                           \
-                            : SCR_STAT(dyn_alloc_box))
+                            : (SCR_STAT(dyn_alloc_box),                                            \
+                               (kind) == SCR_DYN_NUM ? SCR_STAT(cen_box_num)                       \
+                               : (kind) == SCR_DYN_TYPED_REF ? SCR_STAT(cen_box_typed)             \
+                               : (kind) == SCR_DYN_PROMISE ? SCR_STAT(cen_box_promise)             \
+                               : (kind) == SCR_DYN_HANDLE ? SCR_STAT(cen_box_handle)               \
+                                                          : SCR_STAT(cen_box_other)))
 #else
 #define SCR_STAT_DYN_ALLOC(kind) ((void)0)
 #endif

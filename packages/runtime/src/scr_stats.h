@@ -31,7 +31,11 @@
   X(dyn_class_is_key) X(dyn_construct) X(cyc_pass) X(cyc_candidates) X(weak_disposed)              \
   X(weak_filter_pass) X(fiber_start) X(promise_new) X(sys_read) X(sys_write) X(sys_sendmsg)                         \
   X(cyc_freed) X(yin_collect) X(yin_entered) X(yin_dead)                 \
-  X(cand_closure) X(cand_box) X(cand_dyn) X(cand_other)
+  X(cand_closure) X(cand_box) X(cand_dyn) X(cand_other)                                           \
+  X(cen_o_obj) X(cen_o_arr) X(cen_o_func) X(cen_o_str) X(cen_o_numheap) X(cen_o_numimm)           \
+  X(cen_o_boolnull) X(cen_o_other) X(cen_a_obj) X(cen_a_arr) X(cen_a_func) X(cen_a_str)           \
+  X(cen_a_numheap) X(cen_a_numimm) X(cen_a_boolnull) X(cen_a_other)                       \
+  X(cen_box_num) X(cen_box_typed) X(cen_box_promise) X(cen_box_handle) X(cen_box_other)
 
 #ifdef SCR_STATS
 #include <stdint.h>
