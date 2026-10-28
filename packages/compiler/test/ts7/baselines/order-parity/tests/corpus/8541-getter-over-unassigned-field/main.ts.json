@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8541-getter-over-unassigned-field/main.ts"
+ ],
+ "diags": []
+}

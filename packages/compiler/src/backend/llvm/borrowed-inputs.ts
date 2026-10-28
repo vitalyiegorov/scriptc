@@ -8,7 +8,9 @@ import type { LlValue, LlvmEmitterContext } from "./expr-context.js";
  * globals, captures and reassigned bindings keep their ordinary snapshots.
  * Stored values that move into a container must still use emitExpr. */
 export function emitBorrowedInput(host: LlvmEmitterContext, value: IrExpr): LlValue {
-  return host.canBorrowCallArgument(value) ? host.emitReadReceiver(value) : host.emitExpr(value);
+  return host.canBorrowCallArgument(value) || host.canBorrowExpressionLocal(value)
+    ? host.emitReadReceiver(value)
+    : host.emitExpr(value);
 }
 
 /** A projection or writable binding can borrow across later operands only
@@ -38,6 +40,7 @@ export function borrowableInputs(
     const value = inputs[i]!;
     result[i] =
       host.canBorrowCallArgument(value) ||
+      host.canBorrowExpressionLocal(value) ||
       (preserves && host.canBorrowReceiver(value)) ||
       (writes !== null && host.canBorrowReceiver(value) && host.unwrittenRead(value, suffix));
     preserves = preserves && host.referenceEffects.preserves(value);

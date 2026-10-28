@@ -40,6 +40,8 @@ function context() {
     prototypeMethodAccesses: new Map(),
     protocolDispatches: new Map(),
     classMethodValueSelections: new Map(),
+    proxyTargetClasses: new Set(),
+    genericClassByDecl: new Map(),
     isSubclassOf: () => false,
   } as unknown as Lowerer;
   const boxed = fn("box", [

@@ -744,38 +744,27 @@ ScrDyn *scr_dyn_promise_then(ScrPromise *src, ScrDyn *onf, ScrDyn *onr, ScrDyn *
   scr_promise_release(waiter); /* the entry never rejects; nobody awaits it */
   return boxed;
 }
-typedef struct {
-  ScrPromise *destination;
-  ScrDyn *value;
-} ScrDynResolvePack;
+static ScrDyn *scr_dyn_promise_payload(ScrPromise *p);
 
-static void scr_dyn_resolve_entry(ScrFiber *self, void *opaque) {
-  (void)self;
-  ScrDynResolvePack *pack = opaque;
-#ifndef __wasi__
-  /* Promise resolution schedules a job before attaching its reaction. */
-  scr_await_hop();
-#endif
-  ScrDyn *value = scr_await_dyn(pack->value->v.promise);
-  if (scr_exc_pending()) scr_promise_reject_pending(pack->destination);
-  else scr_promise_resolve_dyn(pack->destination, value);
-  scr_dyn_release(pack->value);
-  scr_promise_release(pack->destination);
-  free(pack);
+/* The adopted promise's reaction: a fulfillment resolves the destination
+ * with the payload (which adopts again if it is itself a promise); a
+ * rejection settles it with the same reason (scr_promise_cb_run). */
+static void scr_dyn_resolve_adopt(ScrPromise *destination, ScrPromise *source) {
+  scr_promise_resolve_dyn(destination, scr_dyn_promise_payload(source));
 }
 
-#ifdef __wasi__
+/* NewPromiseResolveThenableJob: one microtask after the resolution, the
+ * destination subscribes a reaction to the value, which runs one microtask
+ * after the value settles (or right away for a settled value), in
+ * subscription order among the value's waiters (scr_promise_race_join). No
+ * fiber or stack is involved. */
 static void scr_dyn_resolve_job(ScrClosure *closure) {
   ScrPromise *destination = scr_box_get_ref(closure->caps[0]);
   ScrDyn *value = scr_box_get_ref(closure->caps[1]);
-  ScrDynResolvePack *pack = malloc(sizeof *pack);
-  if (!pack) scr_ad_oom();
-  pack->destination = destination;
-  pack->value = value;
-  ScrPromise *waiter = scr_async_spawn_after(value->v.promise, scr_dyn_resolve_entry, pack);
-  scr_promise_release(waiter);
+  scr_promise_race_join(destination, value->v.promise, scr_dyn_resolve_adopt);
+  scr_dyn_release(value);
+  scr_promise_release(destination);
 }
-#endif
 
 /* The destination is borrowed; value moves in. An async function may
  * return a native promise hidden behind any/unknown without an explicit
@@ -792,21 +781,12 @@ void scr_promise_resolve_dyn(ScrPromise *destination, ScrDyn *value) {
     scr_dyn_release(value);
     return;
   }
-#ifdef __wasi__
   ScrClosure *job = scr_closure_new((void *)scr_dyn_resolve_job, 2);
   job->caps[0] = scr_box_new_obj(scr_promise_retain_v, scr_promise_release_v, scr_promise_trace_v);
   scr_box_set_ref(job->caps[0], scr_promise_retain(destination));
   job->caps[1] = scr_box_new_obj(scr_dyn_retain_v, scr_dyn_release_v, scr_dyn_trace_v);
   scr_box_set_ref(job->caps[1], value);
   scr_queue_microtask(job);
-#else
-  ScrDynResolvePack *pack = malloc(sizeof *pack);
-  if (!pack) scr_ad_oom();
-  pack->destination = scr_promise_retain(destination);
-  pack->value = value;
-  ScrPromise *waiter = scr_async_spawn(scr_dyn_resolve_entry, pack);
-  scr_promise_release(waiter);
-#endif
 }
 
 /* `await v` where v is a CHECKED-DYNAMIC value: a dyn promise adopts

@@ -1547,18 +1547,7 @@ static bool bc_chain_has(ScrDyn *value, ScrDyn *prototype) {
   if (value->kind != SCR_DYN_OBJ && value->kind != SCR_DYN_ARR && value->kind != SCR_DYN_FUNC &&
       value->kind != SCR_DYN_PROXY)
     return false;
-  ScrDyn *current = scr_dyn_get_prototype(value);
-  while (current && current->kind != SCR_DYN_NULL) {
-    if (scr_dyn_strict_eq(current, prototype)) {
-      scr_dyn_release(current);
-      return true;
-    }
-    ScrDyn *next = scr_dyn_get_prototype(current);
-    scr_dyn_release(current);
-    current = next;
-  }
-  if (current) scr_dyn_release(current);
-  return false;
+  return scr_dyn_chain_has(value, prototype, true);
 }
 
 /* `value instanceof <kind>`. Node's Writable also answers true for an
@@ -1583,7 +1572,8 @@ bool scr_dyn_function_instanceof(ScrDyn *value, ScrDyn *callee) {
   }
   int hooked = scr_dyn_has_instance_hook(value, callee);
   if (hooked >= 0) return hooked == 1;
-  ScrDyn *prototype = bc_get(callee, "prototype");
+  ScrDyn *prototype = scr_dyn_fn_prototype_fast(callee);
+  if (!prototype) prototype = bc_get(callee, "prototype");
   if (!prototype) return false;
   bool found = false;
   if (prototype->kind == SCR_DYN_OBJ || prototype->kind == SCR_DYN_ARR || prototype->kind == SCR_DYN_FUNC ||

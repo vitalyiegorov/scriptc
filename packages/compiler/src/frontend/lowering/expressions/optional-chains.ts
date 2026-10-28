@@ -475,8 +475,23 @@ export function lowerOptionalChain(
   const narrowedTs = lowerer.checker.getNonNullableType(
     lowerer.checker.getTypeAtLocation(recvNode),
   );
-  lowerer.chainRecvByNode.set(recvNode, recvRef);
   lowerer.chainNarrowedType.set(recvNode, narrowedTs);
+  // The guard proved the receiver present, and the checker's flow
+  // narrowing may have dropped more arms than the stored union's nullish
+  // ones (`isString(v) ? v : v?.name` over `string | Opts | undefined`):
+  // the chain's value reads as the checker's narrower arm.
+  if (narrowed.kind === "union" && recvRef.type.kind === "union") {
+    const arm = lowerer.mapTypeOf(narrowedTs);
+    if (arm !== null && arm.kind !== "union" && arm.kind !== "dyn") {
+      try {
+        recvRef = lowerer.maybeNarrow(recvRef, recvNode);
+      } catch (e) {
+        lowerer.chainNarrowedType.delete(recvNode);
+        throw e;
+      }
+    }
+  }
+  lowerer.chainRecvByNode.set(recvNode, recvRef);
   lowerer.chainHandled.add(dotNode);
   // A TAIL entry's intermediate steps (`x?.trim()` inside
   // `x?.trim().toLowerCase()`) checker-type with the chain's `|

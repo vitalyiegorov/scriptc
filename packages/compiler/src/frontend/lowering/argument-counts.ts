@@ -4,6 +4,7 @@ import { isJsSourceFile, locOf } from "../program.js";
 import { BOOL, F64, type IrExpr, type IrStmt, type IrType } from "../../ir/ir.js";
 import { varRef } from "../../ir/build.js";
 import { typeKey } from "../type-mapper.js";
+import { isSafeToRepeat } from "./expressions/evaluation-safety.js";
 import type { Lowerer } from "./lowerer.js";
 import { isThisParameter } from "./call-signatures.js";
 import { buildFunctionAdapter } from "./coercions/builders.js";
@@ -31,9 +32,12 @@ export function argumentCountSlot(lowerer: Lowerer, decl: ts.FunctionDeclaration
     lowerer.isTopLevelFnSymbol(decl.name) &&
     decl.modifiers?.nodes.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) !== true &&
     !isJsSourceFile(ts.getSourceFileOfNode(decl)) &&
-    fixedArity(decl) &&
     bodyReadsArguments(decl) &&
-    usedAsValue(lowerer, decl)
+    // A fixed-arity function reads the count a caller through a value
+    // stored; one with optional or defaulted parameters reads the count
+    // each direct call stores (a value of it keeps the fence: its callers'
+    // counts vary).
+    (fixedArity(decl) ? usedAsValue(lowerer, decl) : !hasRest(decl) && !usedAsValue(lowerer, decl))
   ) {
     const sig = lowerer.fnSigOf(decl.name);
     if (sig) {
@@ -57,6 +61,9 @@ export function declareArgumentCount(
   const loc = locOf(decl);
   const local = lowerer.declareHiddenLocal("%argc", F64);
   const stored = varRef(slot, F64, loc);
+  // Direct calls of an optional-parameter function store the count plus
+  // one, so a zero-argument call is distinguishable from a clear slot.
+  const variable = !fixedArity(decl);
   prologue.push(
     {
       kind: "varDecl",
@@ -72,7 +79,16 @@ export function declareArgumentCount(
           loc,
         },
         then: { kind: "numLit", value: declaredCount(decl), type: F64, loc },
-        else_: stored,
+        else_: variable
+          ? {
+              kind: "bin",
+              op: "-",
+              left: stored,
+              right: { kind: "numLit", value: 1, type: F64, loc },
+              type: F64,
+              loc,
+            }
+          : stored,
         type: F64,
         loc,
       },
@@ -81,6 +97,45 @@ export function declareArgumentCount(
     { kind: "assign", localId: slot, value: { kind: "numLit", value: 0, type: F64, loc }, loc },
   );
   lowerer.ctx.argumentCount = local;
+}
+
+/** A direct call of `decl` when it reads `arguments.length` with optional
+ * or defaulted parameters: the call's own argument count is stored (plus
+ * one) in the function's count slot after the arguments evaluate, which the
+ * function reads and clears on entry. Null when the declaration keeps no
+ * count slot of that kind. */
+export function withArgumentCount(
+  lowerer: Lowerer,
+  decl: ts.FunctionDeclaration,
+  call: IrExpr & { kind: "call" },
+  site: ts.CallExpression,
+): IrExpr | null {
+  if (fixedArity(decl)) return null;
+  const slot = argumentCountSlot(lowerer, decl);
+  if (slot === null) return null;
+  if (site.arguments.nodes.some(ts.isSpreadElement)) {
+    lowerer.unsupported(
+      "SC1090",
+      site,
+      "spread arguments in calls of a function that reads 'arguments.length' over optional parameters (the count each call passes is not known)",
+    );
+  }
+  const argCount = site.arguments.nodes.length;
+  const loc = call.loc;
+  const stmts: IrStmt[] = [];
+  const args = call.args.map((arg, i) => {
+    if (isSafeToRepeat(arg)) return arg;
+    const local = lowerer.declareHiddenLocal(`%arg${i}`, arg.type);
+    stmts.push({ kind: "varDecl", localId: local.id, init: arg, loc });
+    return varRef(local.id, arg.type, loc);
+  });
+  stmts.push({
+    kind: "assign",
+    localId: slot,
+    value: { kind: "numLit", value: argCount + 1, type: F64, loc },
+    loc,
+  });
+  return { kind: "seqExpr", stmts, result: { ...call, args }, type: call.type, loc };
 }
 
 /** `decl` as a value at `reference`: the plain closure when every call
@@ -222,6 +277,10 @@ function fixedArity(fn: ts.FunctionLikeDeclaration): boolean {
       p.initializer === undefined &&
       p.dotDotDotToken === undefined,
   );
+}
+
+function hasRest(fn: ts.FunctionLikeDeclaration): boolean {
+  return fn.parameters.nodes.some((p) => p.dotDotDotToken !== undefined);
 }
 
 function declaredCount(fn: ts.FunctionLikeDeclaration): number {

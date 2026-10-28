@@ -84,6 +84,13 @@ function liveExportTableFirst(
 
 export function isBundlerCjsCandidate(source: string): boolean {
   return (
+    isBundlerInteropCandidate(source) ||
+    (source.includes("module.exports") && /\b0\s*&&/.test(source))
+  );
+}
+
+function isBundlerInteropCandidate(source: string): boolean {
+  return (
     source.includes("__toCommonJS") ||
     source.includes("__toESM") ||
     source.includes("__exportStar") ||
@@ -559,6 +566,108 @@ function readOnlyAccess(access: ts.PropertyAccessExpression): boolean {
 
 const RESERVED_KEYS = new Set(["__proto__"]);
 
+/** A dead export annotation describes names, not values. A factory may
+ * populate the original exports object through callbacks instead. Keep
+ * that object and execute the factory rather than synthesizing undefined
+ * entries. This path excludes replacement/rebinding and bare exports. */
+function rewriteAnnotatedExportObject(sf: ts.SourceFile, host: CjsRewriteHost): string | null {
+  if (sf.text.includes("__scget") || sf.text.includes("__scex")) return null;
+  const annotations: ts.Node[] = [];
+  for (const stmt of sf.statements.nodes) {
+    if (!ts.isExpressionStatement(stmt)) continue;
+    const e = stmt.expression;
+    if (
+      !ts.isBinaryExpression(e) ||
+      e.operatorToken.kind !== ts.SyntaxKind.AmpersandAmpersandToken ||
+      !ts.isNumericLiteral(e.left) ||
+      e.left.text !== "0"
+    )
+      continue;
+    let inner = e.right;
+    while (ts.isParenthesizedExpression(inner)) inner = inner.expression;
+    if (
+      ts.isBinaryExpression(inner) &&
+      inner.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      isModuleExports(inner.left) &&
+      ts.isObjectLiteralExpression(inner.right)
+    )
+      annotations.push(stmt);
+  }
+  if (annotations.length === 0) return null;
+  const withinAnnotation = (node: ts.Node): boolean =>
+    annotations.some((a) => node.pos >= a.pos && node.end <= a.end);
+  const reads: ts.PropertyAccessExpression[] = [];
+  let unsafe = false;
+  ts.walkPreorder(sf, (node) => {
+    if (withinAnnotation(node)) return "skip";
+    if (ts.isIdentifier(node) && node.text === "module") {
+      const parent = node.parent;
+      if (
+        !(
+          ts.isPropertyAccessExpression(parent) &&
+          parent.expression === node &&
+          isModuleExports(parent)
+        ) &&
+        !ts.isTypeOfExpression(parent)
+      )
+        unsafe = true;
+    }
+    if (ts.isPropertyAccessExpression(node) && isModuleExports(node)) {
+      const parent = node.parent;
+      if (
+        (ts.isBinaryExpression(parent) &&
+          parent.left === node &&
+          parent.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+          parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+        ts.isDeleteExpression(parent) ||
+        ts.isPrefixUnaryExpression(parent) ||
+        ts.isPostfixUnaryExpression(parent)
+      )
+        unsafe = true;
+      reads.push(node);
+    }
+    if (ts.isIdentifier(node) && node.text === "exports") {
+      const parent = node.parent;
+      if (ts.isPropertyAccessExpression(parent) && parent.name === node) return undefined;
+      let scope: ts.Node | undefined = node;
+      while (scope !== undefined && !ts.isSourceFile(scope)) {
+        if (
+          ts.isFunctionLike(scope) &&
+          scope.parameters.nodes.some((p) => ts.isIdentifier(p.name) && p.name.text === "exports")
+        )
+          break;
+        scope = scope.parent;
+      }
+      if (scope === undefined || ts.isSourceFile(scope)) unsafe = true;
+    }
+    return undefined;
+  });
+  if (
+    unsafe ||
+    !reads.some(
+      (node) => ts.isCallExpression(node.parent) && node.parent.arguments.nodes.includes(node),
+    )
+  )
+    return null;
+  const edits = [
+    ...annotations.map((node) => ({ start: tokenStartOfNode(node), end: node.end, text: "" })),
+    ...reads.map((node) => ({ start: tokenStartOfNode(node), end: node.end, text: "__scget()" })),
+  ];
+  let text = sf.text;
+  for (const edit of edits.sort((a, b) => b.start - a.start)) {
+    let next = 0;
+    const replacement = text
+      .slice(edit.start, edit.end)
+      .replace(/[^\r\n]/g, () => edit.text[next++] ?? " ");
+    text = text.slice(0, edit.start) + replacement + text.slice(edit.end);
+  }
+  host.lexerVisibleNames?.(sf.fileName, [...cjsLexedExportsOfFile(sf).exports]);
+  return (
+    text +
+    "\nvar __scex;\nfunction __scget() { return __scex || (__scex = /** @type {any} */ ({})); }\nmodule.exports = __scget();\n"
+  );
+}
+
 /** The rewrite (see the header). Null = not a recognized bundle shape (or
  * nothing to fix) — serve the file untouched. A `{ degrade }` answer means
  * the file carries a bundler-interop construct the recognizers cannot
@@ -589,6 +698,10 @@ export function rewriteBundlerCjsSyntax(
           "bundler-interop helper, which cannot compile natively in ESM output",
     };
   }
+
+  const annotated = rewriteAnnotatedExportObject(sf, host);
+  if (annotated !== null) return annotated;
+  if (!isBundlerInteropCandidate(source)) return null;
 
   // The __toESM interop pass (see the section header): wrapper call sites
   // pad down to the bare require they wrap, module-valued `.default`

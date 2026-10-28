@@ -1,3 +1,5 @@
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
+import { mapRootOf, mapPrototypeValue } from "../builtins/map-classes.js";
 /* Property reads (`a.b`): lowerExprInner's property-access branch, intrinsic and union properties, field reads and targets, and match-group reads. */
 import { indexedUnionArms, lowerIndexedUnionMember } from "../indexed-unions.js";
 import { keyedHelperName } from "../stable-names.js";
@@ -111,7 +113,14 @@ import {
   lowerNodeModuleProperty,
   lowerRequireMainProperty,
 } from "../lower-node-module.js";
-import { dynUndefinedExpr, nodeThrowExpr, numLit, strLit, varRef } from "../../../ir/build.js";
+import {
+  dynUndefinedExpr,
+  helperLoc,
+  nodeThrowExpr,
+  numLit,
+  strLit,
+  varRef,
+} from "../../../ir/build.js";
 import { typedArrayLacksMember } from "../builtins/typed-array-members.js";
 import { TEMPORAL_GLOBAL } from "../../builtin-modules.js";
 import { tryLowerExpression } from "./try-lower-expression.js";
@@ -166,7 +175,7 @@ import { lowerNetAddressStaticRead } from "../builtins/net-address.js";
 import { STATS_TYPE_TESTS } from "../builtins/filesystem.js";
 import { arrayValueRead, arrayValueType } from "../array-values.js";
 import { lowerClassMethodValue } from "../class-method-values.js";
-import { reflectMemberValue } from "../builtins/reflection.js";
+import { reflectMemberValue, reflectMetadataMemberValue } from "../builtins/reflection.js";
 import {
   objLitGenericFnInfoOf,
   objLitGenericFnNodeOf,
@@ -308,6 +317,56 @@ function isCreateRequireResolveValue(lowerer: Lowerer, expr: ts.PropertyAccessEx
   );
 }
 
+/** A member read off a type assertion over a checked-dynamic binding
+ * (`(options as Adapter).patch`, the duck-typing probe a union parameter
+ * takes in a package, or `(instance as OnInit).onInit` over an `unknown`
+ * parameter): an assertion checks nothing in JavaScript, so the
+ * member comes from whatever value the binding holds, undefined when it
+ * lacks it. Null when the read is not such a probe. */
+function lowerAssertedDynMemberRead(
+  lowerer: Lowerer,
+  expr: ts.PropertyAccessExpression,
+  loc: SrcLoc,
+): IrExpr | null {
+  if (!isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName)) return null;
+  let asserted: ts.Expression = expr.expression;
+  while (ts.isParenthesizedExpression(asserted)) asserted = asserted.expression;
+  if (!ts.isAsExpression(asserted) && !ts.isTypeAssertion(asserted)) return null;
+  let inner: ts.Expression = asserted.expression;
+  while (ts.isParenthesizedExpression(inner) || ts.isNonNullExpression(inner))
+    inner = inner.expression;
+  if (!ts.isIdentifier(inner)) return null;
+  // Only where the declared type admits values of another kind (an
+  // `Adapter | Options` union): the assertion then names one arm of
+  // several, and the value may be another.
+  const target = lowerer.typeOf(asserted);
+  const declared = lowerer.typeOf(inner);
+  const otherArm =
+    (declared.flags & (ts.TypeFlags.Unknown | ts.TypeFlags.Any)) !== 0 ||
+    (declared.isUnionType() &&
+      ts
+        .constituentTypes(declared)
+        .some(
+          (part) =>
+            (part.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null)) === 0 &&
+            part.getSymbol() !== target.getSymbol(),
+        ));
+  if (!otherArm) return null;
+  const value = lowerer.lowerExpr(inner);
+  if (value.type.kind !== "dyn") return null;
+  return lowerer.maybeNarrow(
+    {
+      kind: "dynKeyGet",
+      value,
+      key: { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) },
+      ...(hasOptionalChainGuard(expr.expression, lowerer) ? { optional: true as const } : {}),
+      type: DYN,
+      loc,
+    },
+    expr,
+  );
+}
+
 export function lowerPropertyAccessExpr(
   lowerer: Lowerer,
   expr: ts.PropertyAccessExpression,
@@ -330,6 +389,10 @@ export function lowerPropertyAccessExpr(
         loc,
       };
     }
+  }
+  {
+    const probe = lowerAssertedDynMemberRead(lowerer, expr, loc);
+    if (probe) return probe;
   }
   // Node's navigator is never nullish, so `navigator?.userAgent` (zod's
   // Cloudflare probe) folds like `navigator.userAgent`.
@@ -497,6 +560,33 @@ export function lowerPropertyAccessExpr(
   if (requireMain) return requireMain;
   const moduleProperty = lowerNodeModuleProperty(lowerer, expr);
   if (moduleProperty) return moduleProperty;
+  // Observable's proposed symbol is absent from the pinned Node runtime.
+  // Libraries may augment SymbolConstructor's types without installing it.
+  if (
+    stdlibGlobalNameOf(lowerer, expr.expression) === "Symbol" &&
+    expr.name.text === "observable"
+  ) {
+    let probe: ts.Node = expr;
+    while (probe.parent) {
+      const parent = probe.parent;
+      if (ts.isTypeOfExpression(parent)) return dynUndefinedExpr(loc);
+      if (
+        ts.isParenthesizedExpression(parent) ||
+        (ts.isBinaryExpression(parent) &&
+          parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken)
+      ) {
+        probe = parent;
+        continue;
+      }
+      if (
+        ts.isBinaryExpression(parent) &&
+        parent.left === probe &&
+        parent.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      )
+        return dynUndefinedExpr(loc);
+      break;
+    }
+  }
   if (
     stdlibGlobalNameOf(lowerer, expr.expression) === "Symbol" &&
     [
@@ -754,6 +844,10 @@ export function lowerPropertyAccessExpr(
         }
         return { kind: "numLit", value: count, type: F64, loc };
       }
+      // An optional-parameter declaration reads the count its direct call
+      // stored (argument-counts.ts).
+      if (ts.isFunctionDeclaration(fn) && lowerer.ctx.argumentCount !== undefined)
+        return varRef(lowerer.ctx.argumentCount.id, F64, loc);
       lowerer.unsupported(
         "SC1090",
         expr,
@@ -1057,7 +1151,12 @@ export function lowerPropertyAccessExpr(
         : { kind: "strIntrinsic", method: "length", receiver: recv, args: [], type: F64, loc };
     }
   }
-  if (isJsSourceFile(ts.getSourceFileOfNode(expr)) && expr.name.text === "constructor") {
+  // A dependency's TypeScript reads `this.constructor` as JavaScript does.
+  if (
+    (isJsSourceFile(ts.getSourceFileOfNode(expr)) ||
+      isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName)) &&
+    expr.name.text === "constructor"
+  ) {
     const receiver = tryLowerExpression(lowerer, expr.expression);
     if (
       receiver?.type.kind === "dyn" ||
@@ -1343,6 +1442,28 @@ export function lowerPropertyAccessExpr(
   // The lib fence's PROPERTY chokepoint: a stdlib-declared member that
   // no lowering above claimed ([1,2].entries, Math.SQRT2, Promise.all,
   // re.exec as a value, ...) reports SC2020 here.
+  // A package's stdlib-typed member (`metatype.prototype` over a
+  // `Function | Type<T>`) read off a value the lowering holds checked-dynamic:
+  // the member is a property of whatever the value is.
+  if (
+    !expr.questionDotToken &&
+    isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName) &&
+    lowerer.isStdlibMember(expr)
+  ) {
+    const receiver = tryLowerExpression(lowerer, expr.expression);
+    if (receiver?.type.kind === "dyn") {
+      return lowerer.maybeNarrow(
+        {
+          kind: "dynKeyGet",
+          value: receiver,
+          key: { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) },
+          type: DYN,
+          loc,
+        },
+        expr,
+      );
+    }
+  }
   lowerer.stdlibMemberFence(expr);
   // The npm chokepoint: a member on a package-typed receiver in a
   // static build — attributed to the package, like every other site.
@@ -1531,6 +1652,24 @@ export function lowerPropertyAccessExpr(
     const mapped = lowerer.mapTypeOf(lowerer.typeOf(expr));
     return mapped && mapped.kind !== "void" ? lowerer.coerceInto(expr, read, mapped) : read;
   }
+  // A function value read through a checker `any` (`(fn as any).default`,
+  // the CommonJS interop probe): the member comes from the function's own
+  // property table, through its checked-dynamic face.
+  if (
+    recvLowered.type.kind === "func" &&
+    (lowerer.typeOf(expr.expression).flags & ts.TypeFlags.Any) !== 0
+  ) {
+    return lowerer.maybeNarrow(
+      {
+        kind: "dynKeyGet",
+        value: lowerer.coerceToExpected(recvLowered, DYN),
+        key: { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) },
+        type: DYN,
+        loc,
+      },
+      expr,
+    );
+  }
   const asserted = assertedMemberRead(lowerer, expr, recvLowered, loc);
   if (asserted) return asserted;
   // A checker-`any` receiver whose value is a FRESH typed result of an
@@ -1580,6 +1719,24 @@ export function lowerPropertyAccessExpr(
   if (
     recvLowered.type.kind === "bytes" &&
     (lowerer.typeOf(expr.expression).flags & ts.TypeFlags.Any) !== 0
+  ) {
+    return lowerer.maybeNarrow(
+      {
+        kind: "dynKeyGet",
+        value: lowerer.coerceToExpected(recvLowered, DYN),
+        key: { kind: "strLit", value: expr.name.text, type: STRING, loc },
+        type: DYN,
+        loc,
+      },
+      expr,
+    );
+  }
+  // A value typed as a generic FAMILY (`Box<any>`) holds an instance of any
+  // instantiation, so a member outside the shared layout reads from the
+  // instance itself.
+  if (
+    nativeReceiver.kind === "object" &&
+    lowerer.classes.get(nativeReceiver.className)?.generic !== undefined
   ) {
     return lowerer.maybeNarrow(
       {
@@ -1748,8 +1905,12 @@ export function lowerIntrinsicProperty(
       );
     }
   }
-  if (lowerer.stdlibGlobalMember(expr, "Reflect") === "ownKeys")
-    return reflectMemberValue(lowerer, "ownKeys", locOf(expr));
+  const reflectMember = lowerer.stdlibGlobalMember(expr, "Reflect");
+  if (reflectMember) {
+    const metadata = reflectMetadataMemberValue(lowerer, reflectMember, locOf(expr));
+    if (metadata) return metadata;
+  }
+  if (reflectMember === "ownKeys") return reflectMemberValue(lowerer, "ownKeys", locOf(expr));
   if (lowerer.chainBlocked(expr)) return null;
   // Object.prototype.constructor: the Object constructor value.
   if (
@@ -1794,6 +1955,31 @@ export function lowerIntrinsicProperty(
     lowerer.stdlibGlobalMember(expr.expression, "Function") === "prototype"
   )
     return { kind: "libCall", fn: "dyn.functionApply", args: [], type: DYN, loc: locOf(expr) };
+  // `Function.prototype.bind` / `.call` as values: the runtime's own
+  // function-prototype members, read off the shared prototype object.
+  if (
+    (expr.name.text === "bind" || expr.name.text === "call") &&
+    ts.isPropertyAccessExpression(expr.expression) &&
+    lowerer.stdlibGlobalMember(expr.expression, "Function") === "prototype"
+  )
+    return {
+      kind: "dynKeyGet",
+      value: {
+        kind: "libCall",
+        fn: "dyn.functionPrototype",
+        args: [],
+        type: DYN,
+        loc: locOf(expr.expression),
+      },
+      key: { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) },
+      type: DYN,
+      loc: locOf(expr),
+    };
+  if (
+    lowerer.stdlibGlobalMember(expr, "Map") === "prototype" &&
+    [...lowerer.classes.values()].some((info) => info.extendsMap)
+  )
+    return mapPrototypeValue(locOf(expr));
   if (lowerer.stdlibGlobalMember(expr, "Array") === "prototype")
     return { kind: "libCall", fn: "dyn.arrayPrototype", args: [], type: DYN, loc: locOf(expr) };
   if (lowerer.stdlibGlobalMember(expr, "Object") === "prototype")
@@ -1811,34 +1997,10 @@ export function lowerIntrinsicProperty(
       type: DYN,
       loc: locOf(expr),
     };
-  // Function.prototype as a VALUE (a prototype-chain link:
-  // `Object.setPrototypeOf(F.prototype, Function.prototype)`): one
-  // anonymous function answering undefined, length 0 — a zero-capture
-  // closure of a compiler helper, so every read is the same function
-  // (closure identity) and shares its property table. Reads through it
-  // find the function members the checked runtime models for every
-  // function (apply, constructor, name, length). Member forms keep their
-  // own lowerings.
-  if (lowerer.stdlibGlobalMember(expr, "Function") === "prototype") {
-    const loc = locOf(expr);
-    const name = "%dyn.functionPrototype";
-    if (!lowerer.liftedFns.some((fn) => fn.name === name))
-      lowerer.liftedFns.push({
-        name,
-        params: [],
-        locals: [],
-        returnType: DYN,
-        body: [{ kind: "return", value: dynUndefinedExpr(loc), loc }],
-        loc,
-      });
-    return {
-      kind: "dynFrom",
-      value: { kind: "closure", fnName: name, captures: [], type: funcOf([], DYN), loc },
-      fnName: "",
-      type: DYN,
-      loc,
-    };
-  }
+  // Function.prototype is shared with runtime prototype traversal, including
+  // functions and constructors obtained through checked-dynamic values.
+  if (lowerer.stdlibGlobalMember(expr, "Function") === "prototype")
+    return { kind: "libCall", fn: "dyn.functionPrototype", args: [], type: DYN, loc: locOf(expr) };
   if (lowerer.stdlibGlobalMember(expr, "Array") === "isArray")
     return lowerArrayIsArrayValue(lowerer, locOf(expr));
   if (lowerer.stdlibGlobalMember(expr, "Array") === "from")
@@ -3372,6 +3534,12 @@ export function lowerUnionProperty(
       }
     }
   }
+  // `length` of a union of strings, arrays and typed arrays (`path: string
+  // | string[]`): each arm answers its own length.
+  if (field === "length") {
+    const lengthRead = lowerUnionLengthRead(lowerer, expr, value);
+    if (lengthRead) return lengthRead;
+  }
   const nonUnitArms = def.arms.filter((arm) => !isUnitType(arm));
   if (nonUnitArms.length === 1 && nonUnitArms[0]?.kind === "object") {
     const objectType = nonUnitArms[0];
@@ -3466,6 +3634,113 @@ export function lowerUnionProperty(
       `with a same-typed field '${field}'; ` +
       `${NARROW_FIRST})`,
   );
+}
+
+/** `u.length` over a union whose present arms are strings, arrays and typed
+ * arrays: a lifted helper tests the tag and reads the arm's own length. A
+ * unit arm (a value the checker narrowed away) throws Node's TypeError. */
+function lowerUnionLengthRead(
+  lowerer: Lowerer,
+  expr: ts.PropertyAccessExpression,
+  value: IrExpr,
+): IrExpr | null {
+  if (value.type.kind !== "union") return null;
+  const def = lowerer.unions.get(value.type.unionId);
+  if (!def) return null;
+  const present = def.arms.flatMap((arm, tag) => (isUnitType(arm) ? [] : [{ arm, tag }]));
+  if (present.length < 2) return null;
+  if (
+    !present.every(
+      ({ arm }) => arm.kind === "string" || arm.kind === "array" || arm.kind === "bytes",
+    )
+  )
+    return null;
+  // Typed arrays only: the inline per-arm form keeps the loop counter an
+  // integer (lowerIndexedUnionMember); a helper call hides the length.
+  if (present.every(({ arm }) => arm.kind === "bytes")) return null;
+  const loc = locOf(expr);
+  const key = `unionLength:${typeKey(value.type)}`;
+  let name = lowerer.arrHofHelpers.get(key);
+  if (name === undefined) {
+    name = keyedHelperName(lowerer, "%union.length", key);
+    lowerer.arrHofHelpers.set(key, name);
+    const at = helperLoc(loc);
+    const union = value.type;
+    const u = varRef("u.0", union, at);
+    const stmts: IrStmt[] = [];
+    for (const { arm, tag } of present) {
+      const narrowed: IrExpr = {
+        kind: "unionNarrow",
+        unionId: union.unionId,
+        tag,
+        value: u,
+        type: arm,
+        loc: at,
+      };
+      const read: IrExpr =
+        arm.kind === "string"
+          ? {
+              kind: "strIntrinsic",
+              method: "length",
+              receiver: narrowed,
+              args: [],
+              type: F64,
+              loc: at,
+            }
+          : arm.kind === "array"
+            ? {
+                kind: "arrIntrinsic",
+                method: "length",
+                receiver: narrowed,
+                args: [],
+                type: F64,
+                loc: at,
+              }
+            : {
+                kind: "bytesIntrinsic",
+                method: "length",
+                receiver: narrowed,
+                args: [],
+                type: F64,
+                loc: at,
+              };
+      stmts.push({
+        kind: "if",
+        cond: {
+          kind: "unionIsTag",
+          unionId: union.unionId,
+          tag,
+          negated: false,
+          value: u,
+          type: BOOL,
+          loc: at,
+        },
+        then: [{ kind: "return", value: read, loc: at }],
+        else_: null,
+        loc: at,
+      });
+    }
+    stmts.push({
+      kind: "return",
+      value: nodeThrowExpr(
+        1,
+        "",
+        "Cannot read properties of undefined (reading 'length')",
+        F64,
+        at,
+      ),
+      loc: at,
+    });
+    lowerer.liftedFns.push({
+      name,
+      params: [{ localId: "u.0", name: "u", type: union }],
+      returnType: F64,
+      locals: [{ id: "u.0", name: "u", type: union, mutable: false }],
+      body: stmts,
+      loc: at,
+    });
+  }
+  return { kind: "call", callee: name, args: [value], type: F64, loc };
 }
 
 /** The unionDisc generalization: a keyed read on a union receiver whose
@@ -3684,6 +3959,14 @@ export function classFieldTarget(
       className: receiverType.className,
       field: fieldName,
       fieldType: getF ? getF.sig.ret : setF!.sig.params[0]!.type,
+    };
+  }
+  if (mapRootOf(info) && !fieldName.startsWith("#")) {
+    return {
+      container: "dynamic",
+      obj: lowerer.coerceToExpected(lowerObjectReceiver(), DYN),
+      field: fieldName,
+      fieldType: DYN,
     };
   }
   if (info.decl && isJsSourceFile(ts.getSourceFileOfNode(info.decl))) {
@@ -4060,7 +4343,7 @@ export function fieldGetExpr(
       };
       return lowerer.coerceToExpected(value, getF.sig.ret);
     }
-    return lowerer.accessorCall(
+    const read = lowerer.accessorCall(
       target.className,
       `get:${target.field}`,
       target.obj,
@@ -4068,6 +4351,18 @@ export function fieldGetExpr(
       getF.sig.ret,
       loc,
     );
+    // A getter over a deferred-init field answers the field's undefined-armed
+    // slot; the property reads the declared type, checked, unless the
+    // consumer observes undefined itself (Lowerer.deferredFieldSlot).
+    if (getF.sig.deferredRead === true && getF.sig.ret.kind === "union") {
+      const inner = lowerer.stripUndefinedArm(getF.sig.ret);
+      const helper = lowerer.deferredReadHelper(getF.sig.ret.unionId, inner, loc);
+      if (helper) {
+        lowerer.deferredGetterReads.add(read);
+        return { kind: "call", callee: helper, args: [read], type: inner, loc };
+      }
+    }
+    return read;
   }
   // Record accessor properties: the read IS a call of the %get: closure
   // — once per read, side effects and all (JS's evaluation). The
@@ -4286,7 +4581,9 @@ export function builtinFunctionValue(name: string, loc: SrcLoc): IrExpr {
  * constructors in both languages, builtin functions in JavaScript), or
  * null when it stays an identity token (JavaScript) or fenced. */
 export function builtinGlobalValue(canonical: string, loc: SrcLoc, js = false): IrExpr | null {
-  if (js && GLOBAL_FUNCTION_VALUES.has(canonical)) return builtinFunctionValue(canonical, loc);
+  // Both source languages: TypeScript reads the timer globals as values too
+  // (`(delegate?.clearTimeout || clearTimeout)(handle)`).
+  if (GLOBAL_FUNCTION_VALUES.has(canonical)) return builtinFunctionValue(canonical, loc);
   if (js && canonical === "Buffer")
     return { kind: "libCall", fn: "buffer.constructor", args: [], type: DYN, loc };
   if (GLOBAL_CONSTRUCTOR_VALUES.has(canonical)) {
@@ -4316,6 +4613,7 @@ const BUILTIN_VALUE_REFLECTION: ReadonlySet<string> = new Set([
   "values",
   "entries",
   "isExtensible",
+  "getPrototypeOf",
   "isFrozen",
   "isSealed",
 ]);
@@ -4336,7 +4634,8 @@ export function builtinGlobalValueAt(
 ): IrExpr | null {
   // A namespace object models its own properties, so member reads and
   // reflection read it like any object.
-  const namespace = js ? builtinNamespaceValue(lowerer, canonical, loc) : null;
+  const namespace =
+    js || canonical === "Reflect" ? builtinNamespaceValue(lowerer, canonical, loc) : null;
   if (namespace !== null) return namespace;
   if (readsBuiltinGlobalMembers(expr)) return null;
   const value = builtinGlobalValue(canonical, loc, js);
@@ -4542,6 +4841,36 @@ export function isPromisePrototypeRead(lowerer: Lowerer, expr: ts.Expression | u
     inner.name.text === "constructor" &&
     lowerer.mapTypeOf(lowerer.typeOf(inner.expression))?.kind === "promise"
   );
+}
+
+/** `Function.prototype.bind`/`call`/`apply` read as a value
+ * (`const _bind = Function.prototype.bind`, rxjs's Subscriber): the member
+ * is the runtime's own checked-dynamic function, whose declared signature
+ * (`this: Function`, `thisArg: any`) has no static function type, so a
+ * binding of it stays checked-dynamic. */
+function isFunctionPrototypeMethodRead(lowerer: Lowerer, expr: ts.Expression): boolean {
+  while (ts.isParenthesizedExpression(expr)) expr = expr.expression;
+  if (!ts.isPropertyAccessExpression(expr) || expr.questionDotToken) return false;
+  if (expr.name.text !== "bind" && expr.name.text !== "call" && expr.name.text !== "apply")
+    return false;
+  const proto = expr.expression;
+  return (
+    ts.isPropertyAccessExpression(proto) &&
+    !proto.questionDotToken &&
+    lowerer.stdlibGlobalMember(proto, "Function") === "prototype"
+  );
+}
+
+/** A binding initializer whose value is an ordinary checked-dynamic object or
+ * function the checker types more narrowly than any static layout: a
+ * Promise prototype read (isPromisePrototypeRead) or a Function.prototype
+ * method read. */
+export function isDynPrototypeValueRead(
+  lowerer: Lowerer,
+  expr: ts.Expression | undefined,
+): boolean {
+  if (!expr) return false;
+  return isPromisePrototypeRead(lowerer, expr) || isFunctionPrototypeMethodRead(lowerer, expr);
 }
 
 /** A promise's `constructor` (the Promise constructor value), and

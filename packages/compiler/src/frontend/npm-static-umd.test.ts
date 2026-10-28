@@ -119,3 +119,37 @@ test("other shapes keep the original text", () => {
   // Not a UMD wrapper.
   expect(unwrap(`exports.a = 1;\n`)).toBeNull();
 });
+
+test("a module that is one parameterless IIFE runs its body at the top level", () => {
+  const source = `(function () {
+
+  'use strict';
+
+  var path = require('path');
+  function join(a, b) { return a + path.sep + b; }
+  module.exports = join;
+  module.exports.self = function () { return this === module.exports; };
+
+})();
+`;
+  const result = expectSameModule(source);
+  expect(result.length).toBe(source.length);
+  expect(result.indexOf("module.exports = join;")).toBe(source.indexOf("module.exports = join;"));
+  expect(result.trimStart().startsWith("'use strict';")).toBe(true);
+  expectSameModule(`;(function () {\n  exports.a = 1;\n}());\n`);
+});
+
+test("module IIFEs that differ from the module's top level keep the original text", () => {
+  const iife = (body: string, call = "})();"): string => `(function () {\n${body}\n${call}\n`;
+  expect(unwrap(iife(`  exports.self = this;`))).toBeNull();
+  expect(unwrap(iife(`  exports.n = arguments.length;`))).toBeNull();
+  expect(unwrap(iife(`  if (exports.a) return;\n  exports.a = 1;`))).toBeNull();
+  // Shadowed wrapper bindings.
+  expect(unwrap(iife(`  var module = { exports: {} };\n  module.exports.a = 1;`))).toBeNull();
+  expect(unwrap(iife(`  function require() {}\n  exports.a = 1;`))).toBeNull();
+  // Arguments, parameters, a name, or other statements.
+  expect(unwrap(iife(`  exports.a = 1;`, "})(1);"))).toBeNull();
+  expect(unwrap(`(function (x) {\n  exports.a = x;\n})();\n`)).toBeNull();
+  expect(unwrap(`(function named() {\n  exports.a = 1;\n})();\n`)).toBeNull();
+  expect(unwrap(iife(`  exports.a = 1;`) + "exports.b = 2;\n")).toBeNull();
+});

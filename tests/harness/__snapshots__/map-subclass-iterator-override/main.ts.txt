@@ -1,0 +1,13 @@
+map-subclass-iterator-override/main.ts:2:3 - error SC1090: Map subclasses overriding Symbol.iterator (native inherited iterator protocol) is not supported yet
+
+  1 | class Container extends Map<string, number> {
+  2 |   [Symbol.iterator](): MapIterator<[string, number]> {
+    |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  3 |     return super[Symbol.iterator]();
+
+map-subclass-iterator-override/main.ts:6:1 - error SC1090: constructing through a class value whose class has no lowering (the class declaration itself was rejected — see its own diagnostic) is not supported yet
+
+  5 | }
+  6 | new Container();
+    | ^~~~~~~~~~~~~~~
+  7 | 

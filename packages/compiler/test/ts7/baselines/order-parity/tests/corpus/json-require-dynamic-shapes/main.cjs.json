@@ -1,0 +1,7 @@
+{
+ "order": [
+  "<repo>/tests/corpus/json-require-dynamic-shapes/shared.cjs",
+  "<repo>/tests/corpus/json-require-dynamic-shapes/main.cjs"
+ ],
+ "diags": []
+}

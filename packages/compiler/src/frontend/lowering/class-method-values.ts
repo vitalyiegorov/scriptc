@@ -3,6 +3,7 @@ import {
   BOOL,
   DYN,
   STRING,
+  UNDEFINED_T,
   RUNTIME_ERROR_CLASSES,
   typeEquals,
   typeKey,
@@ -14,8 +15,8 @@ import {
 } from "../../ir/ir.js";
 import { nodeThrowExpr, varRef } from "../../ir/build.js";
 import { everyStmtList, transformStmtList } from "../../ir/traverse.js";
-import { isJsSourceFile, locOf } from "../program.js";
-import { newFnCtx, type Lowerer } from "./lowerer.js";
+import { defersToRuntime, isJsSourceFile, locOf } from "../program.js";
+import { newFnCtx, PoisonError, type Lowerer } from "./lowerer.js";
 import {
   classMemberNameOf,
   findGenericMethodOn,
@@ -37,6 +38,9 @@ export interface ClassMethodValueSelection {
   fn: IrFunction;
   checked: boolean;
   values: Map<string, IrExpr>;
+  /** The member's `T | undefined` slot when it is declared optional
+   * (`m?(): T;`): classes without an implementation answer undefined. */
+  optional?: IrType;
 }
 
 /** A method value retains its declaration's identity, not the receiver from
@@ -68,15 +72,25 @@ export function lowerClassMethodValue(
     };
   // Abstract declarations have no prototype function. Concrete descendants
   // provide the extracted value through the same reachability-driven selector.
-  let value = declared?.sig.abstract
-    ? nodeThrowExpr(
-        1,
-        "",
-        `Missing implementation of method '${method}'`,
-        funcTypeFromParamShapes(declared.sig.params, declared.sig.ret),
-        loc,
+  const optionalSlot =
+    declared?.sig.optional === true
+      ? lowerer.runtimeOptionalType(funcTypeFromParamShapes(declared.sig.params, declared.sig.ret))
+      : null;
+  const optional = optionalSlot?.kind === "union" ? optionalSlot : undefined;
+  let value = optional
+    ? lowerer.coerceToExpected(
+        { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc },
+        optional,
       )
-    : methodValue(lowerer, expr, info);
+    : declared?.sig.abstract
+      ? nodeThrowExpr(
+          1,
+          "",
+          `Missing implementation of method '${method}'`,
+          funcTypeFromParamShapes(declared.sig.params, declared.sig.ret),
+          loc,
+        )
+      : methodValue(lowerer, expr, info);
   if (!value) return null;
   const callback = isClassCallback(lowerer, info, method);
   const local = callback ? lowerer.declareHiddenLocal("%callbackReceiver", receiver.type) : null;
@@ -119,6 +133,7 @@ export function lowerClassMethodValue(
       fn,
       checked,
       values: new Map(),
+      ...(optional ? { optional } : {}),
     });
     lowerer.classMethodValueHelpers.add(name);
   }
@@ -144,18 +159,24 @@ export function refreshClassMethodValueSelections(lowerer: Lowerer): boolean {
         continue;
       let value = methodValue(lowerer, selection.expression, candidate);
       if (value && selection.checked) value = lowerer.coerceToExpected(value, DYN);
+      if (value && selection.optional) value = lowerer.coerceToExpected(value, selection.optional);
       if (value && !typeEquals(value.type, selection.fallback.type)) {
         const widened = lowerer.coerceCovariantFunction(value, selection.fallback.type);
         // Only a representation-preserving view can keep extraction's
         // identity contract across differently typed base/derived views.
         if (widened) value = widened;
       }
-      if (!value || !typeEquals(value.type, selection.fallback.type))
-        lowerer.unsupported(
-          "SC1090",
-          selection.expression,
-          "method values with incompatible override signatures",
-        );
+      if (!value || !typeEquals(value.type, selection.fallback.type)) {
+        // A package's method value over an incompatible override keeps the
+        // class compiling: that class's value throws the fence when called.
+        value = deferredMethodValue(lowerer, selection.expression, selection.fallback.type);
+        if (value === null)
+          lowerer.unsupported(
+            "SC1090",
+            selection.expression,
+            "method values with incompatible override signatures",
+          );
+      }
       selection.values.set(candidate.def.name, value);
       added = true;
     }
@@ -183,6 +204,34 @@ export function refreshClassMethodValueSelections(lowerer: Lowerer): boolean {
   return changed;
 }
 
+let deferredMethodValues = 0;
+
+/** A function value that throws the incompatible-override fence when called,
+ * for method values written in JavaScript or package TypeScript. */
+function deferredMethodValue(lowerer: Lowerer, blame: ts.Node, type: IrType): IrExpr | null {
+  if (type.kind !== "func" || !defersToRuntime(ts.getSourceFileOfNode(blame))) return null;
+  const diagsBefore = lowerer.diags.length;
+  try {
+    lowerer.unsupported("SC1090", blame, "method values with incompatible override signatures");
+  } catch (e) {
+    if (!(e instanceof PoisonError)) throw e;
+  }
+  const params = type.params.map((t, i) => ({
+    localId: `%pf${i}`,
+    name: `%pf${i}`,
+    type: t,
+  }));
+  if (type.rest === true && type.restAbi === undefined)
+    params.push({ localId: "%pfrest", name: "%pfrest", type: DYN });
+  return lowerer.deferToRuntimeFence(diagsBefore, blame, {
+    kind: "closure",
+    name: `%method.value.fence.${deferredMethodValues++}`,
+    params,
+    returnType: type.ret,
+    type,
+  });
+}
+
 function methodValue(
   lowerer: Lowerer,
   expr: ts.PropertyAccessExpression,
@@ -197,6 +246,9 @@ export function classMethodValue(
   info: ClassInfo,
   method: string,
   loc: SrcLoc,
+  /** The caller selects among the overriding classes itself (an untyped
+   * lookup picks the method by the receiver's runtime class). */
+  selectsOverrides = false,
 ): IrExpr | null {
   const found = findMethodOn(lowerer, info, method);
   const generic = found ? null : findGenericMethodOn(lowerer, info, method);
@@ -216,13 +268,18 @@ export function classMethodValue(
       lowerer.unsupported("SC1090", blame, "values of abstract method declarations");
     params = found.sig.params;
     ret = found.sig.ret;
+    // An async method whose declared result is not spelled as a promise (a
+    // JS `async` method inferred `any`) is still called as one: the function
+    // returns its settled value and every call site sees the promise.
+    if (found.sig.async === true && ret.kind !== "promise" && ret.kind !== "generator")
+      ret = { kind: "promise", inner: ret };
     callee = `%${owner.def.name}.${method}`;
     if (!owner.builtinError) lowerer.noteEdge(callee);
   } else if (
     generic?.info.implicitParams &&
     generic.declarer.decl &&
-    !lowerer.overrideBelow(info, method) &&
-    !genericOverrideBelow(info, method)
+    (selectsOverrides ||
+      (!lowerer.overrideBelow(info, method) && !genericOverrideBelow(info, method)))
   ) {
     owner = generic.declarer;
     const instance = implicitDefaultInstance(lowerer, owner.decl!, generic.info);
@@ -234,8 +291,8 @@ export function classMethodValue(
     !generic.info.implicitParams &&
     generic.info.typeParams.length > 0 &&
     generic.declarer.decl &&
-    !lowerer.overrideBelow(info, method) &&
-    !genericOverrideBelow(info, method)
+    (selectsOverrides ||
+      (!lowerer.overrideBelow(info, method) && !genericOverrideBelow(info, method)))
   ) {
     // A generic method as a value: its erased instance.
     owner = generic.declarer;
@@ -627,8 +684,12 @@ export function finalizeClassMethodValues(lowerer: Lowerer, functions: IrFunctio
     functions.push({
       ...detached,
       name,
+      body: structuredClone(target.body),
       params: target.params.slice(1),
-      locals: target.locals.filter((local) => local.id !== thisParam.localId),
+      // Copies: a later rewrite retypes the target's locals in place.
+      locals: target.locals
+        .filter((local) => local.id !== thisParam.localId)
+        .map((local) => ({ ...local })),
     });
     fn.body = transformStmtList(fn.body, {
       stmt: (stmt) => stmt,

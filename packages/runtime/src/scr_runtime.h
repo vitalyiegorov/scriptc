@@ -50,6 +50,7 @@
 #include "scr_bigint.h"
 #include "scr_os.h"
 #include "scr_dyn.h"
+#include "scr_intl_datetime.h"
 #include "scr_json.h"
 #include "scr_event_target.h"
 #include "scr_blob.h"

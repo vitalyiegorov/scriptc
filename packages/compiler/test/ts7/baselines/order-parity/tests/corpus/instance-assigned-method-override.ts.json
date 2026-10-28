@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/instance-assigned-method-override.ts"
+ ],
+ "diags": []
+}

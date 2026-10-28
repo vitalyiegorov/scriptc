@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8532-optional-method-call-interface-getter.ts"
+ ],
+ "diags": []
+}

@@ -10,8 +10,7 @@ import type { IrModule } from "../src/ir/ir.js";
 // which hoists the constructor and the helper it calls. Those bodies are
 // kept, so their failing statements must keep runtime fences; dropping
 // them left `isNum` without its return (an SC9002 trap at load). isNum's
-// return reads the prototype through Reflect.getPrototypeOf, which has no
-// lowering, so it fences.
+// return calls Reflect.isExtensible, which has no lowering, so it fences.
 const source = `
 function clone(config) {
   var P = (Num.prototype = { constructor: Num, toString: null }),
@@ -22,7 +21,7 @@ function clone(config) {
     x.v = isNum(v) ? 0 : v * unit;
   }
   function isNum(v) {
-    return Reflect.getPrototypeOf(v) === P || (!!v && v._isNum === true);
+    return Reflect.isExtensible(v) === !P || (!!v && v._isNum === true);
   }
   P._isNum = true;
   return Num;

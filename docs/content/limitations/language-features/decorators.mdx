@@ -1,0 +1,9 @@
+- **Decorators:** TypeScript's legacy class, method, accessor, property, and parameter decorators compile with `experimentalDecorators` enabled.
+  `emitDecoratorMetadata` emits design-type metadata; import `reflect-metadata` before decorated classes to store and read it.
+  Extending a decorated class whose constructor was replaced by another native class is unsupported.
+  A class decorator that returns a subclass of its target (`return class extends target {}`) is unsupported.
+  Class fields always use define semantics, so `useDefineForClassFields: false` with `experimentalDecorators` is refused.
+  A decorated class is untyped after lowering: pass explicit type arguments where a generic call would infer its instance type (`make<Service>(Service)` for `make<T>(type: new () => T): T`), and give an undecorated subclass its own constructor when it is constructed with arguments.
+  Newer JavaScript decorators support only a subset of class decorators that do not use the standard context argument.
+  Newer member decorators, `addInitializer`, and context metadata are unsupported.
+  Decorator syntax in JavaScript files is unsupported.

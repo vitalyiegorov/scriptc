@@ -522,7 +522,7 @@ ScrDyn *scr_dyn_array_proto_call(ScrDyn *recv, ScrStr *method, ScrDyn *args) {
     }
     ScrDyn *item = dyn_borrow_item(recv, index);
     if (!item) { scr_dyn_release(out); return NULL; }
-    scr_dyn_this_push_dyn(this_arg);
+    scr_dyn_this_push_borrowed(this_arg); /* argv holds it for the whole call */
     ScrDyn *result = dyn_call_cb(cb, item, index, recv);
     scr_dyn_this_pop();
     if (!result) { scr_dyn_release(item); scr_dyn_release(out); return NULL; }
@@ -562,9 +562,7 @@ static ScrDyn *scr_dynh_dispatch(ScrDyn *recv, const char *method, ScrDyn *const
   ScrDyn *callable = ops->get ? ops->get(recv->v.handle.ptr, method, strlen(method)) : NULL;
   if (scr_exc_pending()) { scr_dyn_release(callable); return NULL; }
   if (!callable) callable = scr_dyn_retain(scr_dyn_undefined());
-  scr_dyn_this_push_dyn(recv);
-  ScrDyn *result = scr_dyn_call(callable, args, argc, what);
-  scr_dyn_this_pop();
+  ScrDyn *result = scr_dyn_call_this(callable, recv, args, argc, what);
   scr_dyn_release(callable);
   return result;
 }
@@ -789,10 +787,7 @@ ScrDyn *scr_dyn_prepare_method(ScrDyn *recv, const char *method) {
 ScrDyn *scr_dyn_invoke_prepared(ScrDyn *recv, ScrDyn *callee, const char *method,
                                ScrDyn *const *args, size_t argc, const char *what) {
   if (!callee) return scr_dyn_invoke(recv, method, args, argc, what);
-  scr_dyn_this_push_dyn(recv);
-  ScrDyn *result = scr_dyn_call(callee, args, argc, what);
-  scr_dyn_this_pop();
-  return result;
+  return scr_dyn_call_this(callee, recv, args, argc, what);
 }
 
 ScrDyn *scr_dyn_invoke(ScrDyn *recv, const char *method,
@@ -915,6 +910,7 @@ void scr_dyn_invoke_discard_id(ScrDyn *recv, ScrDyn *callee, const char *method,
 static ScrDyn *scr_dyn_invoke_impl(
     ScrDyn *recv, const char *method, int mid, ScrDyn *const *args, size_t argc,
     const char *what, ScrDyn *callback_recv) {
+  SCR_STAT(dyn_invoke);
   if (recv->kind == SCR_DYN_UNDEF || recv->kind == SCR_DYN_NULL) {
     ScrJsonBuf b;
     scr_jb_init(&b);
@@ -945,9 +941,7 @@ static ScrDyn *scr_dyn_invoke_impl(
     ScrDyn *callable = scr_dyn_proxy_get(recv, key);
     scr_str_release(key);
     if (!callable) return NULL;
-    scr_dyn_this_push_dyn(recv);
-    ScrDyn *result = scr_dyn_call(callable, args, argc, what);
-    scr_dyn_this_pop();
+    ScrDyn *result = scr_dyn_call_this(callable, recv, args, argc, what);
     scr_dyn_release(callable);
     return result;
   }
@@ -970,11 +964,18 @@ static ScrDyn *scr_dyn_invoke_impl(
       return fast;
     /* An inherited Date method of an instance of a class declared `extends
      * Date`. */
+#ifdef SCR_MAP_CLASS
+    ScrDyn *map_method = scr_dyn_map_class_member(recv, method, strlen(method));
+    if (scr_exc_pending()) return NULL;
+    if (map_method) {
+      ScrDyn *result = scr_dyn_call_this(map_method, recv, args, argc, what);
+      scr_dyn_release(map_method);
+      return result;
+    }
+#endif
     ScrDyn *date_method = scr_dyn_date_class_member(recv, method, strlen(method));
     if (date_method) {
-      scr_dyn_this_push_dyn(recv);
-      ScrDyn *result = scr_dyn_call(date_method, args, argc, what);
-      scr_dyn_this_pop();
+      ScrDyn *result = scr_dyn_call_this(date_method, recv, args, argc, what);
       scr_dyn_release(date_method);
       return result;
     }
@@ -985,9 +986,7 @@ static ScrDyn *scr_dyn_invoke_impl(
     ScrDyn *inherited = scr_dyn_typed_ref_bag_method(recv, method, method_len);
     if (scr_exc_pending()) return NULL;
     if (inherited && scr_dyn_is_callable(inherited)) {
-      scr_dyn_this_push_dyn(recv);
-      ScrDyn *result = scr_dyn_call(inherited, args, argc, what);
-      scr_dyn_this_pop();
+      ScrDyn *result = scr_dyn_call_this(inherited, recv, args, argc, what);
       scr_dyn_release(inherited);
       return result;
     }
@@ -1017,9 +1016,14 @@ static ScrDyn *scr_dyn_invoke_impl(
     if (m && (scr_dyn_is_callable(m))) {
       /* JS binds the receiver for the call (`obj.method()` — this === obj):
        * the ambient-receiver window (scr_runtime.h). */
-      scr_dyn_this_push_dyn(callback_recv ? callback_recv : recv);
-      ScrDyn *r = scr_dyn_call(m, args, argc, what);
-      scr_dyn_this_pop();
+      ScrDyn *r;
+      if (callback_recv) {
+        scr_dyn_this_push_dyn(callback_recv);
+        r = scr_dyn_call(m, args, argc, what);
+        scr_dyn_this_pop();
+      } else {
+        r = scr_dyn_call_this(m, recv, args, argc, what);
+      }
       scr_dyn_release(m);
       return r;
     }
@@ -1034,18 +1038,15 @@ static ScrDyn *scr_dyn_invoke_impl(
         argc > 1 ? args[1] : scr_dyn_undefined(), what);
     }
     if ((mid == DYN_M_call)) {
-      scr_dyn_this_push_dyn(argc >= 1 ? args[0] : scr_dyn_undefined());
-      ScrDyn *r = scr_dyn_call(recv, argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0, what);
-      scr_dyn_this_pop();
-      return r;
+      /* args are borrowed */
+      return scr_dyn_call_this(recv, argc >= 1 ? args[0] : scr_dyn_undefined(),
+                               argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0, what);
     }
     if ((mid == DYN_M_bind)) return scr_dyn_bind(recv, args, argc);
     if ((mid == DYN_M_toString)) {
       ScrDyn *member = scr_dyn_fn_get(recv, method, strlen(method));
       if (member && member->kind != SCR_DYN_UNDEF) {
-        scr_dyn_this_push_dyn(recv);
-        ScrDyn *result = scr_dyn_call(member, args, argc, what);
-        scr_dyn_this_pop();
+        ScrDyn *result = scr_dyn_call_this(member, recv, args, argc, what);
         scr_dyn_release(member);
         return result;
       }
@@ -1061,9 +1062,7 @@ static ScrDyn *scr_dyn_invoke_impl(
       ScrDyn *own = scr_dyn_fn_get(recv, method, strlen(method));
       if (own) {
         if (own->kind == SCR_DYN_FUNC) {
-          scr_dyn_this_push_dyn(recv);
-          ScrDyn *r = scr_dyn_call(own, args, argc, what);
-          scr_dyn_this_pop();
+          ScrDyn *r = scr_dyn_call_this(own, recv, args, argc, what);
           scr_dyn_release(own);
           return r;
         }
@@ -1719,7 +1718,7 @@ static ScrDyn *scr_dyn_invoke_impl(
       ScrDyn *result = NULL;
       if (!scr_dyn_is_callable(member)) dyn_throw_not_fn(what);
       else {
-        scr_dyn_this_push_dyn(recv);
+        scr_dyn_this_push_borrowed(recv);
         result = scr_dyn_call(member, args, argc, what);
         scr_dyn_this_pop();
       }
@@ -1822,6 +1821,11 @@ static ScrDyn *dyn_builtin_method_call(ScrClosure *closure, ScrDyn *const *args,
   ScrStr *method = scr_box_get_ref(closure->caps[1]);
   ScrDyn *receiver = scr_dyn_this_get();
   ScrDyn *result = NULL;
+#ifdef SCR_MAP_CLASS
+  if (!strcmp(prototype->data, "Map")) {
+    result = scr_dyn_map_class_invoke(receiver, method->data, args, argc);
+  } else
+#endif
   if (!strcmp(prototype->data, "Object")) {
     ScrDyn *key = argc ? args[0] : scr_dyn_undefined();
     if (!strcmp(method->data, "toString")) {
@@ -2051,6 +2055,9 @@ static ScrDyn *dyn_global_ctor(const char *name) {
       /* `o.constructor.prototype` of a plain object is Object.prototype
        * (zod's isPlainObject). The other prototypes are not modeled. */
       if (i == 0) scr_dyn_fn_seed_prototype(dyn_global_ctors[i], scr_dyn_object_prototype());
+#ifdef SCR_MAP_CLASS
+      if (i == 3) scr_dyn_map_class_prototype(dyn_global_ctors[i]);
+#endif
     }
     return scr_dyn_retain(dyn_global_ctors[i]);
   }

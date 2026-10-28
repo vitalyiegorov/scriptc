@@ -100,6 +100,8 @@ Merges the raw profiles that runs of a `--profile-generate` executable wrote, an
 $ scriptc merge-profiles -o app.profdata profiles/*.profraw
 ```
 
+Each raw profile's JS type feedback file (`<name>.jsfb`, written next to it; see [Type feedback](#type-feedback)) is merged too, into `<out>.jsfb`. An explicit `.jsfb` input is merged as well.
+
 With `--sparse`, the profile leaves out the functions the runs never reached. The file is smaller, typically by about two thirds, and those functions are optimized as without a profile instead of as cold code.
 
 ## Options
@@ -233,6 +235,21 @@ $ scriptc build app.ts --optimization=speed --profile-use app.profdata
 ```
 
 Train on workloads like the ones the program will run: code the training never reached is optimized as without a profile. The profile can be committed and reused as the program changes. Functions whose control flow changed since the profile was collected lose their profile, and the rest keep theirs, so regenerate it when much of the program has changed. [Build parallelism](/docs/how-it-works#build-parallelism) describes what a profile adds to build time.
+
+### Type feedback
+
+For programs with untyped (dynamic-tier) code, an instrumented executable also records what its property sites and dyn calls saw: per site, the receiver shapes (as ordered key lists), the entry each lookup hit, and the callee functions. It writes this to `<pattern without .profraw>.jsfb` next to the raw profile, at normal exit and at `process.exit`. `merge-profiles` merges these files into `<out>.jsfb`, and `--profile-use <out>` reads that file when it exists. No extra flag is needed.
+
+Sites are keyed by the IR function's name, the site's operation (`get:key`, `set:key`, `keyed`, `invoke:method`, `call:name`) and its position among that function's sites. A site that no longer exists, or whose operation changed, has no record and compiles as without a profile. A sidecar that cannot be parsed is ignored as a whole. The feedback never changes what a program does: it only picks how much of each site's inline cache the emitted code tests before it calls the probe. A site that saw two to four object shapes tests that many cache entries inline (the default is one); every miss takes the path it takes without feedback.
+
+```console
+$ scriptc build app.js --optimization=speed --profile-generate profiles/%p.profraw -o app-instrumented
+$ ./app-instrumented typical-input.json      # writes profiles/<pid>.profraw and profiles/<pid>.jsfb
+$ scriptc merge-profiles -o app.profdata profiles/*.profraw   # also writes app.profdata.jsfb
+$ scriptc build app.js --optimization=speed --profile-use app.profdata
+```
+
+Keep `app.profdata.jsfb` beside `app.profdata`. Changing either file changes the build's cache key.
 
 ## Target CPU
 

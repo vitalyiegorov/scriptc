@@ -9,7 +9,12 @@ import { compile } from "@scriptc/compiler";
 import { npmCases } from "./npm-cases.js";
 import { normalizeNodeTestOutput } from "./node-test-normalize.js";
 import { eventLoopCases, type StdinScript } from "./event-loop-cases.js";
-import { tscJsxOracleEntry, wantsTscJsx } from "./jsx-oracle.js";
+import {
+  tscJsxOracleEntry,
+  wantsTscJsx,
+  tscLegacyDecoratorsOracleEntry,
+  wantsTscLegacyDecorators,
+} from "./jsx-oracle.js";
 
 const execFileAsync = promisify(execFile);
 const enabled = process.env["SCRIPTC_LINUX"] === "1";
@@ -56,6 +61,8 @@ function wantsTscDecorators(file: string): boolean {
  * programs) its deterministic ES2022 downlevel — differential.test.ts's
  * nodeOracleFile, with the identical transform and cache key. */
 function nodeOracleFile(file: string): string {
+  if (wantsTscLegacyDecorators(directiveHead(file)))
+    return tscLegacyDecoratorsOracleEntry(file, cacheDir);
   if (wantsTscJsx(directiveHead(file))) return tscJsxOracleEntry(file, cacheDir);
   if (!wantsTscDecorators(file)) return file;
   const src = readFileSync(file, "utf8");

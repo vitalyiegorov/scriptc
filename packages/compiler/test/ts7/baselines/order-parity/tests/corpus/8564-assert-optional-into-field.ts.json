@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8564-assert-optional-into-field.ts"
+ ],
+ "diags": []
+}

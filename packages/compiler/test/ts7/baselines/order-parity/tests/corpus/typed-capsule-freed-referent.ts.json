@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/typed-capsule-freed-referent.ts"
+ ],
+ "diags": []
+}

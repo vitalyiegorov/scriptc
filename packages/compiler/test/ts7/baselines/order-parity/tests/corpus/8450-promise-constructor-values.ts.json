@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8450-promise-constructor-values.ts"
+ ],
+ "diags": []
+}

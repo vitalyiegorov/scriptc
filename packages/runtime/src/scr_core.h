@@ -422,4 +422,12 @@ char **scr_worker_argv(void);
 #define scr_getenv(name) getenv(name)
 #endif
 
+#include "scr_stats.h"
+
+/* `strcmp(a, literal) == 0` without the call when the first bytes differ:
+ * the method and property names the dynamic handles dispatch on are tested
+ * against many literals in a row. `a` must be a plain variable (evaluated
+ * twice). */
+#define SCR_STREQ(a, lit) ((a)[0] == (lit)[0] && strcmp((a), (lit)) == 0)
+
 #endif /* SCR_CORE_H */

@@ -316,3 +316,8 @@ __attribute__((cold, noinline)) void scr_stack_overflow(void) {
   static const char text[] = "Maximum call stack size exceeded";
   scr_throw_error_msg(SCR_ERR_RANGE, text, sizeof text - 1);
 }
+
+#ifdef SCR_STATS
+#define SCR_STATS_IMPL
+#include "scr_stats.h"
+#endif

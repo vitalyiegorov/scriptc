@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8569-array-isarray-narrowed-read.ts"
+ ],
+ "diags": []
+}

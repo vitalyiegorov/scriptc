@@ -1,0 +1,8 @@
+{
+ "order": [
+  "<repo>/tests/corpus/1975-decorators-legacy-edges/anonymous.ts",
+  "<repo>/tests/corpus/1975-decorators-legacy-edges/factory.ts",
+  "<repo>/tests/corpus/1975-decorators-legacy-edges/main.ts"
+ ],
+ "diags": []
+}

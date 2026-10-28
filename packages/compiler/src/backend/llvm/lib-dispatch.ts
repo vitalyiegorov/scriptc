@@ -391,7 +391,47 @@ export function emitGenericLibCall(host: LlvmEmitterContext, e: LibCallExpr): Ll
     const kind = host.dynKind(value.name);
     const fn = B.tmp();
     B.line(`${fn} = icmp eq i32 ${kind}, ${DYN_KIND.FUNC}`);
-    B.condBr(fn, compare, done);
+    const classObj = B.newLabel("ctor.class");
+    B.condBr(fn, classObj, done);
+    // A probe chain (construction, instanceof, a class property read) has a
+    // probe per compiled class. Keep its misses out of the runtime: a
+    // function that is no class object (an ES5 constructor) fails each probe
+    // on one inline load, which LLVM shares across the chain, and a class
+    // object whose name starts with another byte fails without a strcmp.
+    // Class values carry `classval:<name>` as their sig (scr_dyn_new_class).
+    B.startBlock(classObj);
+    const classPtr = B.tmp();
+    const classLoaded = B.tmp();
+    const isClass = B.tmp();
+    B.line(
+      `${classPtr} = getelementptr inbounds i8, ptr ${value.name}, i64 ${host.abiOffset(56, 36)} ; ->v.fn.class_obj`,
+    );
+    B.line(`${classLoaded} = load ptr, ptr ${classPtr}`);
+    B.line(`${isClass} = icmp ne ptr ${classLoaded}, null`);
+    const prefix = "classval:";
+    const keyText = e.args[1]!.kind === "strLit" ? e.args[1]!.value : "";
+    // An ASCII first name byte encodes alike in every string constant.
+    const firstByte = keyText.startsWith(prefix) ? keyText.charCodeAt(prefix.length) : NaN;
+    if (firstByte < 0x80) {
+      const first = B.newLabel("ctor.first");
+      B.condBr(isClass, first, done);
+      B.startBlock(first);
+      const sigPtr = B.tmp();
+      const sig = B.tmp();
+      const bytePtr = B.tmp();
+      const byte = B.tmp();
+      const sameByte = B.tmp();
+      B.line(
+        `${sigPtr} = getelementptr inbounds i8, ptr ${value.name}, i64 ${host.abiOffset(32, 24)} ; ->v.fn.sig`,
+      );
+      B.line(`${sig} = load ptr, ptr ${sigPtr}`);
+      B.line(`${bytePtr} = getelementptr inbounds i8, ptr ${sig}, i64 ${prefix.length}`);
+      B.line(`${byte} = load i8, ptr ${bytePtr}`);
+      B.line(`${sameByte} = icmp eq i8 ${byte}, ${firstByte}`);
+      B.condBr(sameByte, compare, done);
+    } else {
+      B.condBr(isClass, compare, done);
+    }
     B.startBlock(compare);
     host.declare("declare zeroext i1 @scr_dyn_class_is_key(ptr, ptr)");
     const matches = B.tmp();
@@ -1111,6 +1151,7 @@ export function emitLibCall(host: LlvmEmitterContext, e: LibCallExpr): LlValue {
     case "wasm":
     case "array":
     case "collection":
+    case "map":
     case "record":
     case "disposable":
     case "punycode":

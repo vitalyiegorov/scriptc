@@ -1,0 +1,24 @@
+{
+  "name": "scriptc-nestjs-example",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "check:context": "node dist/context.js",
+    "check:http": "node dist/main.js --check",
+    "check:metadata": "node dist/metadata.js",
+    "check:native": "node check-native.mjs",
+    "bench": "node bench/run.mjs"
+  },
+  "dependencies": {
+    "@nestjs/common": "12.2.0",
+    "@nestjs/core": "12.2.0",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "typescript": "5.9.3"
+  }
+}

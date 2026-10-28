@@ -8,6 +8,7 @@
  * graph. */
 import * as ts from "./ts7/adapter.js";
 import { moduleSourceCandidates } from "./module-source-candidates.js";
+import { isProvenanceSourceFile } from "./provenance-registry.js";
 
 /** `import type …` (default, named, or namespace): erased by Node, so
  * module order, cycle detection, init calls, package selection, and the
@@ -17,7 +18,141 @@ import { moduleSourceCandidates } from "./module-source-candidates.js";
  * crash). Side-effect imports and inline `type` specifiers stay real
  * edges. */
 export function erasedTypeOnlyImport(stmt: ts.ImportDeclaration): boolean {
-  return stmt.importClause?.phaseModifier === ts.SyntaxKind.TypeKeyword;
+  return (
+    stmt.importClause?.phaseModifier === ts.SyntaxKind.TypeKeyword ||
+    dependencyImportUsedOnlyAsType(stmt)
+  );
+}
+
+/** Identifier spellings each dependency source file uses in a value
+ * position (anywhere outside a type annotation, an interface or a type
+ * alias; a class `extends` expression is a value). */
+const valueSpellings = new Map<string, { length: number; names: ReadonlySet<string> }>();
+
+function valueSpellingsOf(sf: ts.SourceFile): ReadonlySet<string> {
+  const known = valueSpellings.get(sf.fileName);
+  if (known !== undefined && known.length === sf.text.length) return known.names;
+  const found = new Set<string>();
+  const inTypePosition = (node: ts.Node): boolean => {
+    for (let p = node.parent; p !== undefined && !ts.isSourceFile(p); p = p.parent) {
+      if (ts.isTypeNode(p)) {
+        const heritage = p.parent;
+        const classExtends =
+          p.kind === ts.SyntaxKind.ExpressionWithTypeArguments &&
+          heritage !== undefined &&
+          ts.isHeritageClause(heritage) &&
+          heritage.token === ts.SyntaxKind.ExtendsKeyword &&
+          (ts.isClassDeclaration(heritage.parent) || ts.isClassExpression(heritage.parent));
+        if (!classExtends) return true;
+      }
+      if (ts.isTypeAliasDeclaration(p) || ts.isInterfaceDeclaration(p)) return true;
+    }
+    return false;
+  };
+  ts.walkPreorder(sf, (node) => {
+    if (ts.isImportDeclaration(node)) return "skip";
+    if (ts.isIdentifier(node) && !inTypePosition(node)) found.add(node.text);
+    return undefined;
+  });
+  if (sf.text.includes("@")) addDecoratorMetadataSpellings(sf, found);
+  valueSpellings.set(sf.fileName, { length: sf.text.length, names: found });
+  return found;
+}
+
+function decoratorsOf(node: ts.Node): readonly ts.Decorator[] {
+  return (node.modifiers?.nodes ?? []).filter((item): item is ts.Decorator => ts.isDecorator(item));
+}
+
+/** The leftmost identifier of the entity a type annotation serializes to in
+ * `design:type` / `design:paramtypes` metadata, as TypeScript's
+ * emitDecoratorMetadata does: a type reference names its entity (a
+ * parenthesized type or a union with one non-nullish constituent defers to
+ * it); arrays, functions, literals and the rest serialize to builtins. */
+function metadataEntityOf(type: ts.TypeNode | undefined): string | null {
+  if (type === undefined) return null;
+  if (ts.isParenthesizedTypeNode(type)) return metadataEntityOf(type.type);
+  if (ts.isTypeReferenceNode(type)) {
+    let name: ts.EntityName = type.typeName;
+    while (ts.isQualifiedName(name)) name = name.left;
+    return name.text;
+  }
+  if (ts.isUnionTypeNode(type)) {
+    const parts = type.types.nodes.filter(
+      (part) =>
+        part.kind !== ts.SyntaxKind.UndefinedKeyword &&
+        part.kind !== ts.SyntaxKind.NeverKeyword &&
+        !(ts.isLiteralTypeNode(part) && part.literal.kind === ts.SyntaxKind.NullKeyword),
+    );
+    return parts.length === 1 ? metadataEntityOf(parts[0]) : null;
+  }
+  return null;
+}
+
+/** emitDecoratorMetadata makes the types of a decorated class's constructor
+ * parameters, and of its decorated members, value references to their
+ * classes — the imports tsc keeps for them. */
+function addDecoratorMetadataSpellings(sf: ts.SourceFile, found: Set<string>): void {
+  const add = (type: ts.TypeNode | undefined): void => {
+    const name = metadataEntityOf(type);
+    if (name !== null) found.add(name);
+  };
+  ts.walkPreorder(sf, (node) => {
+    if (!ts.isClassDeclaration(node) && !ts.isClassExpression(node)) return undefined;
+    const hasParameterDecorators = (member: ts.Node): boolean =>
+      (ts.isConstructorDeclaration(member) ||
+        ts.isMethodDeclaration(member) ||
+        ts.isAccessor(member)) &&
+      member.parameters.nodes.some((parameter) => decoratorsOf(parameter).length > 0);
+    const classDecorated = decoratorsOf(node).length > 0;
+    for (const member of node.members.nodes) {
+      if (ts.isConstructorDeclaration(member)) {
+        if (classDecorated || hasParameterDecorators(member))
+          for (const parameter of member.parameters.nodes) add(parameter.type);
+        continue;
+      }
+      if (decoratorsOf(member).length === 0 && !hasParameterDecorators(member)) continue;
+      if (ts.isMethodDeclaration(member)) {
+        for (const parameter of member.parameters.nodes) add(parameter.type);
+        add(member.type);
+      } else if (ts.isAccessor(member)) {
+        add(member.type);
+        for (const parameter of member.parameters.nodes) add(parameter.type);
+      } else if (ts.isPropertyDeclaration(member)) {
+        add(member.type);
+      }
+    }
+    return undefined;
+  });
+}
+
+/** A dependency's own TypeScript source (a package that ships its `.ts`)
+ * runs as the JavaScript its compiler emits, and that emit drops every
+ * import none of whose bindings is used as a value. The dependency never
+ * runs under Node's type stripping, so unlike a project file its type-only
+ * uses of a module are not edges: rxjs' `types.ts` names Observable and
+ * Subscription only in types, which keeps Observable, Subscriber and
+ * Subscription from forming an import cycle. */
+function dependencyImportUsedOnlyAsType(stmt: ts.ImportDeclaration): boolean {
+  const clause = stmt.importClause;
+  if (clause === undefined || clause.phaseModifier === ts.SyntaxKind.TypeKeyword) return false;
+  const sf = ts.getSourceFileOfNode(stmt);
+  if (
+    sf.isDeclarationFile ||
+    !/\.[cm]?ts$/.test(sf.fileName) ||
+    !(sf.fileName.includes("/node_modules/") || isProvenanceSourceFile(sf.fileName))
+  )
+    return false;
+  const bound: ts.Identifier[] = [];
+  if (clause.name !== undefined) bound.push(clause.name);
+  const named = clause.namedBindings;
+  if (named !== undefined) {
+    if (ts.isNamespaceImport(named)) bound.push(named.name);
+    else
+      for (const element of named.elements.nodes) if (!element.isTypeOnly) bound.push(element.name);
+  }
+  if (bound.length === 0) return false;
+  const used = valueSpellingsOf(sf);
+  return bound.every((name) => !used.has(name.text));
 }
 
 /** `import { type A, type B } from "./m"`: a real module edge that binds

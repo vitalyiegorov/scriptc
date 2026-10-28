@@ -2,6 +2,8 @@ import * as ts from "../../ts7/adapter.js";
 import { isJsSourceFile, locOf } from "../../program.js";
 import { DYN, type IrExpr } from "../../../ir/ir.js";
 import type { Lowerer } from "../lowerer.js";
+import { reflectProxyTargetClass } from "../class-prototypes.js";
+import { lowerDynObjectLiteral } from "./object-literals.js";
 
 /** These values must stay checked-native instead of being copied into the
  * target's inferred record layout, including hoisted and module bindings. */
@@ -45,10 +47,20 @@ export function lowerNativeProxy(lowerer: Lowerer, expr: ts.NewExpression): IrEx
       }
     }
   }
-  const inputs = args.map((arg) => {
-    let value = ts.isObjectLiteralExpression(arg)
-      ? lowerer.lowerExprExpecting(arg, DYN)
-      : lowerer.lowerExpr(arg);
+  const inputs = args.map((arg, index) => {
+    // The handler's traps are read as properties of a checked-dynamic
+    // object, whatever record layout its contextual type would give it.
+    let value =
+      index === 1 && ts.isObjectLiteralExpression(arg)
+        ? lowerDynObjectLiteral(lowerer, arg)
+        : ts.isObjectLiteralExpression(arg)
+          ? lowerer.lowerExprExpecting(arg, DYN)
+          : lowerer.lowerExpr(arg);
+    const targetClass =
+      index === 0 && value.type.kind === "object"
+        ? lowerer.classes.get(value.type.className)
+        : null;
+    if (targetClass) reflectProxyTargetClass(lowerer, targetClass, loc);
     if (value.type.kind !== "dyn" && lowerer.dynConvertible(value.type))
       value = lowerer.coerceToExpected(value, DYN);
     if (value.type.kind !== "dyn") {

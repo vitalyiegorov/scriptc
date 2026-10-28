@@ -1,0 +1,7 @@
+{
+ "order": [
+  "<repo>/tests/corpus/1976-decorators-legacy-metadata/dependency.ts",
+  "<repo>/tests/corpus/1976-decorators-legacy-metadata/main.ts"
+ ],
+ "diags": []
+}

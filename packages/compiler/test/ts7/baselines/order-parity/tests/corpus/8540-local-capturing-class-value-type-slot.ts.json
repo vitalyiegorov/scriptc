@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8540-local-capturing-class-value-type-slot.ts"
+ ],
+ "diags": []
+}

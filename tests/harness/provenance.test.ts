@@ -88,6 +88,76 @@ describe("provenance sources", () => {
     }
   });
 
+  test("a package that ships its own TypeScript compiles from it without an attestation", async () => {
+    const shippedEntry = join(fixtureDir, "cases/shipped/main.ts");
+    const node = await execFileAsync(process.execPath, [shippedEntry], { encoding: "utf8" });
+    const sources = await resolveProvenanceSources(shippedEntry);
+    expect(sources.packages).toHaveLength(1);
+    const pkg = sources.packages[0]!;
+    expect(pkg.name).toBe("shipped");
+    expect(pkg.dir).toBe(join(fixtureDir, "node_modules/shipped"));
+    expect(pkg.entries["shipped"]).toMatch(/node_modules\/shipped\/src\/index\.ts$/);
+    // Every exported subpath maps too: the driver's other dependencies may import it.
+    expect(pkg.entries["shipped/extra"]).toMatch(/node_modules\/shipped\/src\/extra\.ts$/);
+    setProvenanceSources(sources);
+    expect(await buildAndRun("shipped-static", shippedEntry)).toBe(node.stdout);
+  });
+
+  test("a shipped `x!` over an undefined value keeps flowing as undefined instead of trapping", async () => {
+    const assertedEntry = join(fixtureDir, "cases/asserted/main.ts");
+    const node = await execFileAsync(process.execPath, [assertedEntry], { encoding: "utf8" });
+    expect(node.stdout).toContain("m0 undef\n");
+    const sources = await resolveProvenanceSources(assertedEntry);
+    expect(sources.packages).toHaveLength(1);
+    setProvenanceSources(sources);
+    expect(await buildAndRun("asserted-static", assertedEntry)).toBe(node.stdout);
+  });
+
+  test("a class beside structural interface arms dispatches like innerFrom, keeps identity, and tells generic instances apart", async () => {
+    const innerEntry = join(fixtureDir, "cases/inner/main.ts");
+    const node = await execFileAsync(process.execPath, [innerEntry], { encoding: "utf8" });
+    expect(node.stdout).toContain("true\n");
+    setProvenanceSources(await resolveProvenanceSources(innerEntry));
+    expect(await buildAndRun("inner-static", innerEntry)).toBe(node.stdout);
+  });
+
+  test("generic instances stay apart under different type arguments, and a rest overload of a generic function selects", async () => {
+    const sharedEntry = join(fixtureDir, "cases/genshare/main.ts");
+    const node = await execFileAsync(process.execPath, [sharedEntry], { encoding: "utf8" });
+    expect(node.stdout).toBe("deferred\n1\ntrue\n1,2,3,1,1\n");
+    setProvenanceSources(await resolveProvenanceSources(sharedEntry));
+    expect(await buildAndRun("genshare-static", sharedEntry)).toBe(node.stdout);
+  });
+
+  test("shipped TypeScript reading DOM globals Node lacks throws Node's ReferenceError at the read", async () => {
+    const domEntry = join(fixtureDir, "cases/domglobals/main.ts");
+    const node = await execFileAsync(process.execPath, [domEntry], { encoding: "utf8" });
+    expect(node.stdout).toBe("undefined\nReferenceError: requestAnimationFrame is not defined\n");
+    const sources = await resolveProvenanceSources(domEntry);
+    expect(sources.packages).toHaveLength(1);
+    setProvenanceSources(sources);
+    expect(await buildAndRun("domglobals-static", domEntry)).toBe(node.stdout);
+  });
+
+  test("unsupported code inside shipped TypeScript defers to a runtime throw instead of failing the build", async () => {
+    for (const [name, expected] of [
+      ["fenceunused", "ok\n1\n"],
+      ["fencecalled", "ok\ntrue\ntrue\n1\n"],
+    ] as const) {
+      const caseEntry = join(fixtureDir, `cases/${name}/main.ts`);
+      const node = await execFileAsync(process.execPath, [caseEntry], { encoding: "utf8" });
+      expect(node.stdout).toBe(expected);
+      setProvenanceSources(await resolveProvenanceSources(caseEntry));
+      expect(await buildAndRun(`${name}-static`, caseEntry)).toBe(node.stdout);
+      if (name === "fencecalled") {
+        const { coverage } = analyze(caseEntry);
+        expect(coverage.diagnostics).toHaveLength(0);
+        expect((coverage.runtimeFences ?? []).map((d) => d.code)).toContain("SC2020");
+      }
+      setProvenanceSources(null);
+    }
+  });
+
   test("an unmappable source reports a note and uses native package resolution", async () => {
     process.env["SCRIPTC_PROVENANCE_MANIFEST"] = join(fixtureDir, "manifest-broken.json");
     const sources = await resolveProvenanceSources(entry);

@@ -14,6 +14,10 @@ export function staticTypeofAnswer(lowerer: Lowerer, operand: ts.Expression): st
   if (lowerer.checker.getSymbolAtLocation(e) === undefined) return "undefined";
   for (const name of ["global", "globalThis", "process"])
     if (lowerer.isStdlibGlobal(e, name)) return "object";
+  // Standard-library constructors are always functions in the compiled
+  // world (`typeof Symbol === 'function'` feature tests).
+  for (const name of ["Symbol", "Promise", "Map", "Set", "WeakMap", "WeakSet"])
+    if (lowerer.isStdlibGlobal(e, name)) return "function";
   return null;
 }
 
@@ -98,6 +102,22 @@ function knownErrorComparison(lowerer: Lowerer, e: ts.BinaryExpression): boolean
   }
 }
 
+const WELL_KNOWN_SYMBOLS: ReadonlySet<string> = new Set([
+  "iterator",
+  "asyncIterator",
+  "hasInstance",
+  "isConcatSpreadable",
+  "match",
+  "matchAll",
+  "replace",
+  "search",
+  "species",
+  "split",
+  "toPrimitive",
+  "toStringTag",
+  "unscopables",
+]);
+
 /** The value of a condition built from statically answered typeof
  * comparisons, known callback error parameters, `!`, `&&` and `||` (the
  * global-detection chains), or null when any operand needs evaluation. */
@@ -109,6 +129,13 @@ export function staticCondition(lowerer: Lowerer, expr: ts.Expression): boolean 
     return inner === null ? null : !inner;
   }
   if (ts.isIdentifier(e)) return knownError(lowerer, e);
+  // A well-known symbol (`Symbol.iterator`) is a symbol value: truthy.
+  if (
+    ts.isPropertyAccessExpression(e) &&
+    WELL_KNOWN_SYMBOLS.has(e.name.text) &&
+    lowerer.isStdlibGlobal(e.expression, "Symbol")
+  )
+    return true;
   if (!ts.isBinaryExpression(e)) return null;
   const op = e.operatorToken.kind;
   if (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.BarBarToken) {

@@ -30,6 +30,43 @@ export class ClassProtocols {
       const target = type.isTypeReference() ? type.getTarget() : type;
       if (target?.isClassOrInterface()) this.checker.getBaseTypes(target).forEach(add);
     };
+    // A runtime-built constructor function typed by a construct signature
+    // (`interface EmptyErrorCtor { new (): EmptyError }`, rxjs's
+    // createErrorClass) produces instances that are not program-class
+    // instances: when the signature names an interface descending from the
+    // library Error, its values keep checked identity (instanceof,
+    // prototype chain, the Error brand), where a record copy would drop them.
+    const reachesLibError = (type: ts.Type, seen: Set<ts.Symbol>): boolean => {
+      const symbol = type.getSymbol();
+      if (!symbol || seen.has(symbol)) return false;
+      seen.add(symbol);
+      if (
+        ts.symbolName(symbol) === "Error" &&
+        symbol.declarations.some((d) => ts.getSourceFileOfNode(d).isDeclarationFile)
+      )
+        return true;
+      const target = type.isTypeReference() ? type.getTarget() : type;
+      return (
+        target?.isClassOrInterface() === true &&
+        this.checker.getBaseTypes(target).some((base) => reachesLibError(base, seen))
+      );
+    };
+    const addErrorInterface = (type: ts.Type): void => {
+      const symbol = type.getSymbol();
+      if (
+        !symbol ||
+        protocols.has(symbol) ||
+        // The interface may merge with a same-named const (`const EmptyError:
+        // EmptyErrorCtor`), so every declaration need not be an interface.
+        !symbol.declarations.some((d) => ts.isInterfaceDeclaration(d)) ||
+        symbol.declarations.some((d) => ts.getSourceFileOfNode(d).isDeclarationFile)
+      )
+        return;
+      protocols.add(symbol);
+      const target = type.isTypeReference() ? type.getTarget() : type;
+      if (target?.isClassOrInterface())
+        this.checker.getBaseTypes(target).forEach(addErrorInterface);
+    };
     const usesReceiver = (node: ts.Node): boolean =>
       node.kind === ts.SyntaxKind.ThisKeyword || ts.forEachChild(node, usesReceiver) === true;
     const visit = (node: ts.Node): void => {
@@ -55,6 +92,11 @@ export class ClassProtocols {
           entries.push(node);
           this.methods.set(ts.symbolName(property), entries);
         }
+      }
+      if (node.kind === ts.SyntaxKind.ConstructSignature) {
+        const signature = this.checker.getSignatureFromDeclaration(node);
+        const instance = signature ? this.checker.getReturnTypeOfSignature(signature) : undefined;
+        if (instance && reachesLibError(instance, new Set())) addErrorInterface(instance);
       }
       if (
         ts.isObjectLiteralExpression(node) &&
@@ -701,6 +743,17 @@ export class ClassProtocols {
     return source !== undefined && this.isProgramClassInstance(source);
   }
 
+  /** The type `Partial<T>`, `Required<T>` or `Readonly<T>` (the library
+   * aliases) modifies; undefined for any other type. */
+  private modifiedView(type: ts.Type): ts.Type | undefined {
+    const alias = type.getAliasSymbol();
+    if (alias === undefined || !["Partial", "Required", "Readonly"].includes(ts.symbolName(alias)))
+      return undefined;
+    if (!alias.declarations.every((declaration) => declaration.getSourceFile().isDeclarationFile))
+      return undefined;
+    return type.getAliasTypeArguments()?.[0];
+  }
+
   /** String-keyed dictionaries (`Record<string, V>`, `{ [key: string]: V }`)
    * that receive an existing record or class instance. Natively a
    * dictionary is a key/value record, and converting another object into
@@ -976,13 +1029,37 @@ export class ClassProtocols {
       const present = ts
         .constituentTypes(type)
         .filter((part) => (part.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null)) === 0);
-      return present.length > 0 && present.every((part) => this.usesCheckedIdentity(part));
+      if (present.length > 0 && present.every((part) => this.usesCheckedIdentity(part)))
+        return true;
+      // A protocol view beside class instances and function arms
+      // (`Subscription | Unsubscribable | (() => void)`) is one
+      // checked-dynamic slot as well: the view keeps the class instances
+      // live and the functions box by reference.
+      const callable = (part: ts.Type): boolean =>
+        (part.flags & ts.TypeFlags.Object) !== 0 && this.checker.getCallSignatures(part).length > 0;
+      const views = present.filter(
+        (part) =>
+          !callable(part) && !this.isProgramClassInstance(part) && this.usesCheckedIdentity(part),
+      );
+      return (
+        views.length > 0 &&
+        present.every(
+          (part) => views.includes(part) || callable(part) || this.isProgramClassInstance(part),
+        )
+      );
     }
     if (type.isIntersectionType())
       return ts.constituentTypes(type).some((part) => this.usesCheckedIdentity(part));
     if ((type.flags & ts.TypeFlags.Object) === 0) return false;
     const previous = this.answers.get(type);
     if (previous !== undefined) return previous;
+    // `Partial<P>`, `Required<P>` and `Readonly<P>` of a checked-identity
+    // protocol are the same live view with different member modifiers.
+    const modified = this.modifiedView(type);
+    if (modified !== undefined && this.usesCheckedIdentity(modified)) {
+      this.answers.set(type, true);
+      return true;
+    }
     // A dictionary keeps checked identity when the protocols already mark
     // it (a literal whose methods read `this`) or when it receives existing
     // objects (markDictionaryViews).

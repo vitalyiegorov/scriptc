@@ -59,6 +59,7 @@ import { clearFenceEvalCaches } from "../library/fence-eval.js";
 import { archiveNativeLibrary, localizeNativeLibrary, linkNativeWasmLibrary } from "./library.js";
 import type { NativeToolchain } from "./toolchain.js";
 import { evaluateNativeComptime } from "./comptime.js";
+import { profileSidecarBytes } from "../backend/js-feedback-profile.js";
 import { contentDigest, fileDigest, partsDigest, type NativeCache } from "./cache.js";
 import {
   nativeProfileKey,
@@ -94,7 +95,16 @@ function nativeProfile(options: CompileRequestOptions): NativeProfileOptions | u
   if (options.profileUse === undefined) return undefined;
   const path = resolve(options.profileUse);
   try {
-    return { use: { path, digest: contentDigest(readFileSync(path)) } };
+    const bytes = readFileSync(path);
+    const sidecar = profileSidecarBytes(path);
+    return {
+      use: {
+        path,
+        digest: contentDigest(
+          sidecar === null ? bytes : Buffer.concat([bytes, Buffer.from("\0jsfb\0"), sidecar]),
+        ),
+      },
+    };
   } catch (error) {
     throw new NativeCodegenError(
       "SC3002",

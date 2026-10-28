@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8547-array-search-checked-needle.ts"
+ ],
+ "diags": []
+}

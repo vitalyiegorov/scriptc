@@ -306,6 +306,7 @@ export const LIB_FN_SIGS = defineLibFnSignatures({
    * `Promise`, `WeakMap`, `WeakSet`) read as a JavaScript value: one
    * interned function per name, the same one dynamic values answer for
    * `.constructor`. The name is a compiler-chosen literal. */
+  "dyn.functionPrototype": { argTypes: [], result: DYN },
   "dyn.globalConstructor": { argTypes: [STRING], result: DYN },
   /** A builtin global function (setTimeout, setInterval, setImmediate,
    * the clear functions, queueMicrotask, process.nextTick) read as a
@@ -325,6 +326,7 @@ export const LIB_FN_SIGS = defineLibFnSignatures({
   "date.nativeNewValue": { argTypes: [DYN], result: DYN },
   "date.argumentsTime": { argTypes: [DYN], result: DATE_T },
   "date.classOperation": { argTypes: [DYN, DYN], result: VOID },
+  "map.classStorage": { argTypes: [DYN], result: VOID },
   "date.checkedValue": { argTypes: [DYN], result: DATE_T },
   "dyn.nativeRegexIs": { argTypes: [DYN], result: BOOL },
   /** toString() on a checked-dynamic receiver: runtime kind dispatch
@@ -3659,6 +3661,7 @@ export const LIB_FN_SIGS = defineLibFnSignatures({
   "console.table": { argTypes: [DYN, DYN], result: VOID },
   "console.dirDyn": { argTypes: [DYN, F64], result: STRING },
   /** A native reference to the global object; known names retain value fences. */
+  "global.namespaceInstall": { argTypes: [STRING, DYN], result: VOID },
   "global.native": { argTypes: [arrayOf(STRING)], result: DYN },
   // `X.name` through a class value: the arg is a program-dependent
   // classval (a null slot; the libCall case checks the kind).
@@ -3769,6 +3772,7 @@ export const LIB_FN_SIGS = defineLibFnSignatures({
   "arrayBuffer.new": { argTypes: [DYN], result: DYN },
   "ffi.argument": { argTypes: [DYN, STRING], result: DYN },
   "ffi.memoryModule": { argTypes: [DYN], result: DYN },
+  "intl.dateTimeFormatNew": { argTypes: [DYN, DYN], result: DYN },
   "intl.segmenterNew": { argTypes: [], result: DYN },
   "intl.segmenterRefusing": { argTypes: [STRING], result: DYN },
   "arrayBuffer.is": { argTypes: [DYN], result: BOOL },
@@ -3874,6 +3878,7 @@ export const LIB_FN_SIGS = defineLibFnSignatures({
    * prototype chain against f.prototype. */
   "dyn.functionInstanceOf": { argTypes: [DYN, DYN], result: BOOL },
   "dyn.classSuper": { argTypes: [DYN, DYN, DYN], result: VOID },
+  "dyn.legacyClassSuper": { argTypes: [DYN, DYN, DYN], result: VOID },
   "dyn.assignPrototype": { argTypes: [DYN, DYN, DYN], result: DYN },
   "dyn.definePrototypeProps": { argTypes: [DYN, DYN, DYN], result: DYN },
   "dyn.bagGet": { argTypes: [DYN, STRING, DYN], result: DYN },
@@ -3891,6 +3896,7 @@ export const LIB_FN_SIGS = defineLibFnSignatures({
   // dyn.getPrototype for walks that compare each prototype with a program
   // class's prototype: native builtin values end the walk (null).
   "dyn.getPrototypeForIdentity": { argTypes: [DYN], result: DYN },
+  "dyn.literalPrototype": { argTypes: [DYN, DYN], result: DYN },
   "dyn.setPrototype": { argTypes: [DYN, DYN], result: DYN },
   "dyn.getOwnPropertyNames": { argTypes: [DYN], result: DYN },
   "dyn.ownKeys": { argTypes: [DYN], result: DYN },

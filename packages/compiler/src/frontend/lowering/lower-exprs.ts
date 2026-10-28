@@ -1,3 +1,4 @@
+import { isProvenanceSourceFile } from "../provenance-registry.js";
 import { keyedHelperName } from "./stable-names.js";
 import {
   isNewTarget,
@@ -397,6 +398,19 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
   // traps. Sub-union assertions and non-union inners keep their
   // historic erasure (the widening sites re-tag with traps already).
   if (ts.isNonNullExpression(expr)) {
+    // `null!` / `undefined!` (a deliberate placeholder for a required
+    // field): the assertion has no runtime effect, the value is the unit.
+    {
+      let operand: ts.Expression = expr.expression;
+      while (ts.isParenthesizedExpression(operand)) operand = operand.expression;
+      if (
+        operand.kind === ts.SyntaxKind.NullKeyword ||
+        (ts.isIdentifier(operand) && operand.text === "undefined")
+      ) {
+        const unit = lowerer.lowerExpr(operand);
+        if (unit.kind === "unitLit") return unit;
+      }
+    }
     // An asserted element read forwarded into a slot that holds undefined
     // (see analyzeRuntimeOptionalArrayReads) reads without the bounds trap.
     if (
@@ -407,6 +421,18 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
       if (probe?.type.kind === "union") return probe;
     }
     const inner = lowerer.lowerExpr(expr.expression);
+    // A package's `options.flag!` over an untyped options object that lacks
+    // the flag: `!` checks nothing, so a boolean reads as false and a number
+    // as NaN (the same stance as the union case below) instead of failing the
+    // checked extraction.
+    if (
+      inner.type.kind === "dyn" &&
+      isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName)
+    ) {
+      const asserted = lowerer.mapTypeOf(lowerer.typeOf(expr));
+      if (asserted?.kind === "bool" || asserted?.kind === "f64")
+        return lowerer.coerceToExpected(inner, asserted);
+    }
     if (inner.type.kind === "union") {
       // `!` performs no runtime check: a missing array element stays
       // undefined where its destination can hold it.
@@ -435,6 +461,43 @@ function lowerExprInner(lowerer: Lowerer, expr: ts.Expression): IrExpr {
       if (target && target.kind !== "union" && !typeEquals(target, inner.type)) {
         const helper = lowerer.narrowedArmHelper(inner.type.unionId, target, loc);
         if (helper) {
+          // A package's `options.flag!` over a value that is in fact absent:
+          // the flag reads as false (a number as NaN) where its slot cannot
+          // hold undefined, instead of trapping at the assertion.
+          const undefinedTag = lowerer.armTag(inner.type.unionId, UNDEFINED_T);
+          if (
+            undefinedTag >= 0 &&
+            (target.kind === "bool" || target.kind === "f64") &&
+            isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName)
+          ) {
+            const stable = lowerer.declareHiddenLocal("%asserted", inner.type);
+            const ref: IrExpr = { kind: "varRef", localId: stable.id, type: inner.type, loc };
+            return {
+              kind: "seqExpr",
+              stmts: [{ kind: "varDecl", localId: stable.id, init: inner, loc }],
+              result: {
+                kind: "ternary",
+                cond: {
+                  kind: "unionIsTag",
+                  unionId: inner.type.unionId,
+                  tag: undefinedTag,
+                  negated: false,
+                  value: ref,
+                  type: BOOL,
+                  loc,
+                },
+                then:
+                  target.kind === "bool"
+                    ? { kind: "boolLit", value: false, type: BOOL, loc }
+                    : { kind: "numLit", value: Number.NaN, type: F64, loc },
+                else_: lowerer.checkedNarrowCall(helper, ref, target, loc),
+                type: target,
+                loc,
+              },
+              type: target,
+              loc,
+            };
+          }
           return lowerer.checkedNarrowCall(helper, inner, target, loc);
         }
       }
@@ -1231,7 +1294,9 @@ export function lowerNullishCoalesce(
     lowerer,
     first,
     first === expr ? loc : locOf(first),
-    assertedPresenceOperand(lowerer, first.left),
+    // An unassigned deferred-init field reads undefined where the checker
+    // promised its declared type: the default applies to the slot itself.
+    deferredSlotOr(lowerer, assertedPresenceOperand(lowerer, first.left)),
   );
   for (let i = parents.length - 1; i >= 0; i--) {
     const parent = parents[i]!;

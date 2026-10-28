@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8491-static-initializer-closure-later-class.ts"
+ ],
+ "diags": []
+}

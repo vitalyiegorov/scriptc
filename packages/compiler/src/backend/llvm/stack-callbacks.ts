@@ -38,7 +38,7 @@ export class StackCallbacks {
       B.line(`store i32 4, ptr ${kind}`);
     }
     value.captures.forEach((localId, index) => {
-      const box = host.retainBox(host.captureBox(localId));
+      const box = host.stackCaptureBox(localId);
       const caps = B.tmp();
       const slot = B.tmp();
       B.line(`${caps} = getelementptr inbounds %ScrClosure, ptr ${closure}, i32 1`);

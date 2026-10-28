@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/deferred-string-field-reads-undefined.ts"
+ ],
+ "diags": []
+}

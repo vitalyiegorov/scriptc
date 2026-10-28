@@ -1,18 +1,51 @@
+import { builtinNamespaceValue } from "../builtin-namespaces.js";
 import { varRef } from "../../../ir/build.js";
 import * as ts from "../../ts7/adapter.js";
 import { type Lowerer } from "../lowerer.js";
 import { locOf } from "../../program.js";
 import { builtinModuleFnOf } from "../surfaces.js";
 import { hasRuntimeStatics } from "../class-runtime-statics.js";
+import { primitiveOperand } from "../private-brands.js";
 import {
   BOOL,
   DYN,
+  F64,
   type IrExpr,
   STRING,
   type SrcLoc,
   arrayOf,
   isUnitType,
 } from "../../../ir/ir.js";
+
+const METADATA_MEMBERS = new Set([
+  "decorate",
+  "metadata",
+  "defineMetadata",
+  "hasMetadata",
+  "hasOwnMetadata",
+  "getMetadata",
+  "getOwnMetadata",
+  "getMetadataKeys",
+  "getOwnMetadataKeys",
+  "deleteMetadata",
+]);
+
+/** Polyfill extensions are ordinary properties of the native namespace object.
+ * Reading one before a polyfill installs it answers undefined. */
+export function reflectMetadataMemberValue(
+  lowerer: Lowerer,
+  member: string,
+  loc: SrcLoc,
+): IrExpr | null {
+  if (!METADATA_MEMBERS.has(member)) return null;
+  return {
+    kind: "dynKeyGet",
+    value: builtinNamespaceValue(lowerer, "Reflect", loc)!,
+    key: { kind: "strLit", value: member, type: STRING, loc },
+    type: DYN,
+    loc,
+  };
+}
 
 /** The function value of the Reflect member `member` (ownKeys, on native
  * computed-key reflection), or null for members without one. */
@@ -62,6 +95,44 @@ export function lowerReflectCall(
   }
   if (call.questionDotToken) return null;
   const reflectMember = lowerer.stdlibGlobalMember(access, "Reflect");
+  if (
+    reflectMember &&
+    METADATA_MEMBERS.has(reflectMember) &&
+    !access.questionDotToken &&
+    !call.arguments.nodes.some(ts.isSpreadElement)
+  ) {
+    const loc = locOf(call);
+    const receiver = lowerer.declareHiddenLocal("%reflectMetadataReceiver", DYN);
+    const value = varRef(receiver.id, DYN, loc);
+    return {
+      kind: "seqExpr",
+      stmts: [
+        {
+          kind: "varDecl",
+          localId: receiver.id,
+          init: builtinNamespaceValue(lowerer, "Reflect", loc)!,
+          loc,
+        },
+      ],
+      result: {
+        kind: "dynCall",
+        callee: {
+          kind: "dynKeyGet",
+          value,
+          key: { kind: "strLit", value: reflectMember, type: STRING, loc },
+          type: DYN,
+          loc,
+        },
+        receiver: value,
+        calleeName: `Reflect.${reflectMember}`,
+        args: call.arguments.nodes.map((arg) => lowerer.lowerExprExpecting(arg, DYN)),
+        type: DYN,
+        loc,
+      },
+      type: DYN,
+      loc,
+    };
+  }
   // Reflect.getOwnPropertyDescriptor and Reflect.defineProperty over
   // checked objects (execa's Promise mixin): the Object operations, with
   // defineProperty answering true. A non-object target throws the Object
@@ -117,6 +188,53 @@ export function lowerReflectCall(
       fn: "dyn.reflectDeleteProperty",
       args: [target, lowerer.lowerExprExpecting(call.arguments.nodes[1]!, DYN)],
       type: BOOL,
+      loc,
+    };
+  }
+  // Reflect.getPrototypeOf: Object.getPrototypeOf after the TypeError a
+  // primitive target throws (Nest's MetadataScanner walks prototypes so).
+  if (
+    reflectMember === "getPrototypeOf" &&
+    call.arguments.nodes.length === 1 &&
+    !ts.isSpreadElement(call.arguments.nodes[0]!)
+  ) {
+    const loc = locOf(call);
+    const target = lowerer.declareHiddenLocal("%reflectTarget", DYN);
+    const value = varRef(target.id, DYN, loc);
+    return {
+      kind: "seqExpr",
+      stmts: [
+        {
+          kind: "varDecl",
+          localId: target.id,
+          init: lowerer.lowerExprExpecting(call.arguments.nodes[0]!, DYN),
+          loc,
+        },
+      ],
+      result: {
+        kind: "ternary",
+        cond: primitiveOperand(value, loc),
+        then: {
+          kind: "libCall",
+          fn: "error.nodeThrow",
+          args: [
+            { kind: "numLit", value: 1, type: F64, loc },
+            { kind: "strLit", value: "", type: STRING, loc },
+            {
+              kind: "strLit",
+              value: "Reflect.getPrototypeOf called on non-object",
+              type: STRING,
+              loc,
+            },
+          ],
+          type: DYN,
+          loc,
+        },
+        else_: { kind: "libCall", fn: "dyn.getPrototype", args: [value], type: DYN, loc },
+        type: DYN,
+        loc,
+      },
+      type: DYN,
       loc,
     };
   }

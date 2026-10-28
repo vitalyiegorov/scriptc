@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8440-erased-generic-lambda-constructs-generic-class.ts"
+ ],
+ "diags": []
+}

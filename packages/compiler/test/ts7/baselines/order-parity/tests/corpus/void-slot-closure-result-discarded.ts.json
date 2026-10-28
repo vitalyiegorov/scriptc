@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/void-slot-closure-result-discarded.ts"
+ ],
+ "diags": []
+}

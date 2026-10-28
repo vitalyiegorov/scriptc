@@ -89,7 +89,10 @@ export function classSymbolKeyOf(lowerer: Lowerer, key: ts.Expression): ClassSym
   const id = ts.isPropertyAccessExpression(key) ? key.name : key;
   if (!ts.isIdentifier(id)) return null;
   const sym = lowerer.resolveValueSymbol(id);
-  return sym ? classSymbolKeyOfSymbol(lowerer, sym) : null;
+  const declared = sym ? classSymbolKeyOfSymbol(lowerer, sym) : null;
+  if (declared) return declared;
+  const identity = (type.flags & ts.TypeFlags.UniqueESSymbol) !== 0 ? type.getSymbol() : undefined;
+  return identity ? classSymbolKeyOfSymbol(lowerer, identity) : null;
 }
 
 /** Well-known symbols a class field may be keyed by: those no protocol

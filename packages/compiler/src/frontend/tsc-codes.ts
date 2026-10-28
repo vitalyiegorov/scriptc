@@ -21,6 +21,8 @@ export const ADOPTED_OPTIONS = [
   "allowUnusedLabels",
   "allowUnreachableCode",
   "skipLibCheck",
+  "experimentalDecorators",
+  "emitDecoratorMetadata",
   // Import-form interop knobs: they only change which import FORMS
   // typecheck (default imports of CJS-shaped types) — the import fence
   // rejects unsupported forms with SC-diagnostics either way, and a
@@ -80,6 +82,11 @@ export const JS_RELAXED_TSC_CODES: ReadonlySet<number> = new Set([
   2740, // 2322's elaborated "missing the following properties" form
   2559, // a value with no properties in common with an all-optional options type
   2305,
+  // A JSDoc @typedef sharing a name with a runtime export (a package's type
+  // re-export beside its value): Node never sees the typedef, so the value
+  // import is ordinary working JS
+  18042,
+  2693,
   2551,
   2724,
   2731,

@@ -18,7 +18,7 @@ import type { FileParts } from "./lower-modules.js";
 import { isCjsJsFile, locOf, requireSpecOf, resolveImport } from "../program.js";
 import { createRequireCalleeFileOf } from "./builtins/module-bindings.js";
 import { invalidJsonModuleDiag } from "../../diagnostics/diagnostic.js";
-import { BOOL, type IrExpr, type IrGlobal, type IrType } from "../../ir/ir.js";
+import { BOOL, DYN, STRING, type IrExpr, type IrGlobal, type IrType } from "../../ir/ir.js";
 
 /** One required JSON document: its shared global, the run-once flag, and
  * the parsed value with the type it bakes to. */
@@ -26,6 +26,7 @@ export interface JsonRequireModule {
   global: IrGlobal;
   loadedId: string;
   parsed: unknown;
+  source: string;
   type: IrType;
 }
 
@@ -70,8 +71,11 @@ export function collectJsonRequires(lowerer: Lowerer, parts: FileParts[]): void 
         let mod = lowerer.jsonRequireModules.get(jsonSf.fileName);
         if (mod === undefined) {
           const tsType = lowerer.typeOf(call);
-          const mapped = lowerer.mapTypeOf(tsType);
-          if (!mapped || !lowerer.comptimeBakeable(mapped)) lowerer.badType(call, tsType);
+          const inferred = lowerer.mapTypeOf(tsType);
+          // JS JSON modules may contain nulls, heterogeneous arrays, or
+          // empty objects whose type is checked-dynamic. Parse those with
+          // the native JSON parser instead of requiring an exact record.
+          const mapped = inferred && lowerer.comptimeBakeable(inferred) ? inferred : DYN;
           let parsed: unknown;
           try {
             parsed = JSON.parse(jsonSf.text);
@@ -94,14 +98,23 @@ export function collectJsonRequires(lowerer: Lowerer, parts: FileParts[]): void 
             type: BOOL,
             mutable: true,
           });
-          mod = { global, loadedId, parsed, type: mapped };
+          mod = { global, loadedId, parsed, source: jsonSf.text, type: mapped };
           lowerer.jsonRequireModules.set(jsonSf.fileName, mod);
         }
         lowerer.jsonRequireCalls.set(call, mod);
         if (created.has(mod)) continue;
         created.add(mod);
         const loc = locOf(call);
-        const value = lowerer.comptimeValueToIr(mod.parsed, mod.type, "$", call);
+        const value: IrExpr =
+          mod.type.kind === "dyn"
+            ? {
+                kind: "libCall",
+                fn: "json.parse",
+                args: [{ kind: "strLit", value: mod.source, type: STRING, loc }],
+                type: DYN,
+                loc,
+              }
+            : lowerer.comptimeValueToIr(mod.parsed, mod.type, "$", call);
         const actions = lowerer.jsonInitActions.get(sf) ?? [];
         lowerer.jsonInitActions.set(sf, actions);
         actions.push({

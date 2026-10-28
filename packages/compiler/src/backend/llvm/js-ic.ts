@@ -33,6 +33,7 @@ import { emitBorrowedInput } from "./borrowed-inputs.js";
 import { DYN_KIND } from "./dyn.js";
 import type { ExprOf, LlValue, LlvmEmitterContext } from "./expr-context.js";
 import { JS_BITS } from "./jsval-encoding.js";
+import { PGO_KIND_CODE } from "./js-feedback.js";
 import { jsImmediates } from "./jsval.js";
 
 type Host = LlvmEmitterContext;
@@ -57,6 +58,35 @@ export function jsIcMethods(host: Host): boolean {
     host.currentTier === "dynamic" &&
     jsIcMethodSites(host.currentFunctionName)
   );
+}
+
+/** Tells the feedback recorder (js-feedback.ts) what the property site `e`
+ * is about to access. Emits nothing outside an instrumented build. */
+function recordProp(
+  host: Host,
+  e: IrExpr,
+  kind: keyof typeof PGO_KIND_CODE,
+  receiver: string,
+  key: string | null,
+): void {
+  if (!host.feedbackRecording || !jsImmediates(host) || host.currentTier !== "dynamic") return;
+  const id = host.feedbackSiteId(e);
+  if (id === null) return;
+  host.declare("declare void @scr_pgo_prop(ptr, i32, ptr, ptr, i64)");
+  const keyPtr = key === null ? "null" : host.cstr(key);
+  const len = key === null ? 0 : Buffer.byteLength(key, "utf8");
+  host.B.line(
+    `call void @scr_pgo_prop(ptr ${host.cstr(id)}, i32 ${PGO_KIND_CODE[kind]}, ptr ${receiver}, ptr ${keyPtr}, i64 ${len})`,
+  );
+}
+
+/** Tells the feedback recorder which function the call site `e` reached. */
+export function recordCall(host: Host, e: IrExpr, callee: string): void {
+  if (!host.feedbackRecording || !jsImmediates(host) || host.currentTier !== "dynamic") return;
+  const id = host.feedbackSiteId(e);
+  if (id === null) return;
+  host.declare("declare void @scr_pgo_call(ptr, ptr)");
+  host.B.line(`call void @scr_pgo_call(ptr ${host.cstr(`${id}#c`)}, ptr ${callee})`);
 }
 
 function gep(host: Host, base: string, offset: number): string {
@@ -317,7 +347,13 @@ function asResult(host: Host, cell: string, e: IrExpr, owned: boolean | string):
 /** The helper call of a site's slow path, with the site's evaluated
  * (borrowed) arguments. Ordinary parameters take a reference; borrowed
  * ones lend it. Returns the owned result, or "" for a void helper. */
-function helperCall(host: Host, e: ExprOf<"call">, callee: IrFunction, args: LlValue[]): string {
+function helperCall(
+  host: Host,
+  e: ExprOf<"call">,
+  callee: IrFunction,
+  args: LlValue[],
+  after?: () => void,
+): string {
   const B = host.B;
   const borrowed = host.callLifetimes.borrowed.get(e.callee);
   const argList = args
@@ -331,11 +367,13 @@ function helperCall(host: Host, e: ExprOf<"call">, callee: IrFunction, args: LlV
   // The helper is the site's cold path: keep its body out of line.
   if (e.type.kind === "void") {
     B.line(`call void ${target}(${argList}) noinline cold`);
+    after?.();
     if (host.mayThrow.has(e.callee)) host.emitPendingCheck();
     return "";
   }
   let t = B.tmp();
   B.line(`${t} = call ${host.llType(e.type)} ${target}(${argList}) noinline cold`);
+  after?.();
   if (host.mayThrow.has(e.callee)) host.emitPendingCheck();
   if (borrowed && host.borrowedReturns.has(e.callee)) t = host.retainFrame(t, e.type);
   return t;
@@ -365,6 +403,7 @@ export function emitJsIcCall(
 function emitGet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string): LlValue {
   const B = host.B;
   const receiver = emitBorrowedInput(host, e.args[0]!);
+  recordProp(host, e, "get", receiver.name, key);
   const name = keyString(host, key, e);
   const ic = host.jsIcSite();
   const object = B.newLabel("icg.obj");
@@ -401,7 +440,17 @@ function emitGet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string)
   const hits: string[] = [];
   kindIs(host, receiver.name, DYN_KIND.OBJ, object, probe);
   B.startBlock(object);
-  inlineLoad(host, receiver.name, ic, INLINE_WAYS, INLINE_PROTO, (cell) => cell, hits, hit, probe);
+  inlineLoad(
+    host,
+    receiver.name,
+    ic,
+    host.inlineWays(e, INLINE_WAYS),
+    INLINE_PROTO,
+    (cell) => cell,
+    hits,
+    hit,
+    probe,
+  );
   B.startBlock(probe);
   // The read's probe also answers keys the receiver's plain chain lacks.
   host.declare(`declare ptr @scr_js_get_probe(ptr, ptr, ptr)`);
@@ -453,6 +502,7 @@ function numberResult(host: Host, d: string, e: IrExpr): string {
 function emitSet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string): LlValue {
   const B = host.B;
   const receiver = emitBorrowedInput(host, e.args[0]!);
+  recordProp(host, e, "set", receiver.name, key);
   // A value the jsval pass left as `js.toDyn(x)` is stored from the jsval
   // itself: a number replaces the value of an unshared number cell in
   // place instead of boxing a new one.
@@ -462,6 +512,12 @@ function emitSet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string)
       ? host.emitExpr(stored.args[0]!).name
       : null;
   const value = word === null ? emitBorrowedInput(host, stored) : null;
+  // A value this statement made (a fresh function, array or object, or any
+  // owned temp) moves into the property instead of being retained for it
+  // and released at the statement's end: a successful store keeps the
+  // temp's reference, and the paths that do not store release it here.
+  const moved = value !== null && host.ownsFrameTemp(value);
+  if (moved) host.toHeap(value);
   const name = keyString(host, key, e);
   const ic = host.jsIcSite();
   const object = B.newLabel("ics.obj");
@@ -490,12 +546,12 @@ function emitSet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string)
     host,
     receiver.name,
     ic,
-    INLINE_WAYS,
+    host.inlineWays(e, INLINE_WAYS),
     (slot) => {
       const old = B.tmp();
       B.line(`${old} = load ptr, ptr ${slot}`);
       if (word === null) {
-        B.line(`store ptr ${host.retainHeap(value!.name, DYN)}, ptr ${slot}`);
+        B.line(`store ptr ${moved ? value!.name : host.retainHeap(value!.name, DYN)}, ptr ${slot}`);
         host.releaseHeap(old, DYN);
         B.br(join);
         return;
@@ -541,14 +597,21 @@ function emitSet(host: Host, e: ExprOf<"call">, callee: IrFunction, key: string)
   } else {
     cell = value!.name;
   }
-  host.declare(`declare zeroext i1 @scr_js_store_probe(ptr, ptr, ptr, ptr)`);
+  const probeFn = moved ? "scr_js_store_probe_take" : "scr_js_store_probe";
+  host.declare(`declare zeroext i1 @${probeFn}(ptr, ptr, ptr, ptr)`);
   const done = B.tmp();
   B.line(
-    `${done} = call zeroext i1 @scr_js_store_probe(ptr ${receiver.name}, ptr ${name}, ptr ${cell}, ptr ${ic})`,
+    `${done} = call zeroext i1 @${probeFn}(ptr ${receiver.name}, ptr ${name}, ptr ${cell}, ptr ${ic})`,
   );
   B.condBr(done, join, slow);
   B.startBlock(slow);
-  helperCall(host, e, callee, [receiver, { name: cell, type: DYN }]);
+  helperCall(
+    host,
+    e,
+    callee,
+    [receiver, { name: cell, type: DYN }],
+    moved ? () => host.releaseFrame(cell, DYN) : undefined,
+  );
   B.br(join);
   B.startBlock(join);
   return { name: "", type: e.type };
@@ -729,6 +792,7 @@ function emitNativeNumberElement(
 function emitKeyed(host: Host, e: ExprOf<"call">, callee: IrFunction): LlValue {
   const B = host.B;
   const receiver = emitBorrowedInput(host, e.args[0]!);
+  recordProp(host, e, "keyed", receiver.name, null);
   const keyExpr = e.args[1]!;
   const numeric = numberKey(host, keyExpr);
   const key = numeric === null ? emitBorrowedInput(host, keyExpr) : null;
@@ -844,6 +908,7 @@ function emitKeyed(host: Host, e: ExprOf<"call">, callee: IrFunction): LlValue {
 export function emitJsIcMethod(host: Host, e: ExprOf<"dynInvoke">, receiver: string): string {
   const B = host.B;
   const method = e.method;
+  recordProp(host, e, "method", receiver, method);
   const ic = host.jsIcSite();
   const name = keyString(host, method, e);
   host.declare(`declare ptr @scr_js_load_probe(ptr, ptr, ptr)`);
@@ -859,7 +924,7 @@ export function emitJsIcMethod(host: Host, e: ExprOf<"dynInvoke">, receiver: str
     host,
     receiver,
     ic,
-    INLINE_WAYS,
+    host.inlineWays(e, INLINE_WAYS),
     INLINE_PROTO,
     (cell) => host.retainFrame(cell, DYN),
     incoming,

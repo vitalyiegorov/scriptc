@@ -1,0 +1,7 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8527-function-any-cast-member-read/lib.cjs",
+  "<repo>/tests/corpus/8527-function-any-cast-member-read/main.ts"
+ ],
+ "diags": []
+}

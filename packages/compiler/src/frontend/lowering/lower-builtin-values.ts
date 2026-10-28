@@ -97,6 +97,16 @@ export function isNativeBuiltinValueInitializer(
     );
   }
   if (ts.isPropertyAccessExpression(expr)) {
+    // The native bound formatter performs ToNumber itself. Its ambient
+    // Date|number parameter must not reject JavaScript coercible objects.
+    const formatter =
+      expr.name.text === "format" ? lowerer.typeOf(expr.expression).getSymbol() : undefined;
+    if (
+      formatter &&
+      ts.symbolName(formatter) === "DateTimeFormat" &&
+      lowerer.isStdlibSymbol(formatter)
+    )
+      return true;
     return (
       builtinPrototypeMethod(lowerer, expr) !== null ||
       lowerer.stdlibGlobalMember(expr, "console") !== null ||

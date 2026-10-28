@@ -250,6 +250,14 @@ ScrDyn *scr_global_object(void) {
   return scr_global_box;
 }
 
+/* A compiled namespace has one identity through its identifier and through
+ * a stored global object. Install once; polyfills add their own properties. */
+void scr_global_namespace_install(ScrStr *name, ScrDyn *value) {
+  scr_global_object();
+  if (!scr_dyn_obj_get(scr_global_own, name->data, name->len))
+    scr_dyn_obj_set(scr_global_own, name->data, name->len, scr_dyn_retain(value));
+}
+
 ScrDyn *scr_global_native_init(ScrArr *known, ScrDyn *(*console_get)(void)) {
   /* The compiler passes one immortal name table per program: once it is
    * registered, later reads of the global object only take a reference. */

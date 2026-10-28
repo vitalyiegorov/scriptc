@@ -1,3 +1,4 @@
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
 /* Array literals. */
 import { indexedUnionArms, lowerIndexedUnionToArray } from "../indexed-unions.js";
 import * as ts from "../../ts7/adapter.js";
@@ -16,6 +17,8 @@ import {
   UNDEFINED_T,
   VOID,
   arrayOf,
+  canDynCheckTo,
+  isDynTypedRefType,
   isSupportedArrayElem,
   typeEquals,
 } from "../../../ir/ir.js";
@@ -398,6 +401,9 @@ export function lowerArrayLiteral(
     // literal IS the dyn array.
     if (
       isJsSourceFile(ts.getSourceFileOfNode(expr)) ||
+      // A package's array whose declared element type has no native form
+      // (the same fallback its bindings take, dynFallbackType).
+      isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName) ||
       mapped?.kind === "dyn" ||
       lowerer.checkerAnyArray(expr)
     ) {
@@ -554,6 +560,15 @@ export function lowerArrayLiteral(
           type.elem.kind === "f64" ||
           type.elem.kind === "string" ||
           type.elem.kind === "bool" ||
+          isDynTypedRefType(type.elem) ||
+          type.elem.kind === "promise" ||
+          // `[...dynamicMap.entries()]`: tuple rows check in one by one.
+          (type.elem.kind === "record" &&
+            canDynCheckTo(
+              type,
+              (id) => lowerer.shapes.get(id),
+              (id) => lowerer.unions.get(id),
+            )) ||
           searchParamsSource)
       ) {
         src = lowerer.coerceInto(

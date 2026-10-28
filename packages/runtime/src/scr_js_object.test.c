@@ -6,6 +6,7 @@
 #include <string.h>
 
 /* Mirrors scr_js_object.c's budgets. */
+#define SCR_JS_CHAIN_MAX 8 /* the longest prototype chain a cache entry covers */
 #define SHAPE_BUDGET ((size_t)1 << 16)
 #define KEY_BYTES_BUDGET ((size_t)4 << 20)
 
@@ -174,11 +175,25 @@ static void absent_reads(void) {
   assert(get_reads(child, missing, 3));
   assert(get_reads_undefined(sibling, missing));
 
-  /* A longer chain is left to the generic read, even for a receiver whose
-   * absent answer was cached. */
+  /* A longer chain (up to SCR_JS_CHAIN_MAX links) is cached too: the absent
+   * answer holds until a link gains the key. */
   ScrDyn *grandparent = object_with(own, 9);
   other_prototype->prototype = scr_dyn_retain(grandparent);
-  assert(!get_reads_undefined(sibling, missing));
+  assert(get_reads_undefined(sibling, missing));
+  assert(get_reads_undefined(sibling, missing));
+  scr_dyn_obj_set(grandparent, missing->data, missing->len, scr_dyn_new_num(4));
+  assert(get_reads(sibling, missing, 4));
+
+  /* A chain beyond SCR_JS_CHAIN_MAX links is left to the generic read. */
+  ScrDyn *deep_tail = object_with(own, 11);
+  ScrDyn *deep = deep_tail;
+  for (int i = 0; i < SCR_JS_CHAIN_MAX + 2; i++) {
+    ScrDyn *next = object_with(own, 12);
+    next->prototype = scr_dyn_retain(deep);
+    deep = next;
+  }
+  memset(&other_ic, 0, sizeof other_ic);
+  assert(!get_reads_undefined_at(&other_ic, deep, missing));
 
   /* A prototype swapped on a cached receiver: the entry no longer holds. */
   ScrDyn *plain = object_with(own, 10);

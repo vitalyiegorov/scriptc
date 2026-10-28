@@ -95,6 +95,9 @@ export interface RuntimeFeatureSet extends NativeLinkFeatures {
   stdioExtended: boolean;
   brotli: boolean;
   moduleNamespace: boolean;
+  mapClass: boolean;
+  functionPrototype: boolean;
+  intlDateTimeFormat: boolean;
   nativeFetch: boolean;
   netEffective: boolean;
   httpEffective: boolean;
@@ -295,6 +298,9 @@ export function effectiveRuntimeFeatures(
     stdioExtended: features.stdioExtended === true,
     brotli: features.brotli === true,
     moduleNamespace: features.moduleNamespace === true,
+    mapClass: features.mapClass === true,
+    functionPrototype: features.functionPrototype === true,
+    intlDateTimeFormat: features.intlDateTimeFormat === true,
     nativeFetch,
     netEffective,
     httpEffective,

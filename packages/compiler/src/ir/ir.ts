@@ -1475,6 +1475,11 @@ export interface IrLibIdentity {
 
 export interface IrClassDef {
   name: string;
+  /** Set on a class whose class-value slot holds descendants with their own
+   * (adaptable) constructor parameter types: construction through the slot
+   * dispatches to the descendant's constructor with checked argument
+   * conversions, so the upcast's ABI-equality requirement is lifted. */
+  ctorAdapted?: true;
   /** Present for a class evaluated inside a function. Each evaluation owns
    * fresh identity and these shared binding boxes; instance layouts carry a
    * private class-object pointer after their source fields. */
@@ -1561,6 +1566,10 @@ export interface IrClassDef {
    * identical), and tsc guarantees each instantiable class in the
    * declaring subtree implements them. */
   abstractMethods?: string[];
+  /** The subset of `abstractMethods` declared optional (`m?(): T;`): a
+   * class of the declaring subtree may implement none of them, and its
+   * vtable slot stays empty (the member reads as undefined there). */
+  optionalMethods?: string[];
   /** Generic family identity, separate from the concrete layout base.
    * Type arguments specialize storage; JavaScript class identity remains
    * shared by every specialization and its derived instances. */
@@ -4504,6 +4513,14 @@ function canBoxDynCompositeAt(
       );
     case "object":
       return RUNTIME_ERROR_CLASSES.has(t.className) || isDynTypedRefType(t);
+    case "promise":
+      // Promises box by reference wherever the walker meets them (see
+      // canConvertToDyn's top-level rule).
+      return (
+        t.inner.kind === "dyn" ||
+        t.inner.kind === "void" ||
+        canConvertToDyn(t.inner, getRecord, getUnion, visiting)
+      );
     case "array":
       // Process streams have scalar storage only in fields, closures and
       // unions. A direct procStream array has no native ScrArr layout.

@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8563-promise-this-override.ts"
+ ],
+ "diags": []
+}

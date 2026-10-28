@@ -34,3 +34,16 @@ try {
 } catch (e) {
   console.log(e.name);
 }
+
+// reflect-metadata's indirect-eval fallback starts with a unit-valued comma
+// operand. Evaluating it still preserves effects before the refusal.
+try {
+  (void console.log("indirect prefix"), eval)("1");
+} catch (e) {
+  console.log(e.name);
+}
+try {
+  (void 0, eval)("1");
+} catch (e) {
+  console.log(e.name);
+}

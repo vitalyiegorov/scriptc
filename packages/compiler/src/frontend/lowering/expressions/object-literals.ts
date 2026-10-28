@@ -1,3 +1,4 @@
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
 import { keyedHelperName } from "../stable-names.js";
 import { dateJsonType, isDateJsonSource } from "../builtins/dates.js";
 import { dynUndefinedExpr, numLit, strLit, varRef } from "../../../ir/build.js";
@@ -268,21 +269,62 @@ export function lowerDynObjectLiteral(
       !ts.isComputedPropertyName(prop.name) &&
       prop.name.text === "__proto__"
     ) {
-      if (prop.initializer.kind !== ts.SyntaxKind.NullKeyword)
-        lowerer.unsupported(
-          "SC1090",
-          prop,
-          "object-literal prototypes other than null (use Object.setPrototypeOf)",
-        );
       flushFields();
       acc ??= { kind: "dynObjLit", fields: [], type: DYN, loc };
-      acc = {
-        kind: "libCall",
-        fn: "dyn.setPrototype",
-        args: [acc, lowerer.lowerExprExpecting(prop.initializer, DYN)],
-        type: DYN,
-        loc: locOf(prop),
-      };
+      if (prop.initializer.kind === ts.SyntaxKind.NullKeyword) {
+        acc = {
+          kind: "libCall",
+          fn: "dyn.setPrototype",
+          args: [acc, lowerer.lowerExprExpecting(prop.initializer, DYN)],
+          type: DYN,
+          loc: locOf(prop),
+        };
+      } else {
+        const object = lowerer.declareHiddenLocal("%literalObject", DYN);
+        const prototype = lowerer.declareHiddenLocal("%literalPrototype", DYN);
+        const value = varRef(prototype.id, DYN, loc);
+        const target = varRef(object.id, DYN, loc);
+        acc = {
+          kind: "seqExpr",
+          stmts: [
+            { kind: "varDecl", localId: object.id, init: acc, loc },
+            {
+              kind: "varDecl",
+              localId: prototype.id,
+              init: lowerer.lowerExprExpecting(prop.initializer, DYN),
+              loc,
+            },
+          ],
+          result: {
+            kind: "ternary",
+            // Object literal prototype setters ignore primitives. null is
+            // included in the object typeof test and installs a null prototype.
+            cond: {
+              kind: "logical",
+              op: "||",
+              left: { kind: "dynTest", test: "object", value, type: BOOL, loc },
+              right: { kind: "dynTest", test: "function", value, type: BOOL, loc },
+              type: BOOL,
+              loc,
+            },
+            then: {
+              kind: "libCall",
+              fn: "dyn.literalPrototype",
+              args: [target, value],
+              type: DYN,
+              loc,
+            },
+            else_: target,
+            type: DYN,
+            loc,
+          },
+          type: DYN,
+          loc,
+        };
+        // Subsequent literal fields define own properties even when the
+        // installed prototype contains a setter with the same name.
+        hasAccessors = true;
+      }
       continue;
     }
     if (ts.isSpreadAssignment(prop)) {
@@ -812,6 +854,45 @@ export function lowerObjectLiteral(
   expr: ts.ObjectLiteralExpression,
   expected?: IrType & { kind: "record" },
 ): IrExpr {
+  // A prototype setter changes lookup and never creates an own field.
+  // JavaScript literals with this syntax need their checked object identity.
+  if (
+    isJsSourceFile(ts.getSourceFileOfNode(expr)) &&
+    expr.properties.nodes.some(
+      (property) =>
+        ts.isPropertyAssignment(property) &&
+        !ts.isComputedPropertyName(property.name) &&
+        property.name.text === "__proto__",
+    )
+  )
+    return lowerDynObjectLiteral(lowerer, expr);
+  // `{ instance: null! }`: the checker types the property `never`, which has
+  // no native field, while the value is the null the assertion left alone.
+  if (
+    !expected &&
+    expr.properties.nodes.some((property) => {
+      if (!ts.isPropertyAssignment(property)) return false;
+      let value: ts.Expression = property.initializer;
+      while (ts.isParenthesizedExpression(value)) value = value.expression;
+      if (!ts.isNonNullExpression(value)) return false;
+      let operand: ts.Expression = value.expression;
+      while (ts.isParenthesizedExpression(operand)) operand = operand.expression;
+      return (
+        operand.kind === ts.SyntaxKind.NullKeyword ||
+        (ts.isIdentifier(operand) && operand.text === "undefined")
+      );
+    })
+  )
+    return lowerDynObjectLiteral(lowerer, expr);
+  // A package's object literal whose type has no native record form (a
+  // member typed by a declaration the checked-dynamic ABI erases): the same
+  // fallback its bindings take is a checked-dynamic object.
+  if (
+    !expected &&
+    isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName) &&
+    lowerer.mapTypeOf(lowerer.typeOf(expr)) === null
+  )
+    return lowerDynObjectLiteral(lowerer, expr);
   // A spread of an untyped (`any`) source into a typed slot: TypeScript
   // types such a literal `any`, and the copy holds whatever own properties
   // the source has at runtime. Build it as a checked-dynamic object, then

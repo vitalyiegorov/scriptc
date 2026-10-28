@@ -169,7 +169,7 @@ export function checkedClassConstructionPacked(
   return { kind: "call", callee: PACKED, args: [callee, packed], type: DYN, loc };
 }
 
-function constructorArguments(
+export function constructorArguments(
   lowerer: Lowerer,
   params: ParamShape[],
   incoming: IrExpr[],

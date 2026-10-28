@@ -362,6 +362,11 @@ export function lowerArrayMethodCall(
       receiverIr.kind === "dyn" ||
       (receiverIr.kind === "array" && receiverIr.elem.kind === "dyn")) &&
     (lowerer.checkerAnyArray(access.expression) ||
+      // An array the checker types with elements the native layout cannot
+      // hold (a union of an untyped class value and an interface) lives in
+      // the checked-dynamic tree as a whole: its methods run on the runtime
+      // array.
+      (receiverIr?.kind === "dyn" && lowerer.checker.isArrayType(checkerReceiver)) ||
       // A checker-`any` CHAIN whose value lowers to a real static array
       // (`context.stack.split('\n').slice(2)` — the dyn-receiver string
       // machinery answered string[]): same rule, any-typed spelling.
@@ -1494,9 +1499,62 @@ function lowerArraySearchValues(
   receiver: IrExpr,
   needle: IrExpr,
   fromIndex: IrExpr,
+  guarded = false,
 ): IrExpr {
   const loc = locOf(call);
   const argNode = call.arguments.nodes[0] ?? call;
+  // A needle that is a checked view of an untyped value (`token as string`):
+  // strict equality never converts, so a value of another kind misses
+  // instead of failing the check.
+  if (
+    !guarded &&
+    isSafeToRepeat(receiver) &&
+    needle.kind === "dynCheck" &&
+    needle.value.type.kind === "dyn" &&
+    (needle.type.kind === "string" || needle.type.kind === "f64" || needle.type.kind === "bool")
+  ) {
+    const held = lowerer.declareHiddenLocal("%needle", DYN);
+    const raw: IrExpr = { kind: "varRef", localId: held.id, type: DYN, loc };
+    const found = lowerArraySearchValues(
+      lowerer,
+      call,
+      method,
+      elem,
+      receiver,
+      { ...needle, value: raw },
+      fromIndex,
+      true,
+    );
+    const resultT = method === "includes" ? BOOL : F64;
+    return {
+      kind: "seqExpr",
+      stmts: [{ kind: "varDecl", localId: held.id, init: needle.value, loc }],
+      result: {
+        kind: "ternary",
+        cond: {
+          kind: "dynTest",
+          test:
+            needle.type.kind === "string"
+              ? "string"
+              : needle.type.kind === "f64"
+                ? "number"
+                : "boolean",
+          value: raw,
+          type: BOOL,
+          loc,
+        },
+        then: found,
+        else_:
+          method === "includes"
+            ? { kind: "boolLit", value: false, type: BOOL, loc }
+            : { kind: "numLit", value: -1, type: F64, loc },
+        type: resultT,
+        loc,
+      },
+      type: resultT,
+      loc,
+    };
+  }
   // A derived CLASS VALUE against a base-classval element widens (the same
   // pointer — identity search is exact); the coercion path owns the ABI gate.
   if (

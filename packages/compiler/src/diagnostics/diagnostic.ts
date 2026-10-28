@@ -681,6 +681,22 @@ export function strictNullChecksFloorDiag(configFile: string): ScrDiagnostic {
   };
 }
 
+/** Legacy decorator projects opt into assignment semantics for class fields
+ * with `useDefineForClassFields: false`. Native classes always define their
+ * fields, so decorated fields would silently differ from tsc's output. */
+export function assignClassFieldsDiag(configFile: string): ScrDiagnostic {
+  return {
+    code: "SC0002",
+    message:
+      "this project's tsconfig sets useDefineForClassFields to false with experimentalDecorators, " +
+      "which scriptc does not support (class fields always use define semantics, so a field " +
+      "without an initializer is an own property and own fields shadow accessors that decorators " +
+      "install on the prototype)",
+    loc: { file: configFile, start: 0, end: 0 },
+    hint: 'remove "useDefineForClassFields": false from the project tsconfig',
+  };
+}
+
 export function unsupportedTypeDiag(typeText: string, loc: SrcLoc): ScrDiagnostic {
   // `any` has a distinct diagnostic so coverage can identify operations
   // that need a represented type or an explicit checked cast.

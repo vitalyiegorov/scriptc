@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8552-returned-assertion-of-optional-field.ts"
+ ],
+ "diags": []
+}

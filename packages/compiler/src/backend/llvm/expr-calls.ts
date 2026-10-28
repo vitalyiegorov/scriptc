@@ -14,7 +14,7 @@ import {
   type IrType,
 } from "../../ir/ir.js";
 import { liveRefView } from "./expr-stream-bridges.js";
-import { typedRefConstructor, vAdapters } from "./shapes.js";
+import { boxAccess, boxHeaderFields, typedRefConstructor, vAdapters } from "./shapes.js";
 import { INT32_ABI_SUFFIX, SCALAR_UNION_RESULT } from "./int32-abi.js";
 import { dispatchesCall, INTEGER_DISPATCH_SUFFIX } from "./integer-clones.js";
 import { canStackObject, emitStackObject } from "./stack-objects.js";
@@ -755,11 +755,21 @@ export function emitCallExpr(
       }
       // Lifted async lambdas enter through their spawn wrapper (which
       // takes sc_env first, like every lifted function).
-      host.declare(`declare ptr @scr_closure_new(ptr, ${host.sizeType})`);
+      const embedded = host.embeddedMask(e.fnName);
       const c = B.tmp();
-      B.line(
-        `${c} = call ptr @scr_closure_new(ptr @${host.callTarget(e.fnName)}, ${host.sizeType} ${e.captures.length})`,
-      );
+      if (embedded !== 0) {
+        host.declare(
+          `declare ptr @scr_closure_new_embed(ptr, ${host.sizeType}, i32, ${host.sizeType})`,
+        );
+        B.line(
+          `${c} = call ptr @scr_closure_new_embed(ptr @${host.callTarget(e.fnName)}, ${host.sizeType} ${e.captures.length}, i32 ${embedded}, ${host.sizeType} ${embedded.toString(2).replaceAll("0", "").length})`,
+        );
+      } else {
+        host.declare(`declare ptr @scr_closure_new(ptr, ${host.sizeType})`);
+        B.line(
+          `${c} = call ptr @scr_closure_new(ptr @${host.callTarget(e.fnName)}, ${host.sizeType} ${e.captures.length})`,
+        );
+      }
       const out = host.own({ name: c, type: e.type });
       const functionKind =
         (target.generator ? 1 : 0) + (target.async ? 2 : 0) + (target.ownsPrototype ? 4 : 0);
@@ -776,21 +786,59 @@ export function emitCallExpr(
         B.line(`store ptr @${mangleBorrowedFunction(e.fnName)}, ptr ${entry}`);
       }
       e.captures.forEach((localId, i) => {
-        const box = host.captureBox(localId);
-        const retained = host.retainBox(box);
         const caps = B.tmp();
         const capp = B.tmp();
         B.line(`${caps} = getelementptr inbounds %ScrClosure, ptr ${c}, i64 1 ; caps`);
         B.line(
           `${capp} = getelementptr inbounds ptr, ptr ${caps}, ${host.sizeType} ${i} ; caps[${i}]`,
         );
-        B.line(`store ptr ${retained}, ptr ${capp}`);
-        if (i === 0 && e.adapts === true) {
+        let original: string | null = null;
+        if ((embedded >>> i) & 1) {
+          // The binding never changes once the closure exists: its value
+          // moves into the box the closure allocated for it.
+          const type = target.captures![i]!.type;
+          const fields = boxHeaderFields(host.shapeHost, type)!;
+          const value = host.captureValue(localId);
+          // The box is the k-th ScrBox after caps[]: k counts the embedded
+          // captures before this one.
+          const k = (embedded & ((1 << i) - 1)).toString(2).replaceAll("0", "").length;
+          const tail = B.tmp();
+          const box = B.tmp();
+          B.line(
+            `${tail} = getelementptr inbounds ptr, ptr ${caps}, ${host.sizeType} ${e.captures.length}`,
+          );
+          B.line(`${box} = getelementptr inbounds %ScrBox, ptr ${tail}, ${host.sizeType} ${k}`);
+          B.line(`store ptr ${box}, ptr ${capp}`);
+          B.line(`store ${host.sizeType} -1, ptr ${box}`); // immortal: the closure owns it
+          const field = (index: number): string => {
+            const p = B.tmp();
+            B.line(`${p} = getelementptr inbounds %ScrBox, ptr ${box}, i32 0, i32 ${index}`);
+            return p;
+          };
+          B.line(`store i32 ${fields.kind}, ptr ${field(1)}`);
+          if (fields.kind === 5) {
+            B.line(`store ptr ${fields.retain}, ptr ${field(2)}`);
+            B.line(`store ptr ${fields.release}, ptr ${field(3)}`);
+            B.line(`store ptr ${fields.trace}, ptr ${field(4)}`);
+          }
+          if (boxAccess(type) === "ref") {
+            B.line(`store ptr ${value}, ptr ${field(5)}`);
+            if (i === 0 && e.adapts === true) original = value;
+          } else {
+            host.boxSet(box, type, value);
+          }
+        } else {
+          const box = host.ownedCaptureBox(localId);
+          B.line(`store ptr ${box}, ptr ${capp}`);
+          if (i === 0 && e.adapts === true) {
+            const slot = B.tmp();
+            original = B.tmp();
+            B.line(`${slot} = getelementptr inbounds %ScrBox, ptr ${box}, i64 0, i32 5`);
+            B.line(`${original} = load ptr, ptr ${slot}`);
+          }
+        }
+        if (original !== null) {
           // A signature adapter stands for the function it forwards to.
-          const slot = B.tmp();
-          const original = B.tmp();
-          B.line(`${slot} = getelementptr inbounds %ScrBox, ptr ${box}, i64 0, i32 5`);
-          B.line(`${original} = load ptr, ptr ${slot}`);
           // Boxed adapters report the original's length (its static
           // arity, as the original's own boxes do).
           const source = target.captures?.[0]?.type;
@@ -834,8 +882,10 @@ export function emitCallExpr(
           B.line(`call void @scr_dyn_this_push_typed(ptr ${lazyReceiver.name}, ptr ${recipe})`);
           return;
         }
-        host.declare("declare void @scr_dyn_this_push_dyn(ptr)");
-        B.line(`call void @scr_dyn_this_push_dyn(ptr ${receiver?.name ?? "null"})`);
+        // The receiver is this frame's own value (host.emitExpr), alive until
+        // the frame releases it after the call: the window borrows it.
+        host.declare("declare void @scr_dyn_this_push_borrowed(ptr)");
+        B.line(`call void @scr_dyn_this_push_borrowed(ptr ${receiver?.name ?? "null"})`);
       };
       const target = host.knownCallbackTarget(e.callee);
       const known = target?.known;
@@ -1047,8 +1097,7 @@ export function emitCallExpr(
           `${value} = call ptr @scr_classobj_new(ptr @${sym}, ${host.sizeType} ${e.captures.length})`,
         );
         e.captures.forEach((id, index) => {
-          const box = host.captureBox(id);
-          const owned = host.retainBox(box);
+          const owned = host.ownedCaptureBox(id);
           const caps = B.tmp();
           const slot = B.tmp();
           B.line(`${caps} = getelementptr inbounds %ScrClassObj, ptr ${value}, i64 1`);

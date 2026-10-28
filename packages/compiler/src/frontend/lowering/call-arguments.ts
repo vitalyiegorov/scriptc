@@ -653,6 +653,7 @@ export function lowerSpreadArgsCall(
   // (`(...args: unknown[]) => R`), whose ABI is the JS one.
   if (
     !isJsSourceFile(ts.getSourceFileOfNode(expr)) &&
+    callee.type.kind !== "dyn" &&
     !(callee.type.kind === "func" && callee.type.rest === true && callee.type.restAbi === undefined)
   )
     return null;

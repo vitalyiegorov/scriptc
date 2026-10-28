@@ -332,11 +332,115 @@ export function usesCjsTopLevelThis(lowerer: Lowerer, sf: ts.SourceFile): boolea
   return found;
 }
 
+/** Before the first effectful module statement, the original exports object
+ * is still empty. Transpiler fallback initializers commonly read it then. */
+function initialCjsThisRead(lowerer: Lowerer, node: ts.Expression): boolean {
+  let use: ts.Node = node;
+  while (ts.isParenthesizedExpression(use.parent)) use = use.parent;
+  const parent = use.parent;
+  if (
+    (ts.isBinaryExpression(parent) &&
+      parent.left === use &&
+      parent.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+    ts.isDeleteExpression(parent) ||
+    ts.isPostfixUnaryExpression(parent) ||
+    (ts.isPrefixUnaryExpression(parent) &&
+      (parent.operator === ts.SyntaxKind.PlusPlusToken ||
+        parent.operator === ts.SyntaxKind.MinusMinusToken))
+  )
+    return false;
+  const pure = (expression: ts.Expression): boolean => {
+    if (ts.isParenthesizedExpression(expression)) return pure(expression.expression);
+    if (ts.isFunctionExpression(expression) || ts.isArrowFunction(expression)) return true;
+    if (ts.isIdentifier(expression) || ts.isLiteralExpression(expression)) return true;
+    if (isCjsTopLevelThis(lowerer, expression)) return true;
+    if (ts.isPropertyAccessExpression(expression))
+      return isCjsTopLevelThis(lowerer, expression.expression);
+    if (ts.isCallExpression(expression) && expression.arguments.nodes.length === 0) {
+      let callee = expression.expression;
+      while (ts.isParenthesizedExpression(callee)) callee = callee.expression;
+      if (ts.isFunctionExpression(callee) && callee.parameters.nodes.length === 0)
+        return callee.body.statements.nodes.every(
+          (statement) =>
+            ts.isFunctionDeclaration(statement) ||
+            ts.isEmptyStatement(statement) ||
+            (ts.isReturnStatement(statement) &&
+              (!statement.expression || pure(statement.expression))) ||
+            (ts.isVariableStatement(statement) &&
+              statement.declarationList.declarations.nodes.every(
+                (declaration) =>
+                  ts.isIdentifier(declaration.name) &&
+                  (!declaration.initializer || pure(declaration.initializer)),
+              )),
+        );
+    }
+    if (ts.isBinaryExpression(expression))
+      return (
+        (expression.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+          expression.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+          expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) &&
+        pure(expression.left) &&
+        pure(expression.right)
+      );
+    return false;
+  };
+  const beforeRead = (expression: ts.Expression): boolean => {
+    if (expression === node)
+      return (
+        ts.isPropertyAccessExpression(node) ||
+        (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression))
+      );
+    if (ts.isParenthesizedExpression(expression)) return beforeRead(expression.expression);
+    if (ts.isBinaryExpression(expression)) {
+      if (node.pos >= expression.left.pos && node.end <= expression.left.end)
+        return beforeRead(expression.left);
+      return pure(expression.left) && beforeRead(expression.right);
+    }
+    return false;
+  };
+  let statement: ts.Node = node;
+  while (statement.parent && !ts.isSourceFile(statement.parent)) {
+    if (ts.isFunctionLike(statement)) return false;
+    statement = statement.parent;
+  }
+  for (const item of ts.getSourceFileOfNode(node).statements.nodes) {
+    if (item === statement && ts.isVariableStatement(item)) {
+      for (const declaration of item.declarationList.declarations.nodes) {
+        if (!ts.isIdentifier(declaration.name)) return false;
+        const initializer = declaration.initializer;
+        if (!initializer) continue;
+        if (node.pos >= initializer.pos && node.end <= initializer.end)
+          return beforeRead(initializer);
+        if (!pure(initializer)) return false;
+      }
+      return false;
+    }
+    if (
+      !ts.isFunctionDeclaration(item) &&
+      !ts.isEmptyStatement(item) &&
+      !(ts.isExpressionStatement(item) && ts.isStringLiteral(item.expression)) &&
+      !(
+        ts.isVariableStatement(item) &&
+        item.declarationList.declarations.nodes.every(
+          (declaration) =>
+            ts.isIdentifier(declaration.name) &&
+            (!declaration.initializer || pure(declaration.initializer)),
+        )
+      )
+    )
+      return false;
+    if (item === statement) return true;
+  }
+  return false;
+}
+
 /** The value of top-level `this` in a CommonJS module: the module's own
  * object standing for its original exports, created when the module starts
  * (lowerFileInit). Exports themselves are the static export table, so a
  * property access through `this` would read or write an object no requirer
- * sees; it keeps a named refusal instead. Typeof, truthiness, identity and
+ * sees; only reads before the first effectful statement use its initial
+ * empty object, and other accesses keep a named refusal. Typeof, truthiness, identity and
  * passing the value along (the UMD wrapper `(function (root) { ... })(this)`)
  * behave as in Node. */
 export function lowerCjsTopLevelThis(lowerer: Lowerer, expr: ts.Expression): IrExpr | null {
@@ -348,7 +452,8 @@ export function lowerCjsTopLevelThis(lowerer: Lowerer, expr: ts.Expression): IrE
   const access = receiver.parent;
   if (
     (ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access)) &&
-    access.expression === receiver
+    access.expression === receiver &&
+    !initialCjsThisRead(lowerer, access)
   ) {
     lowerer.unsupported(
       "SC1090",

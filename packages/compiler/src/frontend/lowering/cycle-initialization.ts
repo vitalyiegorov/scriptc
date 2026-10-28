@@ -14,6 +14,7 @@ import {
   type CycleEarlyBinding,
 } from "../program.js";
 import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
+import { isProvenanceSourceFile } from "../provenance-registry.js";
 import {
   BOOL,
   STRING,
@@ -68,6 +69,9 @@ export interface CycleInitFlag {
 interface ClassReference {
   loc: SrcLoc;
   name: string;
+  /** Spans of the functions enclosing the reference: IR whose span contains
+   * such a function only creates it, and does not read the class. */
+  functions?: readonly SrcLoc[];
 }
 
 /** The static field storage of a flag without a class. */
@@ -88,14 +92,23 @@ export function markCycleEarlyBindings(lowerer: Lowerer): void {
     lowerer.moduleOrder,
     lowerer.forkTargets.length === 0 && lowerer.workerTargets.length === 0,
   );
-  const refuse = (node: ts.Node, reason: string): void => {
+  const refuse = (node: ts.Node, reason: string, module: ts.SourceFile): void => {
     if (lowerer.remainder) return;
+    // A provenance package's TypeScript ran in this evaluation order as the
+    // published build, so its bindings are initialized wherever the program
+    // reaches them: a binding without an exact early-access
+    // representation keeps unchecked storage instead of refusing the build.
+    if (isProvenanceSourceFile(module.fileName)) return;
     lowerer.pushDiag(unsupportedDiag("SC1016", locOf(node), `circular imports (${reason})`));
   };
   for (const binding of early) {
     const where = `'${binding.name.text}' declared in ${binding.module.fileName} can be accessed before its declaration runs`;
     if (binding.kind === "var") {
-      refuse(binding.reference, `the var binding ${where}, where Node reads undefined`);
+      refuse(
+        binding.reference,
+        `the var binding ${where}, where Node reads undefined`,
+        binding.module,
+      );
       continue;
     }
     if (binding.kind === "class") {
@@ -106,18 +119,23 @@ export function markCycleEarlyBindings(lowerer: Lowerer): void {
       const heritage = earlyHeritageReference(lowerer, binding);
       if (info !== undefined && !info.generic && heritage === null)
         registerClassInitFlag(lowerer, binding, info, true);
-      else refuse(heritage ?? binding.reference, `the class ${where}`);
+      else refuse(heritage ?? binding.reference, `the class ${where}`, binding.module);
       continue;
     }
     const global = lowerer.globalsBySymbol.get(binding.symbol);
     if (global === undefined) {
-      refuse(binding.reference, `the binding ${where}, and it has no module storage to check`);
+      refuse(
+        binding.reference,
+        `the binding ${where}, and it has no module storage to check`,
+        binding.module,
+      );
       continue;
     }
     if (binding.folded !== undefined) {
       refuse(
         binding.folded,
         `the binding ${where}, and this use is resolved from its type rather than its storage`,
+        binding.module,
       );
       continue;
     }
@@ -213,11 +231,21 @@ function earlyHeritageReference(lowerer: Lowerer, binding: CycleEarlyBinding): t
     ts.walkPreorder(sf, (node) => {
       if (found !== null || node === declaration) return "skip";
       if (!ts.isHeritageClause(node)) return undefined;
+      // Only a class's `extends` clause runs; an interface's heritage and
+      // `implements` are types, and so are the type arguments of an
+      // `extends` clause.
+      if (
+        node.token !== ts.SyntaxKind.ExtendsKeyword ||
+        !(ts.isClassDeclaration(node.parent) || ts.isClassExpression(node.parent))
+      )
+        return "skip";
       // Node evaluates the whole clause when the class statement runs:
       // any reference inside it (parenthesized, a factory argument)
       // reaches the class.
       ts.walkPreorder(node, (inner) => {
         if (found !== null) return "skip";
+        if (ts.isTypeNode(inner) && inner.kind !== ts.SyntaxKind.ExpressionWithTypeArguments)
+          return "skip";
         if (
           ts.isIdentifier(inner) &&
           names.has(inner.text) &&
@@ -297,10 +325,17 @@ function classReferences(
     ts.walkPreorder(sf, (node) => {
       if (node === declaration) return "skip";
       if (ts.isIdentifier(node) && names.has(node.text) && resolvesTo(lowerer, node, symbol, cycle))
-        out.push({ loc: locOf(node), name: node.text });
+        out.push({ loc: locOf(node), name: node.text, functions: enclosingFunctions(node) });
       return undefined;
     });
   }
+  return out;
+}
+
+function enclosingFunctions(node: ts.Node): SrcLoc[] {
+  const out: SrcLoc[] = [];
+  for (let n: ts.Node | undefined = node.parent; n !== undefined; n = n.parent)
+    if (ts.isFunctionLike(n)) out.push(locOf(n));
   return out;
 }
 
@@ -308,7 +343,11 @@ function classReferences(
  * for, or undefined. */
 function coveredReference(flag: CycleInitFlag, loc: SrcLoc): ClassReference | undefined {
   return (flag.references ?? []).find(
-    (r) => r.loc.file === loc.file && loc.start <= r.loc.start && r.loc.end <= loc.end,
+    (r) =>
+      r.loc.file === loc.file &&
+      loc.start <= r.loc.start &&
+      r.loc.end <= loc.end &&
+      !(r.functions ?? []).some((f) => loc.start <= f.start && f.end <= loc.end),
   );
 }
 

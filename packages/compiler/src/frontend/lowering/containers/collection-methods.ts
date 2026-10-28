@@ -1,3 +1,4 @@
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
 import { keyedHelperName } from "../stable-names.js";
 import { primitiveElement } from "../array-values.js";
 import { nodeThrowExpr, boolLit, countedFor, numLit, strLit, varRef } from "../../../ir/build.js";
@@ -63,7 +64,11 @@ export function lowerMapMethodCall(
   if (!MAP_METHODS.has(name)) return null;
   let receiverIr = lowerer.mapTypeOf(lowerer.typeOf(access.expression));
   let probedUntyped = false;
-  if (receiverIr?.kind !== "map" && isJsSourceFile(ts.getSourceFileOfNode(access))) {
+  if (
+    receiverIr?.kind !== "map" &&
+    (isJsSourceFile(ts.getSourceFileOfNode(access)) ||
+      isProvenanceSourceFile(ts.getSourceFileOfNode(access).fileName))
+  ) {
     const probed = tryLowerExpression(lowerer, access.expression);
     if (probed?.type.kind === "map") {
       receiverIr = probed.type;
@@ -596,7 +601,11 @@ export function lowerSetMethodCall(
   // Set<union-of-signatures>, but the VALUE lowered as a real Set of
   // identity tokens (the new-Set probe) — the lowered receiver's type
   // is the honest dispatch key.
-  if (receiverIr?.kind !== "set" && isJsSourceFile(ts.getSourceFileOfNode(access))) {
+  if (
+    receiverIr?.kind !== "set" &&
+    (isJsSourceFile(ts.getSourceFileOfNode(access)) ||
+      isProvenanceSourceFile(ts.getSourceFileOfNode(access).fileName))
+  ) {
     const probed = tryLowerExpression(lowerer, access.expression);
     if (probed?.type.kind === "set") {
       receiverIr = probed.type;

@@ -35,6 +35,7 @@ ScrDyn *scr_process_builtin_unsupported(ScrStr *id, ScrStr *member);
  * name when `keys` lists it. Borrows all three; +1 handle. */
 ScrDyn *scr_module_namespace_value(ScrStr *id, ScrArr *keys, ScrDyn *getter);
 ScrDyn *scr_global_native(ScrArr *known);
+void scr_global_namespace_install(ScrStr *name, ScrDyn *value);
 ScrDyn *scr_global_native_init(ScrArr *known, ScrDyn *(*console_get)(void));
 ScrDyn *scr_console_native(void);
 /* node:console Console instances: a native handle over the stdout/stderr

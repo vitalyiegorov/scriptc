@@ -57,3 +57,30 @@ export declare function grow(into: Tree[]): void;
 `);
   expect(reexported(entry)).toEqual(["Node", "List"]);
 });
+
+test("side-effect polyfill declarations retain global augmentations without declaring runtime exports", () => {
+  const declarations = `export {};
+declare global {
+  namespace Reflect {
+    function defineMetadata(key: unknown, value: unknown, target: object): void;
+  }
+}
+`;
+  const entry = fixture(declarations);
+  const plan = npmStaticTypeExportPlan(nodeFrontendServices(), entry, ["pkg"]);
+  expect(plan.globalRoots).toHaveLength(1);
+  expect(plan.copies.get(plan.globalRoots[0]!)).toBe(declarations);
+  expect(plan.typedefs.size).toBe(0);
+});
+
+test("global augmentation roots preserve relative declaration dependencies", () => {
+  const entry = fixture('import "./globals"; export {};\n');
+  writeFileSync(
+    join(entry, "..", "node_modules", "pkg", "lib", "globals.d.ts"),
+    "export {}; declare global { interface Polyfilled { version: string } }\n",
+  );
+  const plan = npmStaticTypeExportPlan(nodeFrontendServices(), entry, ["pkg"]);
+  expect(plan.globalRoots).toHaveLength(1);
+  expect(plan.copies.size).toBe(2);
+  expect(plan.copies.get(plan.globalRoots[0]!)).toContain("./globals.scriptc-types");
+});

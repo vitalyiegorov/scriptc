@@ -4,7 +4,8 @@
   Methods that use `#private` members or `super` throw a TypeError for a receiver that is not an instance of the class.
   `C.prototype` also reads as a value for `Object.getPrototypeOf` and for `===` and `!==` comparisons.
   Changing the prototype of a class prototype (`Object.setPrototypeOf(C.prototype, X)`, `util.inherits(C, F)`, or `Object.setPrototypeOf` on a class prototype reached through an instance) is unsupported.
-  Other bare prototype reflection, TypeScript class prototypes as values, accessor replacement, and prototype storage on local, generic, mixin, or runtime-provided classes are unsupported.
+  Legacy-decorated TypeScript classes and classes used as reflection metadata targets expose their prototypes as values.
+  Other bare prototype reflection, undecorated TypeScript class prototypes as values outside metadata targets, accessor replacement outside legacy-decorated classes, and prototype storage on mixin or runtime-provided classes are unsupported.
   Plain objects, arrays, functions, class instances, and Date, RegExp, Map, Set, WeakMap, WeakSet, and Promise values inherit `constructor`, `valueOf`, `toString`, `hasOwnProperty`, and `propertyIsEnumerable` from `Object.prototype` as in Node, so `value.constructor === Object` and `value.valueOf === Object.prototype.valueOf` compare identities exactly.
   Named reads such as `value.valueOf` answer these inherited members; computed-key reads such as `value[key]` do not.
   `Object.prototype`'s own members read as values; its mutation and other reflection, such as `isPrototypeOf` and `__proto__`, are unsupported.

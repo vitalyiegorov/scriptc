@@ -73,6 +73,75 @@ export function unwrapUmdFactory(sf: ts.SourceFile): string | null {
   ]);
 }
 
+/* A CommonJS module whose whole body is a parameterless IIFE (cors):
+ *
+ *   (function () {
+ *     'use strict';
+ *     var vary = require('vary');
+ *     module.exports = middlewareWrapper;
+ *   })();
+ *
+ * Node's module wrapper is already a function scope, so the IIFE body runs
+ * exactly as it would at the module's top level, and its requires and
+ * export assignments become the module's own. Accepted: the IIFE is the
+ * file's only statement, its function is anonymous with no parameters and
+ * is called with no arguments, its body has no `return`, `arguments` or
+ * `this` of its own (helper probes aside, as above), and its top level
+ * declares none of the module wrapper's bindings. */
+
+/** True when the text may begin with a module IIFE (a cheap probe). */
+export function mayHoldModuleIife(source: string): boolean {
+  return /^(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*;?\s*[(]\s*function\s*[(]\s*[)]/.test(source);
+}
+
+/** The module text with a module IIFE's body at the top level, or null when
+ * the file is not one. */
+export function unwrapModuleIife(sf: ts.SourceFile): string | null {
+  const stmts = sf.statements.nodes.filter((stmt) => !ts.isEmptyStatement(stmt));
+  if (stmts.length !== 1) return null;
+  const stmt = stmts[0]!;
+  if (!ts.isExpressionStatement(stmt)) return null;
+  const call = unparenthesized(stmt.expression);
+  if (!ts.isCallExpression(call) || call.arguments.nodes.length !== 0) return null;
+  const fn = unparenthesized(call.expression);
+  if (
+    !ts.isFunctionExpression(fn) ||
+    fn.name !== undefined ||
+    fn.asteriskToken !== undefined ||
+    fn.modifiers !== undefined ||
+    fn.parameters.nodes.length !== 0
+  )
+    return null;
+  const body = fn.body;
+  if (body === undefined || !ownBodyKeepsModuleSemantics(body)) return null;
+  if (body.statements.nodes.some(declaresWrapperBinding)) return null;
+  const open = tokenStartOfNode(body) + 1;
+  const close = body.end - 1;
+  return applyEdits(sf.text, 0, sf.text.length, [
+    { start: tokenStartOfNode(stmt), end: open, text: "" },
+    { start: close, end: stmt.end, text: "" },
+  ]);
+}
+
+const WRAPPER_BINDINGS = new Set(["exports", "require", "module", "__filename", "__dirname"]);
+
+/** A top-level declaration of a name the module wrapper binds: inside the
+ * IIFE it shadows the wrapper's binding, at the top level it would not. */
+function declaresWrapperBinding(stmt: ts.Statement): boolean {
+  const names: ts.Node[] = [];
+  if (ts.isVariableStatement(stmt))
+    for (const decl of stmt.declarationList.declarations.nodes) names.push(decl.name);
+  else if ((ts.isFunctionDeclaration(stmt) || ts.isClassDeclaration(stmt)) && stmt.name)
+    names.push(stmt.name);
+  let found = false;
+  for (const name of names)
+    ts.walkPreorder(name, (n) => {
+      if (ts.isIdentifier(n) && WRAPPER_BINDINGS.has(n.text)) found = true;
+      return found ? "stop" : undefined;
+    });
+  return found;
+}
+
 function unparenthesized(e: ts.Expression): ts.Expression {
   while (ts.isParenthesizedExpression(e)) e = e.expression;
   return e;

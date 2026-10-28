@@ -1,10 +1,3 @@
-generic-methods.ts:19:10 - error SC1090: calling the generic method 'm' through a receiver whose runtime class may override it (a subclass of 'VBase' redeclares it and generic methods dispatch statically — bind the receiver to a const initialized with its 'new' expression) is not supported yet
-
-  18 | function throughBase(r: VBase): string {
-  19 |   return r.m(1);
-     |          ^~~~~~
-  20 | }
-
 generic-methods.ts:31:3 - error SC1090: overriding the inherited method 'f' with a generic method (generic methods dispatch statically, so the base's vtable slot could never reach this override) is not supported yet
 
   30 | class GenericOver extends PlainBase {

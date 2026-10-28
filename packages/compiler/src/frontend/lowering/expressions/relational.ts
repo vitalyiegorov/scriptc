@@ -1952,6 +1952,21 @@ export function lowerInExpression(
           loc,
         };
   }
+  // A primitive receiver (a JS function instantiated with a string) throws
+  // Node's TypeError, as `#x in v` does.
+  if (recv.type.kind === "string" || recv.type.kind === "f64" || recv.type.kind === "bool") {
+    return {
+      kind: "libCall",
+      fn: "error.nodeThrow",
+      args: [
+        numLit(1, loc),
+        strLit("", loc),
+        privateInMessage(key, lowerer.coerceToExpected(recv, DYN), loc),
+      ],
+      type: BOOL,
+      loc,
+    };
+  }
   if (recv.type.kind !== "record") {
     lowerer.unsupported(
       "SC1090",

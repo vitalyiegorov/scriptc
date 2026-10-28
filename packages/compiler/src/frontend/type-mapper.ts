@@ -717,6 +717,15 @@ export class UnionRegistry {
     return id !== undefined && this.pendingRec.has(id);
   }
 
+  /** True when `unionId` is a recursive placeholder whose frame ended
+   * without finalizing it: no arm list will ever fill it in. */
+  isAbandonedPlaceholder(unionId: string): boolean {
+    const def = this.byId.get(unionId);
+    if (def === undefined || def.arms.length > 0 || !this.pendingRec.has(unionId)) return false;
+    for (const t of this.inProgress) if (this.recIds.get(t) === unionId) return false;
+    return true;
+  }
+
   /** Completes a recursive placeholder with its canonical arm list and
    * registers the structural key (first writer wins, like shapes). */
   finalizeRecursive(t: ts.Type, arms: IrType[], discriminant?: IrUnionDiscriminant): string {
@@ -1274,10 +1283,14 @@ export interface TypeMapperCtx {
    * class-derived interfaces as well as the current function bindings.
    * Absent in checkers with no lowering attached (generic instance types
    * stay unmapped there). */
+  /** Whether the program reads the generic class as a value (a bare
+   * `typeof C` then maps to its erased instantiation). */
+  genericClassValueUsed?: (decl: ts.ClassLikeDeclaration) => boolean;
   genericClassInstance?: (
     decl: ts.ClassLikeDeclaration,
     typeRef: ts.Type,
     mapArgument: (type: ts.Type) => IrType | null,
+    quiet?: boolean,
   ) => IrType | null;
   /** MIXIN class nodes (the class inside a mixin function): one shared
    * AST node, one instantiation per call site — the node's instance type
@@ -1789,6 +1802,20 @@ export function isFetchHandleType(
   return handle;
 }
 
+let promiseLikeUnmappedDepth = 0;
+
+/** Runs `fn` with `PromiseLike<T>` and `PromiseConstructor` unmapped, and
+ * no mapping memoized (so the scoped answers never leak): `Promise.try`'s
+ * callback keeps its pre-existing fences. */
+export function withoutPromiseLikeMapping<R>(fn: () => R): R {
+  promiseLikeUnmappedDepth++;
+  try {
+    return fn();
+  } finally {
+    promiseLikeUnmappedDepth--;
+  }
+}
+
 export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   if (mapTypeDepth >= MAP_TYPE_MAX_DEPTH) return null;
   // These intrinsic domains cannot depend on generic bindings, declaration
@@ -1808,7 +1835,8 @@ export function mapType(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   }
   const topLevel = mapTypeDepth === 0;
   const typeId = (type as { id?: number }).id;
-  const memoizable = typeId !== undefined && (ctx.canMemoizeType?.() ?? true);
+  const memoizable =
+    typeId !== undefined && promiseLikeUnmappedDepth === 0 && (ctx.canMemoizeType?.() ?? true);
   // An empty literal's type maps to the empty record as an unreduced union's
   // arm (emptyLiteralArm) and to the checked-dynamic value elsewhere: the two
   // answers keep separate memo entries.
@@ -2055,6 +2083,13 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
         if (viaConditional !== null) {
           contextResolutions++;
           return viaConditional;
+        }
+        // A conditional that resolves to `any` under the bindings
+        // (`ObservedValueOf<Observable<any>>`) is an `any`-typed slot,
+        // checked-dynamic like a type parameter bound to `any`.
+        if ((evaluated.flags & ts.TypeFlags.Any) !== 0) {
+          contextResolutions++;
+          return DYN;
         }
       }
     }
@@ -2378,7 +2413,16 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     // element is one checked-dynamic value (a class capsule or an object),
     // so a native array of them keeps every element's identity and passes
     // method calls a receiver they can dispatch.
-    if (elem.kind === "dyn") return ctx.classImplementedProtocol?.(elemTs) ? arrayOf(DYN) : DYN;
+    if (elem.kind === "dyn") {
+      // A type parameter element asks about the type it is bound to in this
+      // instantiation, so `T[]` in a generic body agrees with the
+      // instantiated parameter's `(Subscription | Unsubscribable)[]`.
+      const boundElem =
+        elemTs.flags & ts.TypeFlags.TypeParameter
+          ? (ctx.resolveTypeParamTs?.(elemTs) ?? elemTs)
+          : elemTs;
+      return ctx.classImplementedProtocol?.(boundElem) ? arrayOf(DYN) : DYN;
+    }
     // The shared predicate is the runtime/backend storage contract. In
     // particular, valid standalone values such as Date and opaque
     // handles do not automatically have an array element representation.
@@ -2478,6 +2522,15 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (errorMetadata) return errorMetadata;
     const brandedPrimitive = mapBrandedPrimitiveIntersection(widened, ctx);
     if (brandedPrimitive) return brandedPrimitive;
+  }
+  // A CLASS REFINED by a structural guard (`source is { lift: ... }` over an
+  // Observable): every other constituent only names members the class
+  // already has, so it describes the class's own instances and adds nothing
+  // the class lacks. The value is the instance; members keep reading and
+  // calling the class's own slots and methods.
+  if (widened.isIntersectionType()) {
+    const refined = mapClassRefinementIntersection(widened, ctx);
+    if (refined) return refined;
   }
   // REFINED handle intersections — @types/node's idioms: `ServerResponse<
   // IncomingMessage> & { req: IncomingMessage }` (RequestListener's
@@ -2639,7 +2692,28 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (classDecl.typeParameters?.nodes) {
       const ctorSigs = checker.getConstructSignatures(widened);
       if (ctorSigs.length !== 1) return null;
-      const inst = mapType(checker.getReturnTypeOfSignature(ctorSigs[0]!), ctx);
+      const ret = checker.getReturnTypeOfSignature(ctorSigs[0]!);
+      let inst = mapType(ret, ctx);
+      // The bare `typeof Box` (a class passed around as a value, then built
+      // through `new ctor<T>(...)`) names no instantiation: its construct
+      // signature returns `Box<T>` over the class's OWN type parameters.
+      // JavaScript erases them, so the value is the instantiation with every
+      // parameter unknown (checked-dynamic), and subclasses `Sub<T> extends
+      // Box<T>` instantiate the same way and upcast into the slot.
+      if (inst === null && ctx.genericClassInstance && ctx.genericClassValueUsed?.(classDecl)) {
+        const own = classDecl.typeParameters.nodes.length;
+        const args = checker.getTypeArguments(ret as ts.TypeReference).slice(0, own);
+        if (
+          args.length === own &&
+          args.every(
+            (arg) =>
+              (arg.flags & ts.TypeFlags.TypeParameter) !== 0 &&
+              !ctx.resolveTypeParam?.(arg) &&
+              arg.getSymbol()?.declarations.some((d) => d.parent === classDecl),
+          )
+        )
+          inst = ctx.genericClassInstance(classDecl, ret, () => DYN, true);
+      }
       return inst?.kind === "object" ? { kind: "classval", className: inst.className } : null;
     }
     return { kind: "classval", className: classNamer(classDecl) };
@@ -2658,6 +2732,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       const inst = mapType(checker.getReturnTypeOfSignature(ctorSigs[0]!), ctx);
       if (
         inst?.kind === "object" &&
+        !isUntypedRestConstruct(checker, ctorSigs[0]!) &&
         !RUNTIME_ERROR_CLASSES.has(inst.className) &&
         inst.className !== RUNTIME_EMITTER_CLASS &&
         !RUNTIME_STREAM_CLASSES.has(inst.className)
@@ -2672,19 +2747,39 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     // value rides the checked-dynamic tree, as an `unknown` slot already
     // holds one. `new` through it and static reads dispatch at run time,
     // and the constructed value checks into the signature's instance type.
-    // Lib and package constructables keep their fences, and so do those of
-    // fetched provenance sources (third-party code under its own policies:
-    // an unused `@__PURE__` const typed `{ new (): any }` elides there).
+    // Lib and package constructables keep their fences. A fetched
+    // provenance source's constructables map like the program's own (a
+    // runtime-built constructor function typed by its construct signature,
+    // rxjs's `createErrorClass` errors); the elision of an unused
+    // `@__PURE__` const typed `{ new (): any }` is decided separately
+    // (provenanceElidedConstDecl).
     if (
       ctorSigs.length > 0 &&
       checker.getCallSignatures(widened).length === 0 &&
       (widened.getSymbol()?.declarations.length ?? 0) > 0 &&
-      widened.getSymbol()!.declarations.every((d) => {
-        const sf = ts.getSourceFileOfNode(d);
-        return ctx.isProgramFile(sf) && !isProvenanceSourceFile(sf.fileName);
-      })
+      widened.getSymbol()!.declarations.every((d) => ctx.isProgramFile(ts.getSourceFileOfNode(d)))
     ) {
       return DYN;
+    }
+    // The lib's construct-only Promise constructor type
+    // (`PromiseConstructorLike`, `new <T>(executor) => PromiseLike<T>`): a
+    // constructor value whose instances are thenables, held checked-dynamic
+    // like the program constructables above.
+    if (
+      ctorSigs.length === 1 &&
+      checker.getCallSignatures(widened).length === 0 &&
+      (widened.getSymbol()?.declarations.length ?? 0) > 0 &&
+      widened.getSymbol()!.declarations.every((d) => ctx.isStdlibFile(ts.getSourceFileOfNode(d)))
+    ) {
+      const instSym = checker.getReturnTypeOfSignature(ctorSigs[0]!).getSymbol();
+      if (
+        instSym !== undefined &&
+        ["Promise", "PromiseLike"].includes(ts.symbolName(instSym)) &&
+        instSym.declarations.some(
+          (d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(ts.getSourceFileOfNode(d)),
+        )
+      )
+        return DYN;
     }
   }
   // Map<K, V>: a reference to the standard library's Map interface —
@@ -3270,6 +3365,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     return { kind: "regex" };
   }
   if (
+    isStdlibInterface("DateTimeFormat") ||
     isStdlibInterface("Segmenter") ||
     isStdlibInterface("Segments") ||
     isStdlibInterface("SegmentData")
@@ -3311,6 +3407,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     isStdlibInterface("ArrayBuffer") ||
     isStdlibInterface("SharedArrayBuffer") ||
     isStdlibInterface("PropertyDescriptor") ||
+    isStdlibInterface("TypedPropertyDescriptor") ||
     isStdlibInterface("ProcessVersions") ||
     isStdlibInterface("ProcessRelease")
   )
@@ -3962,6 +4059,19 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     if (!inner) return null;
     return { kind: "promise", inner };
   }
+  // The thenable `PromiseLike<T>` (what a Promise constructor signature's
+  // resolve accepts and its construction answers) and the `PromiseConstructor`
+  // value are arbitrary objects the checked-dynamic tree already holds.
+  if (
+    promiseLikeUnmappedDepth === 0 &&
+    (isStdlibInterface("PromiseConstructor") || isStdlibInterface("PromiseLike"))
+  )
+    return DYN;
+  // The `AsyncIterable<T>` protocol (an object with `[Symbol.asyncIterator]`)
+  // and the `ArrayLike<T>` protocol (a `length` and index members) are held
+  // like their `PromiseLike<T>` sibling: any object implementing it —
+  // an async generator included — rides the checked-dynamic representation.
+  if (isStdlibInterface("AsyncIterable") || isStdlibInterface("ArrayLike")) return DYN;
   // Native collection iterators use checked runtime iterator objects.
   if (isStdlibInterface("MapIterator") || isStdlibInterface("SetIterator")) return DYN;
   // Array iterators (`list.values()` and friends) are generators over the
@@ -4025,7 +4135,10 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // a generator stays single-pass.
   if (isStdlibInterface("Iterable")) {
     const arg = checker.getTypeArguments(widened as ts.TypeReference)[0];
-    const elem = arg ? mapType(arg, ctx) : null;
+    const mappedElem = arg ? (arg.flags & ts.TypeFlags.Any ? DYN : mapType(arg, ctx)) : null;
+    // `Iterable<void>` yields undefined values: a checked-dynamic element holds them
+    // (the void unit has no array storage of its own).
+    const elem = mappedElem?.kind === "void" ? DYN : mappedElem;
     return elem ? iterableUnionType(elem, ctx.shapes, unions) : null;
   }
   // IteratorResult<T, TReturn> — the checker's type of `g.next()` (an
@@ -5011,6 +5124,9 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
             !checker.isNeverType(part) &&
             !isEmptyObjectLiteralType(part, ctx),
         );
+      // A class-backed protocol (an interface a program class implements)
+      // is a live checked-dynamic view; see the collapse below.
+      let protocolViewArm = false;
       for (const part of parts) {
         if (hasArrayPart && emptyTuple(part)) continue;
         // TypeScript's client can retain impossible intersections in a
@@ -5043,6 +5159,13 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
 
         if (!mapped) {
           return null;
+        }
+        if (
+          mapped.kind === "dyn" &&
+          (part.flags & ts.TypeFlags.Object) !== 0 &&
+          (ctx.classImplementedProtocol?.(part) || isStdlibProtocolView(part, ctx))
+        ) {
+          protocolViewArm = true;
         }
         if (mapped.kind === "void") {
           byKey.set(typeKey(UNDEFINED_T), UNDEFINED_T);
@@ -5099,6 +5222,38 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       if (
         arms.some((a) => a.kind === "dyn") &&
         arms.every((a) => dynSubsumableUnionArm(a, ctx)) &&
+        !unions.recursivePending(widened)
+      ) {
+        return DYN;
+      }
+      // A union beside a class-backed protocol view (`Subscription |
+      // Unsubscribable | (() => void)`): the protocol arm already accepts
+      // every class instance that satisfies it, so the union rides the same
+      // checked-dynamic representation. Class instances box at their class
+      // with identity and functions box by reference; narrowing tests
+      // (`instanceof`, `typeof x === "function"`) dispatch on the dyn value.
+      if (
+        protocolViewArm &&
+        arms.every(
+          (a) =>
+            dynSubsumableUnionArm(a, ctx) ||
+            a.kind === "object" ||
+            // The iterable union's own arms (generator, Set, ...) and the
+            // other handle kinds convert as the protocol arm's values.
+            (a.kind !== "func" &&
+              a.kind !== "union" &&
+              canConvertToDyn(
+                a,
+                (id) => ctx.shapes.get(id),
+                (id) => ctx.unions.get(id),
+              )) ||
+            (a.kind === "func" &&
+              canConvertToDyn(
+                a,
+                (id) => ctx.shapes.get(id),
+                (id) => ctx.unions.get(id),
+              )),
+        ) &&
         !unions.recursivePending(widened)
       ) {
         return DYN;
@@ -5161,6 +5316,13 @@ function isAsyncLocalStorageSnapshot(sig: ts.Signature, ctx: TypeMapperCtx): boo
     ctx.isStdlibFile(ts.getSourceFileOfNode(decl)) &&
     isDeclaredInAmbientModule(decl, "async_hooks")
   );
+}
+
+/** A parameter annotation spelled `any` or `any[]`. */
+function spelledAnyType(node: ts.TypeNode | undefined): boolean {
+  if (node === undefined) return false;
+  if (node.kind === ts.SyntaxKind.AnyKeyword) return true;
+  return ts.isArrayTypeNode(node) && node.elementType.kind === ts.SyntaxKind.AnyKeyword;
 }
 
 function mapCallSignature(sig: ts.Signature, ctx: TypeMapperCtx): IrType | null {
@@ -5230,12 +5392,24 @@ function mapCallSignature(sig: ts.Signature, ctx: TypeMapperCtx): IrType | null 
       decl.parent !== undefined &&
       (ts.isFunctionDeclaration(decl.parent) ||
         ts.isFunctionTypeNode(decl.parent) ||
+        // A spelled `any` on an interface method or call signature
+        // (`call(subscriber: Subscriber<R>, source: any): void`) or on an
+        // annotated lambda parameter is the same checked-dynamic slot.
+        ((ts.isMethodSignatureDeclaration(decl.parent) ||
+          ts.isCallSignatureDeclaration(decl.parent)) &&
+          spelledAnyType(decl.type)) ||
         ((ts.isArrowFunction(decl.parent) || ts.isFunctionExpression(decl.parent)) &&
-          decl.initializer !== undefined &&
-          decl.type === undefined &&
+          ((decl.initializer !== undefined && decl.type === undefined) ||
+            spelledAnyType(decl.type)) &&
           !isJsSourceFile(ts.getSourceFileOfNode(decl)))) &&
       !ts.getSourceFileOfNode(decl).isDeclarationFile &&
-      (checker.getTypeOfSymbol(p).flags & ts.TypeFlags.Any) !== 0
+      ((checker.getTypeOfSymbol(p).flags & ts.TypeFlags.Any) !== 0 ||
+        // `any[]` is a checked value too (dynFallbackType's stance).
+        (checker.isArrayType(checker.getTypeOfSymbol(p)) &&
+          spelledAnyType(decl.type) &&
+          (checker.getTypeArguments(checker.getTypeOfSymbol(p) as ts.TypeReference)[0]!.flags &
+            ts.TypeFlags.Any) !==
+            0))
     )
       pt = DYN;
     if (
@@ -5243,6 +5417,17 @@ function mapCallSignature(sig: ts.Signature, ctx: TypeMapperCtx): IrType | null 
       ts.isParameter(decl) &&
       ts.isSetAccessorDeclaration(decl.parent) &&
       isJsSourceFile(ts.getSourceFileOfNode(decl))
+    )
+      pt = DYN;
+    // A parameter annotated with a type name nothing declares, in a
+    // dependency's shipped TypeScript (a DOM type such as FrameRequestCallback;
+    // its checker diagnostics are suppressed): a checked value like `unknown`.
+    if (
+      !pt &&
+      decl &&
+      ts.isParameter(decl) &&
+      checker.getTypeOfSymbol(p).isErrorType() &&
+      isProvenanceSourceFile(ts.getSourceFileOfNode(decl).fileName)
     )
       pt = DYN;
     // An inferred JavaScript binding pattern consumes an iterable; it
@@ -5349,7 +5534,13 @@ function mapCallSignature(sig: ts.Signature, ctx: TypeMapperCtx): IrType | null 
     isJsSourceFile(ts.getSourceFileOfNode(sigDecl)) &&
     (retT.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) !== 0;
   let ret =
-    jsUnitReturn || (retT.flags & ts.TypeFlags.Any) !== 0
+    jsUnitReturn ||
+    (retT.flags & ts.TypeFlags.Any) !== 0 ||
+    // `any[]` is a checked value (dynFallbackType's stance).
+    (sigDecl !== undefined &&
+      !ts.getSourceFileOfNode(sigDecl).isDeclarationFile &&
+      checker.isArrayType(retT) &&
+      (checker.getTypeArguments(retT as ts.TypeReference)[0]!.flags & ts.TypeFlags.Any) !== 0)
       ? DYN
       : retT.flags & ts.TypeFlags.Never
         ? VOID
@@ -5900,6 +6091,33 @@ export function restTupleParamTypes(type: ts.Type, ctx: TypeMapperCtx): IrType[]
   return out;
 }
 
+/** The leading positions of a rest tuple that ends in an `any` rest element
+ * (`[handler: () => void, ...args: any[]]`, what a forwarding `(...args)`
+ * infers from `(handler, ...args: any[]) => R`). Null for every other type or
+ * when a leading position is optional or does not map. */
+export function restTupleAnyTailLeadingTypes(type: ts.Type, ctx: TypeMapperCtx): IrType[] | null {
+  const { checker } = ctx;
+  if (!checker.isTupleType(type)) return null;
+  const ref = type as ts.TupleTypeReference;
+  const tupleShape =
+    (ref.elementFlags as ts.ElementFlags[] | undefined) !== undefined
+      ? ref
+      : (ref.getTarget() as ts.TupleType | undefined);
+  const flags = tupleShape?.elementFlags;
+  const args = checker.getTypeArguments(ref);
+  if (flags === undefined || args.length < 2 || flags.length !== args.length) return null;
+  if (!(flags[flags.length - 1]! & ts.ElementFlags.Rest)) return null;
+  if ((args[args.length - 1]!.flags & ts.TypeFlags.Any) === 0) return null;
+  const out: IrType[] = [];
+  for (let i = 0; i < args.length - 1; i++) {
+    if (!(flags[i]! & ts.ElementFlags.Required)) return null;
+    const et = mapTupleElement(args[i]!, ctx);
+    if (!et) return null;
+    out.push(et);
+  }
+  return out;
+}
+
 /** `Parameters<F>` (the fixed tuple of F's parameters, interned exactly as
  * the spelled tuple maps) and `ReturnType<F>` (F's mapped result) over a
  * bound function-typed type parameter. */
@@ -6330,6 +6548,19 @@ function matchInferReference(
   ctx: TypeMapperCtx,
 ): Map<ts.Symbol, ts.Type> | false | undefined {
   const { checker } = ctx;
+  // A union pattern (`O extends ObservableInput<infer T>`, an alias of a
+  // union of generic references): the first member the checked type
+  // matches binds the infer positions; the pattern fails only when every
+  // member fails.
+  if (extendsType.isUnionType()) {
+    let allFalse = true;
+    for (const member of ts.constituentTypes(extendsType)) {
+      const matched = matchInferReference(checked, member, ctx);
+      if (matched instanceof Map) return matched;
+      if (matched !== false) allFalse = false;
+    }
+    return allFalse ? false : undefined;
+  }
   const target = (t: ts.Type): ts.Type | undefined =>
     t.isTypeReference?.() ? (t as ts.TypeReference).getTarget?.() : undefined;
   const wantTarget = target(extendsType) ?? extendsType.getAliasSymbol();
@@ -6967,6 +7198,41 @@ function mapErrorMetadataIntersection(type: ts.Type, ctx: TypeMapperCtx): IrType
  * with a class identity, call/construct/index signature, accessor, or a
  * non-literal value field might describe runtime behavior, so it retains the
  * SC2008 refusal instead of borrowing the primitive representation. */
+/** `Class & { member: ... }` where the class (exactly one constituent maps to
+ * a class instance) declares every member the other constituents name: the
+ * intersection's values are instances of that class. */
+function mapClassRefinementIntersection(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {
+  if (!widened.isIntersectionType()) return null;
+  const { checker } = ctx;
+  let owner: ts.Type | null = null;
+  let mapped: IrType | null = null;
+  const refinements: ts.Type[] = [];
+  for (const part of ts.constituentTypes(widened)) {
+    const sym = part.getSymbol();
+    if (sym !== undefined && (sym.flags & ts.SymbolFlags.Class) !== 0) {
+      if (owner !== null) return null;
+      const m = mapType(part, ctx);
+      if (m?.kind !== "object") return null;
+      owner = part;
+      mapped = m;
+      continue;
+    }
+    if (
+      (part.flags & ts.TypeFlags.Object) === 0 ||
+      checker.getCallSignatures(part).length > 0 ||
+      checker.getConstructSignatures(part).length > 0 ||
+      checker.getIndexInfosOfType(part).length > 0
+    )
+      return null;
+    refinements.push(part);
+  }
+  if (owner === null || mapped === null || refinements.length === 0) return null;
+  for (const refinement of refinements)
+    for (const property of checker.getPropertiesOfType(refinement))
+      if (checker.getPropertyOfType(owner, ts.symbolName(property)) === undefined) return null;
+  return mapped;
+}
+
 function mapBrandedPrimitiveIntersection(widened: ts.Type, ctx: TypeMapperCtx): IrType | null {
   if (!widened.isIntersectionType()) return null;
   const { checker, resolveTypeParam, resolveTypeParamTs } = ctx;
@@ -8070,6 +8336,9 @@ function mapRecordTypeInner(
   {
     const props = checker.getPropertiesOfType(widened);
     if (ctx.classImplementedProtocol?.(widened)) return DYN;
+    // A structural type that function values satisfy (isFunctionProtocolView)
+    // is a checked-dynamic view, which keeps each value as itself.
+    if (isFunctionProtocolView(widened, ctx)) return DYN;
     // Symbol-keyed records use the checked object's descriptor table. A
     // checker-internal __@ name is not a string field in a native struct.
     if (props.some((property) => ts.symbolName(property).startsWith("__@"))) return DYN;
@@ -8312,6 +8581,36 @@ const STDLIB_CONTAINERS: Record<string, { role: (i: number) => string }> = {
   Generator: { role: (i) => ["yield", "return", "next"][i] ?? "channel" },
   AsyncGenerator: { role: (i) => ["yield", "return", "next"][i] ?? "channel" },
 };
+
+/** The members every function value has through `Function.prototype`. */
+const FUNCTION_PROTOTYPE_MEMBERS: ReadonlySet<string> = new Set(["call", "apply", "bind"]);
+
+/** A program-declared structural type whose members are all
+ * `Function.prototype` members (rxjs's `interface Operator { call(subscriber,
+ * source): void }`): function values satisfy it through their apparent
+ * members, and so do objects with such a method. */
+export function isFunctionProtocolView(
+  type: ts.Type,
+  ctx: Pick<TypeMapperCtx, "checker" | "isStdlibFile" | "isProgramFile">,
+): boolean {
+  if ((type.flags & ts.TypeFlags.Object) === 0) return false;
+  const { checker } = ctx;
+  const props = checker.getPropertiesOfType(type);
+  return (
+    props.length > 0 &&
+    checker.getCallSignatures(type).length === 0 &&
+    props.every(
+      (property) =>
+        FUNCTION_PROTOTYPE_MEMBERS.has(ts.symbolName(property)) &&
+        checker.getCallSignatures(checker.getTypeOfSymbol(property)).length > 0 &&
+        property.declarations.every(
+          (d) =>
+            !ctx.isStdlibFile(ts.getSourceFileOfNode(d)) &&
+            ctx.isProgramFile(ts.getSourceFileOfNode(d)),
+        ),
+    )
+  );
+}
 
 /** The `string | object`-family collapse domain (mapTypeInner's union
  * rule): arms the checked-dynamic representation holds FAITHFULLY, so a
@@ -8770,4 +9069,36 @@ function isEmptyObjectLiteralType(type: ts.Type, ctx: TypeMapperCtx): boolean {
     checker.getCallSignatures(type).length === 0 &&
     checker.getConstructSignatures(type).length === 0
   );
+}
+
+/** A structural protocol view the standard library declares and the
+ * checked-dynamic tree holds (`PromiseLike<T>`, `AsyncIterable<T>`): the
+ * object-typed analogue of a class-implemented protocol, accepting every
+ * object that satisfies it. */
+function isStdlibProtocolView(type: ts.Type, ctx: TypeMapperCtx): boolean {
+  const symbol = type.getSymbol();
+  return (
+    symbol !== undefined &&
+    ["PromiseLike", "AsyncIterable", "ArrayLike"].includes(ts.symbolName(symbol)) &&
+    symbol.declarations.some(
+      (d) => ts.isInterfaceDeclaration(d) && ctx.isStdlibFile(ts.getSourceFileOfNode(d)),
+    )
+  );
+}
+
+/** A construct signature `new (...args: any[]): T`: the slot's callers pass
+ * any argument list, so the values it holds need not share one class's
+ * completed constructor ABI (a derived class with its own parameters, a
+ * local class capturing its environment). Such constructables ride the
+ * checked-dynamic tree like the other untyped class values. */
+function isUntypedRestConstruct(checker: ts.TypeChecker, sig: ts.Signature): boolean {
+  const params = sig.getParameters();
+  if (params.length !== 1) return false;
+  const decl = params[0]!.valueDeclaration;
+  if (decl === undefined || !ts.isParameter(decl) || decl.dotDotDotToken === undefined)
+    return false;
+  const type = checker.getTypeOfSymbol(params[0]!);
+  if (!checker.isArrayType(type)) return false;
+  const elem = checker.getTypeArguments(type as ts.TypeReference)[0];
+  return elem !== undefined && (elem.flags & ts.TypeFlags.Any) !== 0;
 }

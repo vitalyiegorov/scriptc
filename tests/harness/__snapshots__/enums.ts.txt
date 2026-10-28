@@ -26,16 +26,9 @@ enums.ts:21:17 - error SC1090: enum objects as values ('E' — member reads like
      |                 ^
   22 | console.log(grabbed.A);
 
-enums.ts:27:13 - error SC1090: enum reverse lookups ('E[i]' where the index is a runtime value — only compile-time-constant indices lower) are not supported yet
+enums.ts:26:13 - error SC1090: 'E[42]' (no member of 'E' has this value — Node answers undefined, which the reverse mapping's 'string' type cannot carry) is not supported yet
 
-  26 | i += 1;
-  27 | console.log(E[i]);
-     |             ^~~~
-  28 | 
-
-enums.ts:31:13 - error SC1090: 'E[42]' (no member of 'E' has this value — Node answers undefined, which the reverse mapping's 'string' type cannot carry) is not supported yet
-
-  30 | // which the reverse mapping's `string` type cannot carry.
-  31 | console.log(E[42]);
+  25 | // which the reverse mapping's `string` type cannot carry.
+  26 | console.log(E[42]);
      |             ^~~~~
-  32 | 
+  27 | 

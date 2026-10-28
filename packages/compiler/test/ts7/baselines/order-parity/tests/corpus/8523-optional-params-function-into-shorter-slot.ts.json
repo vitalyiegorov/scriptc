@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8523-optional-params-function-into-shorter-slot.ts"
+ ],
+ "diags": []
+}

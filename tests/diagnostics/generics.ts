@@ -40,7 +40,7 @@ class Box<T> {
     this.v = v;
   }
 }
-// The uninstantiated family as a value: no thunk, no single ctor ABI.
+// The uninstantiated family as a value: the erased instantiation compiles.
 const BoxAlias = Box;
 // Each specialization resolves the matching concrete base layout while
 // every specialization retains the declaration's JavaScript class identity.

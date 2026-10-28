@@ -34,6 +34,7 @@ import {
   vAdapters,
 } from "./shapes.js";
 import { emitLlvmLayouts } from "./layouts.js";
+import { feedbackPathDefinition } from "./js-feedback.js";
 import { emitArraySearchHelpers } from "./array-search.js";
 import { emitClassMembershipHelper } from "./classes.js";
 import { type RegexMatcherCode, compileRegexMatcher } from "./regex-matchers.js";
@@ -105,6 +106,8 @@ function emitFunctionsInChunks(emitter: LlEmitter, chunks: number): string[] {
 /** Modules with fewer functions emit in one process, and compute their
  * analyses in it: forking and merging would cost more than the workers save
  * (SCRIPTC_EMIT_WORKER_FUNCTIONS lowers it, for tests). */
+const UNDEFINED_VALUE_DECL = "declare ptr @scr_dyn_undefined()";
+
 export function workerMinFunctions(): number {
   const value = Number(process.env["SCRIPTC_EMIT_WORKER_FUNCTIONS"] ?? "2000");
   return Number.isFinite(value) && value > 0 ? value : 2000;
@@ -616,7 +619,7 @@ export function emitModuleParts(emitter: LlEmitter): string[] {
     `%ScrLogArg = type { i32, i64 }`,
     `%ScrVt = type { ${emitter.sizeType}, ${emitter.sizeType}, ptr }`,
     `%ScrUnion = type { ${emitter.sizeType}, i32, ptr, ptr, ptr, i64 }`,
-    `%ScrClosure = type { ${emitter.sizeType}, ptr, ${emitter.sizeType}, ptr, i32, i32, ptr, ptr }`,
+    `%ScrClosure = type { ${emitter.sizeType}, ptr, ${emitter.sizeType}, ptr, i32, i32, ptr, ptr, i32 }`,
     `%ScrFfiTable = type { ptr, ${emitter.sizeType}, ${emitter.sizeType}, ptr, i8, ptr, ptr, ${emitter.sizeType}, ${emitter.sizeType}, ${emitter.sizeType}, ptr, ptr }`,
     `%ScrRegex = type { ${emitter.sizeType}, ptr, ptr, ptr, double, ptr, ptr, ptr }`,
     // ScrArr mirrors scr_runtime.h field-for-field: { rc, len (i32), cap
@@ -743,8 +746,22 @@ export function emitModuleParts(emitter: LlEmitter): string[] {
     ...(emitter.detachedExit && emitter.mod.lib === undefined
       ? [`@scr_detached_exit = constant i8 1`]
       : []),
+    ...(emitter.feedbackRecording &&
+    emitter.feedbackPath !== undefined &&
+    emitter.mod.lib === undefined
+      ? [feedbackPathDefinition(emitter.feedbackPath)]
+      : []),
   );
-  for (const d of emitter.decls) out.push(d);
+  for (const d of emitter.decls) {
+    if (d === UNDEFINED_VALUE_DECL) {
+      // THE undefined value is one immortal node the runtime exports: the
+      // module's calls to scr_dyn_undefined() become the node's address
+      // (emitParts).
+      out.push(`@scr_dyn_undefined_node = external global i8`);
+      continue;
+    }
+    out.push(d);
+  }
   out.push(``);
   const flushedDecls = new Set(emitter.decls);
   {
@@ -2546,10 +2563,17 @@ export function emitFfiCallbackDefs(emitter: LlEmitter): { globals: string[]; de
 }
 
 export function emitParts(emitter: LlEmitter): string[] {
-  const parts = [
+  let parts = [
     ...limitInlineReleases(emitter.emitModuleParts(), emitter.shapeHost.rcMode),
     ...emitter.disposeObserverGates(),
   ];
+  if (emitter.decls.has(UNDEFINED_VALUE_DECL))
+    parts = parts.map((part) =>
+      part.replace(
+        /^(\s*%[-$._A-Za-z0-9]+ = )call ptr @scr_dyn_undefined\(\)/gm,
+        "$1getelementptr inbounds i8, ptr @scr_dyn_undefined_node, i64 0",
+      ),
+    );
   if (!emitter.executableTls) return parts;
   // A worker executable's thread-locals all live in the executable's own
   // TLS block: the program's internal ones, and the runtime's external

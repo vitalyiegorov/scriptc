@@ -96,7 +96,9 @@ import {
   nativeProfileRefusal,
   type NativeProfileMatch,
   type NativeProfileOptions,
+  jsFeedbackPattern,
 } from "./backend/native-profile.js";
+import { feedbackWaysFor, profileSidecarBytes } from "./backend/js-feedback-profile.js";
 import {
   executableLinkerEnvironmentFingerprint,
   linkNativeExecutable,
@@ -145,6 +147,7 @@ import { clearResolveCaches } from "./frontend/resolve.js";
 import { loadFfiProfile, type FfiProfile } from "./ffi/ffi-manifest.js";
 import { executableLinkFeatures } from "./backend/executable-features.js";
 import { youngNurseryRequested } from "./backend/young-nursery.js";
+import { runtimeStatsRequested } from "./backend/runtime-stats.js";
 import {
   type FrontendInputSnapshot,
   FrontendInputTracker,
@@ -609,6 +612,9 @@ async function compileExecutableNative(
     ...(features.warningReplace ? { warningReplace: true } : {}),
     ...(features.stdioExtended ? { stdioExtended: true } : {}),
     ...(features.moduleNamespace ? { moduleNamespace: true } : {}),
+    ...(features.mapClass ? { mapClass: true } : {}),
+    ...(features.functionPrototype ? { functionPrototype: true } : {}),
+    ...(features.intlDateTimeFormat ? { intlDateTimeFormat: true } : {}),
     zlib: features.zlib,
     ...(features.brotli ? { brotli: true } : {}),
     assert: features.assert,
@@ -743,11 +749,15 @@ async function readNativeProfile(
       `cannot read --profile-use file ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  return { use: { path, digest: createHash("sha256").update(bytes).digest("hex") } };
+  const sidecar = profileSidecarBytes(path);
+  const digest = createHash("sha256").update(bytes);
+  if (sidecar !== null) digest.update("\0jsfb\0").update(sidecar);
+  return { use: { path, digest: digest.digest("hex") } };
 }
 
 function usesPrecompiledRuntimePack(opts: CompileRequestOptions, backend: "llvm"): boolean {
-  if (backend !== "llvm" || opts.sanitize === true) return false;
+  // The stats runtime is built from source (backend/runtime-stats.ts).
+  if (backend !== "llvm" || opts.sanitize === true || runtimeStatsRequested()) return false;
   return nativeCodegenTarget() !== null;
 }
 
@@ -901,6 +911,15 @@ async function prepareExecutableInput(
       ...(opts.sanitize === true ? { wasmBoundsChecks: true } : {}),
       ...inlineRcOption(opts.optimization, opts.sanitize === true),
       ...(opts.detachedExit === true ? { detachedExit: true } : {}),
+      ...(opts.profileGenerate !== undefined
+        ? { feedbackPath: jsFeedbackPattern(opts.profileGenerate) }
+        : {}),
+      ...(() => {
+        const feedbackWays = feedbackWaysFor(
+          opts.profileUse === undefined ? undefined : resolve(opts.profileUse),
+        );
+        return feedbackWays === undefined ? {} : { feedbackWays };
+      })(),
       ...targetCpuField(opts.targetCpu),
     });
   } catch (err) {
@@ -1539,6 +1558,7 @@ async function compileTracked(
       ...(profile === undefined ? {} : { profile: nativeProfileKey(profile) }),
       ...checkerField(),
       ...(youngNurseryRequested() ? { youngNursery: true as const } : {}),
+      ...(runtimeStatsRequested() ? { runtimeStats: true as const } : {}),
       npmStatic: opts.npmStatic ?? null,
       ffiProfile:
         opts.ffiProfilePath === undefined || ffiProfileBytes === null

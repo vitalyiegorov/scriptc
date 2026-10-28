@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/js-ic-deep-prototype-chain.js"
+ ],
+ "diags": []
+}

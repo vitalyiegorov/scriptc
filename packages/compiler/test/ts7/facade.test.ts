@@ -490,14 +490,17 @@ test("declaration misses stay direct while explicit whole-file prefetch remains 
   expect(facade.getSymbolAtLocation(name)).toBe(raw.getSymbolAtLocation(name));
   expect(facade.getTypeAtLocation(name)).toBe(raw.getTypeAtLocation(name));
   expect(calls["getSymbolAtLocation"]).toEqual([[name]]);
-  expect(calls["getTypeAtLocation"]).toEqual([[name]]);
+  // The direct path asks the server about one node, inside the panic fence's one-element batch.
+  expect(calls["getTypeAtLocation"]).toEqual([[[name]]]);
   const warm = { ...counts };
   facade.getSymbolAtLocation(name);
   facade.getTypeAtLocation(name);
   expect(counts).toEqual(warm);
   facade.prefetchSourceFile(sf);
   expect(calls["getSymbolAtLocation"]!.some(([nodes]) => Array.isArray(nodes))).toBe(true);
-  expect(calls["getTypeAtLocation"]!.some(([nodes]) => Array.isArray(nodes))).toBe(true);
+  expect(
+    calls["getTypeAtLocation"]!.some(([nodes]) => Array.isArray(nodes) && nodes.length > 1),
+  ).toBe(true);
 });
 
 test("managed misses stay direct instead of falling back to whole-file prefetch", () => {
@@ -528,7 +531,8 @@ export function dead(input: number): number {
   facade.getTypeAtLocation(identifiers[0]!);
   facade.getTypeAtLocation(identifiers[1]!);
   expect(counts["getTypeAtLocation"]).toBe(before + 2);
-  expect(Array.isArray(calls["getTypeAtLocation"]!.at(-1)![0])).toBe(false);
+  // One node per miss (the panic fence's one-element batch), never a whole-file sweep.
+  expect(calls["getTypeAtLocation"]!.at(-1)![0]).toEqual([identifiers[1]]);
 });
 
 test("reachable waves batch symbol types after symbol-only analysis", () => {

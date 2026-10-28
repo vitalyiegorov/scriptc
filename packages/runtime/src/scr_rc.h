@@ -561,6 +561,13 @@ static inline void scr_cyc_free_inline(void *obj) {
   if (scr_cyc_gen(scr_cyc_hdr(obj)) == SCR_CYC_OLD) scr_cyc_old_freed++;
   scr_mem_free(scr_cyc_hdr(obj));
 }
+/* scr_cyc_free_inline for an object no weak collection or kept record
+ * source can name (a capture box): it skips the dispose notification. */
+static inline void scr_cyc_free_unkeyed_inline(void *obj) {
+  scr_cyc_live--;
+  if (scr_cyc_gen(scr_cyc_hdr(obj)) == SCR_CYC_OLD) scr_cyc_old_freed++;
+  scr_mem_free(scr_cyc_hdr(obj));
+}
 _Static_assert(SCR_CYC_NURSERY == 0, "zeroed cycle headers start in the nursery");
 _Static_assert(sizeof(((ScrCycHdr *)0)->gen) == 1 && SCR_CYC_OLD == 2,
                "LLVM backend's inline free compares an i8 generation against 2");

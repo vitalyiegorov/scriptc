@@ -163,21 +163,30 @@ if (UPDATE) {
   test("re-record baselines from the current native frontend", async () => {
     const written = new Set<string>();
     const all = allEntries();
-    for (let i = 0; i < all.length; i += CHUNK) {
-      const batch = all.slice(i, i + CHUNK);
-      const answers = await nativeAnswers(batch);
-      for (let j = 0; j < batch.length; j++) {
-        const path = orderBaselinePath(repoRoot, relativeName(batch[j]!));
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, JSON.stringify(answers[j]!, null, 1) + "\n");
-        written.add(path);
-      }
+    // Several awaited children at a time: the corpus is thousands of entries,
+    // and one child per batch in sequence outlasts any test deadline on a
+    // loaded machine (the recording then stopped part-way, leaving the
+    // alphabetical tail without baselines).
+    const batches: string[][] = [];
+    for (let i = 0; i < all.length; i += CHUNK) batches.push(all.slice(i, i + CHUNK));
+    const PARALLEL = 4;
+    for (let g = 0; g < batches.length; g += PARALLEL) {
+      const group = batches.slice(g, g + PARALLEL);
+      const answered = await Promise.all(group.map((batch) => nativeAnswers(batch)));
+      group.forEach((batch, k) => {
+        for (let j = 0; j < batch.length; j++) {
+          const path = orderBaselinePath(repoRoot, relativeName(batch[j]!));
+          mkdirSync(dirname(path), { recursive: true });
+          writeFileSync(path, JSON.stringify(answered[k]![j]!, null, 1) + "\n");
+          written.add(path);
+        }
+      });
     }
     // Drop the baselines of fixtures that no longer exist.
     for (const path of globSync(join(repoRoot, ORDER_BASELINE_DIR, "**/*.json"))) {
       if (!written.has(path)) rmSync(path);
     }
-  }, 600_000);
+  }, 3_600_000);
 } else {
   describe(`preflight/order canary vs recorded 5.9.3 baselines (${entries.length} entries${FULL ? ", full sweep" : ""})`, () => {
     test.for(chunks.map((c) => [`${relativeName(c[0]!)} … +${c.length - 1}`, c] as const))(

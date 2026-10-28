@@ -1,3 +1,4 @@
+import { isProvenanceSourceFile } from "../provenance-registry.js";
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { declareTypedArguments } from "./typed-arguments.js";
 import { declareArgumentCount } from "./argument-counts.js";
@@ -25,7 +26,7 @@ import {
   canBoxFuncIntoDyn,
   typeEquals,
 } from "../../ir/ir.js";
-import { isJsSourceFile, locOf } from "../program.js";
+import { defersToRuntime, isJsSourceFile, locOf } from "../program.js";
 import { PoisonError, jsFuncNameOf, newFnCtx } from "./lowerer.js";
 import { enforceLibBoundary, lowerSurplusCalls } from "./lib-boundary.js";
 import { returnsOnlyThis } from "./lower-classes.js";
@@ -38,6 +39,7 @@ import {
   blockBodyOf,
 } from "./function-returns.js";
 import { generatorMeta, isThisParameter, type ParamShape } from "./call-signatures.js";
+import { hasStaticThis } from "./static-this.js";
 
 /** Save the call-site receiver before defaults or body effects. Escaping
  * arrows capture this binding instead of reading a later call's receiver. */
@@ -248,7 +250,10 @@ export function lowerLambda(
   if (
     !(
       ts.isMethodDeclaration(node) &&
-      isJsSourceFile(ts.getSourceFileOfNode(node)) &&
+      // A legacy decorated class's methods are prototype values too.
+      (isJsSourceFile(ts.getSourceFileOfNode(node)) ||
+        isProvenanceSourceFile(ts.getSourceFileOfNode(node).fileName) ||
+        (node.parent !== undefined && lowerer.legacyDecoratorClasses.has(node.parent))) &&
       canBoxFuncIntoDyn(
         funcType,
         (id) => lowerer.shapes.get(id),
@@ -337,6 +342,10 @@ export function lowerLambda(
     const receiver =
       (checkedReceiver ||
         isJsSourceFile(ts.getSourceFileOfNode(node)) ||
+        // A package function that reads `this` takes the call's receiver
+        // (its checker diagnostics are not enforced, so no `this`
+        // parameter need be declared).
+        (isProvenanceSourceFile(ts.getSourceFileOfNode(node).fileName) && hasStaticThis(node)) ||
         node.parameters.nodes.some(isThisParameter)) &&
       !ts.isArrowFunction(node)
         ? declareCallReceiver(lowerer, node, isGenerator)
@@ -487,7 +496,7 @@ export function lowerLambda(
     // position. ICEs (SC9001) stay compile errors, exactly like
     // lowerStmts; probe mode (diagSink) keeps the poison.
     if (!(e instanceof PoisonError)) throw e;
-    if (!isJsSourceFile(ts.getSourceFileOfNode(node))) throw e;
+    if (!defersToRuntime(ts.getSourceFileOfNode(node))) throw e;
     const params: IrParam[] = funcType.params.map((t, i) => ({
       localId: `%pf${i}`,
       name: `%pf${i}`,
@@ -541,7 +550,9 @@ export function lowerFunction(lowerer: Lowerer, decl: ts.FunctionDeclaration): I
     const argumentCount: IrStmt[] = [];
     declareArgumentCount(lowerer, decl, argumentCount);
     const receiver =
-      decl.parameters.nodes.some(isThisParameter) || isJsSourceFile(ts.getSourceFileOfNode(decl))
+      decl.parameters.nodes.some(isThisParameter) ||
+      isJsSourceFile(ts.getSourceFileOfNode(decl)) ||
+      (isProvenanceSourceFile(ts.getSourceFileOfNode(decl).fileName) && hasStaticThis(decl))
         ? declareCallReceiver(lowerer, decl, sig.generator !== undefined)
         : null;
     const { params, prologue } = lowerer.declareParams(decl.parameters.nodes, sig.params);
@@ -602,7 +613,7 @@ export function lowerFunction(lowerer: Lowerer, decl: ts.FunctionDeclaration): I
     // at the declaration's position — so a reachable-but-broken
     // signature stops the RUN at its own site instead of the build.
     // ICEs (SC9001) stay compile errors, exactly like lowerStmts.
-    if (isJsSourceFile(ts.getSourceFileOfNode(decl))) {
+    if (defersToRuntime(ts.getSourceFileOfNode(decl))) {
       // An ABI type naming a class that never REGISTERED (the sentence-
       // walker idiom's path type — the #private fence) is fine to emit:
       // callers CAN lower calls to this symbol (a same-typed param

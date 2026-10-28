@@ -790,6 +790,7 @@ function loadFrontend(
         inlineRequireCycleCalls: finalLoad.inlineRequireCycleCalls,
         moduleEdges: finalLoad.moduleEdges,
         projectCheckJs: finalLoad.typeWorld?.projectCheckJs ?? false,
+        legacyDecoratorClasses: finalLoad.legacyDecoratorClasses,
         externalTypes: finalLoad.externalTypes,
         externalTypeSpecifiersByFile: finalLoad.externalTypeSpecifiersByFile,
       });

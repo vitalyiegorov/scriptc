@@ -1,0 +1,7 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8501-generic-class-js-caller/lib.ts",
+  "<repo>/tests/corpus/8501-generic-class-js-caller/main.mjs"
+ ],
+ "diags": []
+}

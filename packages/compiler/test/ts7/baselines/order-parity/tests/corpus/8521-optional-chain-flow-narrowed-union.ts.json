@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8521-optional-chain-flow-narrowed-union.ts"
+ ],
+ "diags": []
+}

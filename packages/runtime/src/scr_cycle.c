@@ -1848,6 +1848,9 @@ static __attribute__((noinline)) size_t scr_yin_collect(void) {
   scr_yin_stat[1] += n - scr_yin_dead.n;
   scr_yin_stat[2] += scr_yin_dead.n;
   size_t freed = scr_yin_dead.n;
+  SCR_STAT(yin_collect);
+  SCR_STAT_ADD(yin_entered, n);
+  SCR_STAT_ADD(yin_dead, freed);
   for (size_t i = 0; i < scr_yin_dead.n; i++) {
     void *obj = scr_yin_dead.v[i];
     scr_cyc_type(scr_cyc_hdr(obj))->free_fn(obj);
@@ -2003,6 +2006,7 @@ static SCR_CYC_COMPACT size_t scr_cyc_settle(unsigned gen_limit, bool doomed) {
   }
   scr_xgen.n = 0;
   freed += scr_xg_freed;
+  SCR_STAT_ADD(cyc_freed, freed);
 
   /* A limited pass walked only some of the candidates: the schedule's
    * baselines stay those of the last pass over them all. */
@@ -2055,6 +2059,7 @@ static size_t scr_cyc_pass(unsigned gen_limit) {
   if (scr_collecting) return 0;
   scr_cyc_route_bypassed();
   scr_collecting = true;
+  SCR_STAT(cyc_pass);
   scr_cyc_window_update();
   scr_gen_limit = gen_limit;
 
@@ -2117,6 +2122,16 @@ static size_t scr_cyc_pass(unsigned gen_limit) {
     }
     scr_roots[g].n = 0;
   }
+  SCR_STAT_ADD(cyc_candidates, scr_cands.n);
+#ifdef SCR_STATS
+  for (size_t i = 0; i < scr_cands.n; i++) {
+    uint32_t k = scr_cyc_type(scr_cyc_hdr(scr_cands.v[i]))->kind;
+    if (k == SCR_CYC_KIND_CLOSURE) SCR_STAT(cand_closure);
+    else if (k == SCR_CYC_KIND_BOX) SCR_STAT(cand_box);
+    else if (k == SCR_CYC_KIND_DYN) SCR_STAT(cand_dyn);
+    else SCR_STAT(cand_other);
+  }
+#endif
   scr_xgen_edges.n = 0;
   scr_white.n = 0;
   scr_gray_referenced = 0;

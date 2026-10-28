@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8603-dyn-call-receiver-apply-url-base.js"
+ ],
+ "diags": []
+}

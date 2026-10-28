@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/npm-cjs-annotated-runtime-exports/main.mjs"
+ ],
+ "diags": []
+}

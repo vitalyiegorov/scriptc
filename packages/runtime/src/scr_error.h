@@ -76,6 +76,9 @@ struct ScrDyn *scr_dyn_class_prototype(struct ScrDyn *value, struct ScrDyn *base
 struct ScrDyn *scr_dyn_class_base_prototype(struct ScrDyn *constructor);
 struct ScrDyn *scr_dyn_class_inherit(struct ScrDyn *constructor, struct ScrDyn *base);
 void scr_dyn_class_super(struct ScrDyn *constructor, struct ScrDyn *receiver, struct ScrDyn *arguments);
+#ifdef SCR_FUNCTION_PROTOTYPE
+void scr_dyn_legacy_class_super(struct ScrDyn *constructor, struct ScrDyn *receiver, struct ScrDyn *arguments);
+#endif
 struct ScrDyn *scr_dyn_assign_prototype(struct ScrDyn *target, struct ScrDyn *sources, struct ScrDyn *protected_keys);
 struct ScrDyn *scr_dyn_bag_get(struct ScrDyn *bag, ScrStr *key, struct ScrDyn *receiver);
 struct ScrDyn *scr_dyn_reflect_get(struct ScrDyn *target, struct ScrDyn *key, struct ScrDyn *receiver);

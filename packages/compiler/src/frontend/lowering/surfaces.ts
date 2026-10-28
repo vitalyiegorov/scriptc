@@ -909,6 +909,18 @@ export const OBJECT_CALLABLE_VALUES: Record<string, BuiltinModuleFn | undefined>
     result: DYN,
     valueParams: exactValueParams(DYN),
   },
+  setPrototypeOf: {
+    fn: "dyn.setPrototype",
+    params: [DYN, DYN],
+    result: DYN,
+    valueParams: exactValueParams(DYN, DYN),
+  },
+  isExtensible: {
+    fn: "dyn.isExtensible",
+    params: [DYN],
+    result: BOOL,
+    valueParams: exactValueParams(DYN),
+  },
 };
 
 /** The lowerable surface of the supported node builtin modules, keyed by

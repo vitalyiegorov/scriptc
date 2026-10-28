@@ -29,7 +29,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { locOf } from "../program.js";
-import { BOOL, F64, type IrExpr, STRING, UNDEFINED_T } from "../../ir/ir.js";
+import { BOOL, DYN, F64, type IrExpr, type IrType, STRING, UNDEFINED_T } from "../../ir/ir.js";
 import { nodeThrowExpr } from "../../ir/build.js";
 
 /** The member's source-name text (identifiers and string-literal names —
@@ -192,6 +192,68 @@ function lowerEnumReverseRead(
   ) {
     return lowerEnumKeyRead(lowerer, expr, decls, key);
   }
+  // `E[method]` over a `string | number` key: the key's runtime arm picks
+  // the name-to-value read or the reverse mapping.
+  if (idx === null && keyType.isUnionType()) {
+    const parts = ts.constituentTypes(keyType);
+    if (
+      parts.every((t) => (t.flags & (ts.TypeFlags.StringLike | ts.TypeFlags.NumberLike)) !== 0) &&
+      parts.some((t) => (t.flags & ts.TypeFlags.StringLike) !== 0) &&
+      parts.some((t) => (t.flags & ts.TypeFlags.NumberLike) !== 0)
+    ) {
+      const lowered = lowerer.lowerExpr(key);
+      if (lowered.type.kind === "union") {
+        const numberTag = lowerer.armTag(lowered.type.unionId, F64);
+        const stringTag = lowerer.armTag(lowered.type.unionId, STRING);
+        if (numberTag >= 0 && stringTag >= 0) {
+          const local = lowerer.declareHiddenLocal("%enumMixedKey", lowered.type);
+          const ref: IrExpr = { kind: "varRef", localId: local.id, type: lowered.type, loc };
+          const narrowed = (tag: number, type: IrType): IrExpr => ({
+            kind: "unionNarrow",
+            unionId: (lowered.type as IrType & { kind: "union" }).unionId,
+            tag,
+            value: ref,
+            type,
+            loc,
+          });
+          const byName = lowerEnumKeyRead(lowerer, expr, decls, key, narrowed(stringTag, STRING));
+          const byValue = lowerer.coerceToExpected(
+            lowerEnumRuntimeReverseRead(lowerer, expr, decls, key, narrowed(numberTag, F64)),
+            byName.type,
+          );
+          return {
+            kind: "seqExpr",
+            stmts: [{ kind: "varDecl", localId: local.id, init: lowered, loc }],
+            result: {
+              kind: "ternary",
+              cond: {
+                kind: "unionIsTag",
+                unionId: lowered.type.unionId,
+                tag: numberTag,
+                negated: false,
+                value: ref,
+                type: BOOL,
+                loc,
+              },
+              then: byValue,
+              else_: byName,
+              type: byName.type,
+              loc,
+            },
+            type: byName.type,
+            loc,
+          };
+        }
+      }
+    }
+  }
+  if (
+    idx === null &&
+    ((keyType.flags & ts.TypeFlags.NumberLike) !== 0 ||
+      (keyType.isUnionType() &&
+        ts.constituentTypes(keyType).every((t) => (t.flags & ts.TypeFlags.NumberLike) !== 0)))
+  )
+    return lowerEnumRuntimeReverseRead(lowerer, expr, decls, key);
   if (idx === null) {
     lowerer.unsupported(
       "SC1090",
@@ -214,6 +276,63 @@ function lowerEnumReverseRead(
     );
   }
   return { kind: "strLit", value: name, type: STRING, loc };
+}
+
+/** `E[value]` with a RUNTIME numeric index: the index evaluates once and is
+ * compared against every numeric member's constant, the LAST member carrying
+ * the value answering its name (the entries JS writes in declaration order).
+ * A value no member carries answers undefined, as in Node (the result
+ * carries an undefined arm, like the runtime string-key read). */
+function lowerEnumRuntimeReverseRead(
+  lowerer: Lowerer,
+  expr: ts.ElementAccessExpression,
+  decls: readonly ts.EnumDeclaration[],
+  key: ts.Expression,
+  loweredKey?: IrExpr,
+): IrExpr {
+  const loc = locOf(expr);
+  const keyValue = lowerer.coerceToExpected(loweredKey ?? lowerer.lowerExpr(key), F64);
+  const keyLocal = lowerer.declareHiddenLocal("%enumIndex", F64);
+  const keyRef: IrExpr = { kind: "varRef", localId: keyLocal.id, type: F64, loc };
+  const names = new Map<number, string>();
+  for (const d of decls) {
+    for (const member of d.members.nodes) {
+      const v = lowerer.checker.getConstantValue(member);
+      if (typeof v === "number") names.set(v, memberNameText(member));
+    }
+  }
+  const resultType = lowerer.withUndefinedArm(STRING);
+  let result: IrExpr = lowerer.coerceToExpected(
+    { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc },
+    resultType,
+  );
+  for (const [value, name] of [...names].reverse()) {
+    result = {
+      kind: "ternary",
+      cond: {
+        kind: "bin",
+        op: "===",
+        left: keyRef,
+        right: { kind: "numLit", value, type: F64, loc },
+        type: BOOL,
+        loc,
+      },
+      then: lowerer.coerceToExpected(
+        { kind: "strLit", value: name, type: STRING, loc },
+        resultType,
+      ),
+      else_: result,
+      type: resultType,
+      loc,
+    };
+  }
+  return {
+    kind: "seqExpr",
+    stmts: [{ kind: "varDecl", localId: keyLocal.id, init: keyValue, loc }],
+    result,
+    type: resultType,
+    loc,
+  };
 }
 
 /** Object.prototype members every enum object inherits: a runtime key
@@ -247,13 +366,19 @@ function lowerEnumKeyRead(
   expr: ts.ElementAccessExpression,
   decls: readonly ts.EnumDeclaration[],
   key: ts.Expression,
+  loweredKey?: IrExpr,
 ): IrExpr {
   const loc = locOf(expr);
   const enumName = decls[0]!.name.text;
-  const valueType = lowerer.mapTypeOf(lowerer.typeOf(expr));
+  // A key the checker cannot index the enum by (`string | number`) reads
+  // `any`: the read answers the checked-dynamic value.
+  const valueType =
+    (lowerer.typeOf(expr).flags & ts.TypeFlags.Any) !== 0 && loweredKey !== undefined
+      ? DYN
+      : lowerer.mapTypeOf(lowerer.typeOf(expr));
   if (valueType === null) lowerer.badType(expr, lowerer.typeOf(expr));
-  const resultType = lowerer.withUndefinedArm(valueType);
-  const keyValue = lowerer.coerceToExpected(lowerer.lowerExpr(key), STRING);
+  const resultType = valueType.kind === "dyn" ? valueType : lowerer.withUndefinedArm(valueType);
+  const keyValue = lowerer.coerceToExpected(loweredKey ?? lowerer.lowerExpr(key), STRING);
   const keyLocal = lowerer.declareHiddenLocal("%enumKey", STRING);
   const keyRef: IrExpr = { kind: "varRef", localId: keyLocal.id, type: STRING, loc };
   const matches = (text: string): IrExpr => ({

@@ -37,6 +37,10 @@ export interface NativeLinkFeatures {
   /** Module namespace objects as checked-dynamic values link
    * scr_module_namespace.c; absent (false) otherwise. */
   moduleNamespace?: boolean;
+  /** Native Map subclass storage and inherited operations. */
+  mapClass?: boolean;
+  functionPrototype?: boolean;
+  intlDateTimeFormat?: boolean;
   zlib: boolean;
   /** node:zlib's Brotli forms: scr_brotli.c and the vendored brotli archive. */
   brotli?: boolean;

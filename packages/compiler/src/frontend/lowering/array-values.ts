@@ -68,8 +68,12 @@ export function arrayValueRead(
 ): IrExpr {
   const type = arrayValueType(lowerer, elem);
   const read: IrExpr = { kind: "arrayGet", arr, index, type: elem, loc };
-  const missing: IrExpr =
-    type.kind === "dyn" ? dynUndefinedExpr(loc) : lowerer.wrappedUndefined(type, loc)!;
+  const missing: IrExpr | null =
+    type.kind === "dyn" ? dynUndefinedExpr(loc) : lowerer.wrappedUndefined(type, loc);
+  // A union such as `boolean | Promise<boolean>` has no layout with an
+  // undefined arm, so a hole has no value to read as: the element is read
+  // directly, as for an element the optional-read analysis proved present.
+  if (missing === null) return read;
   return {
     kind: "ternary",
     cond: {

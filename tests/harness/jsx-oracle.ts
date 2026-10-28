@@ -24,14 +24,34 @@ export function wantsTscJsx(head: readonly string[]): boolean {
   return head.some((line) => /^\/\/ @tsc-jsx\s*$/.test(line));
 }
 
+/** Legacy decorators need the project's metadata options and a whole-program
+ * checker: isolated transpilation cannot distinguish imported classes from
+ * interfaces when it emits design types. */
+export function wantsTscLegacyDecorators(head: readonly string[]): boolean {
+  return head.some((line) => /^\/\/ @tsc-legacy-decorators\s*$/.test(line));
+}
+
+export function tscLegacyDecoratorsOracleEntry(file: string, cacheDir: string): string {
+  return tscDirectoryOracleEntry(file, cacheDir, true);
+}
+
 /** The oracle entry (`main.js` of the transpiled program) for `file`. */
 export function tscJsxOracleEntry(file: string, cacheDir: string): string {
+  return tscDirectoryOracleEntry(file, cacheDir, false);
+}
+
+function tscDirectoryOracleEntry(file: string, cacheDir: string, legacy: boolean): string {
   const root = dirname(file);
   const files = listFiles(root);
-  const hash = createHash("sha256").update(ts5.version);
+  const hash = createHash("sha256")
+    .update(ts5.version)
+    .update(legacy ? "legacy" : "jsx");
   for (const path of files)
     hash.update("\0").update(relative(root, path)).update("\0").update(readFileSync(path));
-  const dir = join(cacheDir, `jsx-oracle-${hash.digest("hex").slice(0, 16)}`);
+  const dir = join(
+    cacheDir,
+    `${legacy ? "legacy-decorators" : "jsx"}-oracle-${hash.digest("hex").slice(0, 16)}`,
+  );
   const entry = join(dir, "main.js");
   if (existsSync(entry)) return entry;
   const configPath = join(root, "tsconfig.json");
@@ -50,6 +70,17 @@ export function tscJsxOracleEntry(file: string, cacheDir: string): string {
     jsxFragmentFactory: config.jsxFragmentFactory,
     jsxImportSource: config.jsxImportSource,
     reactNamespace: config.reactNamespace,
+    ...(legacy
+      ? {
+          experimentalDecorators: true,
+          emitDecoratorMetadata: config.emitDecoratorMetadata,
+          useDefineForClassFields: config.useDefineForClassFields,
+          moduleResolution: ts5.ModuleResolutionKind.Bundler,
+          strict: true,
+          rootDir: root,
+          skipLibCheck: true,
+        }
+      : {}),
   };
   // Atomic publish: build beside the final directory, then rename it into
   // place; a concurrent suite that wins the rename leaves the same content.
@@ -59,6 +90,11 @@ export function tscJsxOracleEntry(file: string, cacheDir: string): string {
     const target = join(staging, relative(root, path));
     mkdirSync(dirname(target), { recursive: true });
     if (/\.(?:[cm]?ts|tsx|jsx?|[cm]js)$/.test(path) && !/\.d\.[cm]?ts$/.test(path)) {
+      if (legacy && /\.(?:[cm]?ts|tsx)$/.test(path)) continue;
+      if (legacy) {
+        copyFileSync(path, target);
+        continue;
+      }
       const output = ts5.transpileModule(readFileSync(path, "utf8"), {
         compilerOptions,
         fileName: path,
@@ -94,8 +130,24 @@ export function tscJsxOracleEntry(file: string, cacheDir: string): string {
       copyFileSync(path, target);
     }
   }
+  if (legacy) {
+    const program = ts5.createProgram(
+      files.filter(
+        (path) =>
+          /\.(?:[cm]?ts|tsx)$/.test(path) &&
+          !relative(root, path).split(/[\\/]/).includes("node_modules"),
+      ),
+      { ...compilerOptions, outDir: staging },
+    );
+    const result = program.emit();
+    if (result.emitSkipped)
+      throw new Error(`TypeScript did not emit the legacy decorator oracle for ${file}`);
+  }
   if (!existsSync(join(staging, "package.json")))
     writeFileSync(join(staging, "package.json"), '{ "type": "module" }\n');
+  // A directory without its entry is a leftover of an interrupted build (the
+  // rename below cannot replace it): clear it so the oracle is rebuilt.
+  if (existsSync(dir) && !existsSync(entry)) rmSync(dir, { recursive: true, force: true });
   try {
     renameSync(staging, dir);
   } catch {

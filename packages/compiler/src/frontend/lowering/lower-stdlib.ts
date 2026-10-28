@@ -2520,6 +2520,11 @@ export function lowerStdlibMethodCall(
     // An untyped iterable (`Math.min(...caps.map(f))` in JavaScript): the
     // runtime packs its values and folds their ToNumber like Node. V8 names
     // a null or undefined source by its text, calls as `f(...)`.
+    // An array of untyped values (`keys.map(key => metadata[key].index)` over
+    // an untyped `metadata`) folds the same way, as the untyped iterable of
+    // its elements.
+    if (src.type.kind === "array" && src.type.elem.kind === "dyn")
+      src = lowerer.coerceToExpected(src, DYN);
     if (src.type.kind === "dyn") {
       const what = ts.isCallExpression(spread.expression)
         ? `${ts.getTextOfNode(spread.expression.expression)}(...)`

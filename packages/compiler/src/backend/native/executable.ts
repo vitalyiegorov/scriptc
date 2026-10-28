@@ -3,6 +3,7 @@ import {
   toolchainEnvironmentFingerprint,
 } from "../toolchain-environment.js";
 import { isMobileTarget } from "../target-platform.js";
+import { runtimeStatsRequested } from "../runtime-stats.js";
 import { createHash } from "node:crypto";
 import { chmod, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { availableParallelism, tmpdir } from "node:os";
@@ -322,6 +323,7 @@ const RUNTIME_UNITS: readonly RuntimeUnit[] = [
   unit((u) => u.opts.dgram && u.opts.dnsPromises, "scr_dns_promises.c"),
   unit((u) => u.opts.dgram && u.opts.dgramDyn, "scr_dgram_dyn.c"),
   unit((u) => u.opts.textCodecDyn, "scr_text_codec_dyn.c"),
+  unit((u) => u.opts.intlDateTimeFormat, "scr_intl_datetime.c"),
   unit((u) => u.opts.watch, "scr_watch.c"),
   unit((u) => u.opts.foreignFfi, "scr_ffi_queue.c"),
   unit((u) => u.opts.nodeTest, "scr_test.c"),
@@ -387,9 +389,13 @@ const RUNTIME_DEFINES: readonly {
   // Checked objects carry the dynamic tier's shapes (scr_json.c's SCR_JS_TIER build); only
   // programs with dynamic-tier code select it.
   { define: "SCR_JS_TIER", when: (opts) => opts.dynTier === true },
+  { define: "SCR_MAP_CLASS", when: (opts) => opts.mapClass === true },
+  { define: "SCR_FUNCTION_PROTOTYPE", when: (opts) => opts.functionPrototype === true },
   { define: "SCR_WARNING_REPLACE", when: (opts) => opts.warningReplace },
   { define: "SCR_STDIO_EXTENDED", when: (opts) => opts.stdioExtended },
   { define: "SCR_YIN", when: (opts) => opts.youngNursery },
+  // Event counters (scr_stats.h); a program build never reads them.
+  { define: "SCR_STATS", when: () => runtimeStatsRequested() },
 ];
 
 function runtimeDefineArgs(opts: CcOptions): string[] {

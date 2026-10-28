@@ -850,6 +850,33 @@ ScrUrl *scr_url_new(ScrStr *input) {
  * Reuse the absolute parser for encoding, dot segments, authority validation,
  * and canonicalization. The base is parsed even for an absolute input: an
  * invalid supplied base is a constructor error in Node. */
+/* The last base a relative reference resolved against, parsed once: a
+ * request handler's `new URL(path, "http://host")` names the same base
+ * every time. The cached URL is private (never handed to the program). */
+static SCR_TL ScrStr *url_base_key;
+static SCR_TL ScrUrl *url_base_value;
+
+static void url_base_forget(void) {
+  if (url_base_value) scr_url_release(url_base_value);
+  scr_str_release(url_base_key);
+  url_base_value = NULL;
+  url_base_key = NULL;
+}
+
+/* The parsed base, borrowed from the cache; NULL with the error pending. */
+static ScrUrl *url_parse_base(ScrStr *base_input) {
+  if (url_base_value && url_base_key->len == base_input->len &&
+      memcmp(url_base_key->data, base_input->data, base_input->len) == 0)
+    return url_base_value;
+  ScrUrl *parsed = scr_url_new(base_input);
+  if (!parsed) return NULL;
+  if (url_base_value) url_base_forget();
+  else scr_atexit(url_base_forget);
+  url_base_key = scr_str_retain(base_input);
+  url_base_value = parsed;
+  return parsed;
+}
+
 ScrUrl *scr_url_new_base(ScrStr *input, ScrStr *base_input) {
   ScrStr *usv = url_usv(input);
   if (usv) {
@@ -857,7 +884,7 @@ ScrUrl *scr_url_new_base(ScrStr *input, ScrStr *base_input) {
     scr_str_release(usv);
     return u;
   }
-  ScrUrl *base = scr_url_new(base_input);
+  ScrUrl *base = url_parse_base(base_input);
   if (!base) return NULL;
   size_t begin = 0, end = input->len;
   while (begin < end && (unsigned char)input->data[begin] <= 0x20) begin++;
@@ -958,7 +985,6 @@ ScrUrl *scr_url_new_base(ScrStr *input, ScrStr *base_input) {
   scr_str_release(resolved);
 done:
   free(cleaned.data);
-  scr_url_release(base);
   return result;
 }
 

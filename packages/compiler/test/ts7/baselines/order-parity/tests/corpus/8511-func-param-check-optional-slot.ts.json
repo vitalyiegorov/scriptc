@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8511-func-param-check-optional-slot.ts"
+ ],
+ "diags": []
+}

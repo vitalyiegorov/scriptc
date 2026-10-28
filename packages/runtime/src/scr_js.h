@@ -238,10 +238,21 @@ ScrDyn *scr_js_get_probe(ScrDyn *receiver, const ScrStr *key, ScrJsIc *ic);
 /* `receiver.key = value` (value borrowed) when it replaces a writable own
  * data property or adds one the prototype chain lacks: true when done. */
 bool scr_js_store_probe(ScrDyn *receiver, const ScrStr *key, ScrDyn *value, ScrJsIc *ic);
+/* The same, but a store that succeeds keeps the caller's reference to
+ * `value` (the caller gives it up); on false the caller still owns it. */
+bool scr_js_store_probe_take(ScrDyn *receiver, const ScrStr *key, ScrDyn *value, ScrJsIc *ic);
 /* `receiver[key]` for an array element or an own data property named by a
  * string key: +1 value, or NULL. */
 ScrDyn *scr_js_keyed_probe(ScrDyn *receiver, const ScrDyn *key, ScrJsIc *ic);
 /* `receiver[index]` for a dense array element: +1 value, or NULL. */
 ScrDyn *scr_js_index_probe(ScrDyn *receiver, double index);
+
+/* Profile-generate builds (--profile-generate): the recorder entry points
+ * the emitted code calls from every dynamic-tier property site and dyn call,
+ * and the output path the compiler embeds. kind: 0 get, 1 set, 2 keyed,
+ * 3 method read; `key` is NULL for keyed. Production builds never use them. */
+void scr_pgo_prop(const char *site, int kind, ScrDyn *recv, const char *key, size_t key_len);
+void scr_pgo_call(const char *site, ScrDyn *callee);
+extern const char scr_pgo_out_path[];
 
 #endif

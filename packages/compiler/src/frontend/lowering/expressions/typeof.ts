@@ -15,6 +15,7 @@ import { lowerWebAssemblyTypeof } from "../builtins/webassembly.js";
 import { isNavigatorGlobal } from "../builtins/navigator.js";
 import { processHasIpc } from "../builtins/process.js";
 import { lowerPerfHooksTypeof } from "../builtins/performance.js";
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
 import { isNodeModuleValue } from "../lower-node-module.js";
 import { builtinClassRefOf } from "../builtins/class-values.js";
 import { STRING_INDEX_METHODS, builtinModuleConstOf, stdlibGlobalNameOf } from "../surfaces.js";
@@ -76,6 +77,19 @@ export function lowerTypeofExpr(lowerer: Lowerer, expr: ts.TypeOfExpression, loc
       if (isNodeEsmFile(sf, lowerer.program) && !/\.tsx?$/.test(sf.fileName))
         return { kind: "strLit", value: "undefined", type: STRING, loc };
     }
+  }
+  // A name nothing declares in a dependency's shipped TypeScript (a DOM
+  // global Node lacks): typeof answers "undefined" without throwing.
+  {
+    let operand = expr.expression;
+    while (ts.isParenthesizedExpression(operand)) operand = operand.expression;
+    if (
+      ts.isIdentifier(operand) &&
+      lowerer.resolveValueSymbol(operand) === null &&
+      lowerer.checker.getSymbolAtLocation(operand) === undefined &&
+      isProvenanceSourceFile(ts.getSourceFileOfNode(operand).fileName)
+    )
+      return { kind: "strLit", value: "undefined", type: STRING, loc };
   }
   if (isNavigatorGlobal(lowerer, expr.expression))
     return { kind: "strLit", value: "object", type: STRING, loc };

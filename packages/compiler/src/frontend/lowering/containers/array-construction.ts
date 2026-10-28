@@ -1,3 +1,4 @@
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
 import { keyedHelperName } from "../stable-names.js";
 import { indexedUnionArms, lowerIndexedUnionToArray } from "../indexed-unions.js";
 import { generatorDrain } from "../iterator-adapters.js";
@@ -398,8 +399,11 @@ export function lowerArrayConstructor(
   // reference. Known element forms retain native arrays, including their
   // existing sparse storage and indexed property contracts.
   if (
-    isJsSourceFile(ts.getSourceFileOfNode(expr)) &&
-    (result?.kind !== "array" || result.elem.kind === "dyn")
+    (isJsSourceFile(ts.getSourceFileOfNode(expr)) &&
+      (result?.kind !== "array" || result.elem.kind === "dyn")) ||
+    // A package's `new Array<T>()` whose element type has no static layout
+    // is the checked-dynamic array its JavaScript build constructs.
+    (isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName) && result?.kind !== "array")
   ) {
     return {
       kind: "dynCall",
@@ -913,6 +917,35 @@ export function lowerArrayFromValue(lowerer: Lowerer, loc: SrcLoc): IrExpr {
   };
 }
 
+/** The interned `Array.from(source, mapper, receiver)` over checked-dynamic
+ * values: acquire the iterator once, map each value, collect. */
+function arrayFromDirectHelper(lowerer: Lowerer, loc: SrcLoc): string {
+  const name = "%builtin.Array.fromDirect";
+  if (!lowerer.liftedFns.some((fn) => fn.name === name)) {
+    const context = newFnCtx(false, null, null, DYN);
+    lowerer.fnStack.push(context);
+    try {
+      const params = ["source", "mapper", "receiver"].map((name) => {
+        const local = lowerer.declareHiddenLocal(name, DYN);
+        return { localId: local.id, name, type: DYN };
+      });
+      const refs = params.map((param) => varRef(param.localId, DYN, loc));
+      const value = lowerCheckedArrayFrom(lowerer, refs[0]!, loc, refs[1], refs[2]);
+      lowerer.liftedFns.push({
+        name,
+        params,
+        returnType: DYN,
+        locals: context.locals,
+        body: [...value.stmts, { kind: "return", value: value.result, loc }],
+        loc,
+      });
+    } finally {
+      lowerer.fnStack.pop();
+    }
+  }
+  return name;
+}
+
 /** `Array.from({ length: n }, mapfn)` — the counted-generation idiom — on
  * THE stdlib Array global. The source must be an OBJECT LITERAL whose
  * single property is `length` (the shape the idiom always spells; the
@@ -944,29 +977,7 @@ export function lowerArrayFromCall(
     args.length <= 3 &&
     !args.some(ts.isSpreadElement)
   ) {
-    const name = "%builtin.Array.fromDirect";
-    if (!lowerer.liftedFns.some((fn) => fn.name === name)) {
-      const context = newFnCtx(false, null, null, DYN);
-      lowerer.fnStack.push(context);
-      try {
-        const params = ["source", "mapper", "receiver"].map((name) => {
-          const local = lowerer.declareHiddenLocal(name, DYN);
-          return { localId: local.id, name, type: DYN };
-        });
-        const refs = params.map((param) => varRef(param.localId, DYN, loc));
-        const value = lowerCheckedArrayFrom(lowerer, refs[0]!, loc, refs[1], refs[2]);
-        lowerer.liftedFns.push({
-          name,
-          params,
-          returnType: DYN,
-          locals: context.locals,
-          body: [...value.stmts, { kind: "return", value: value.result, loc }],
-          loc,
-        });
-      } finally {
-        lowerer.fnStack.pop();
-      }
-    }
+    const name = arrayFromDirectHelper(lowerer, loc);
     return {
       kind: "call",
       callee: name,
@@ -1174,6 +1185,19 @@ export function lowerArrayFromCall(
     if (src.type.kind === "string" && args.length === 1) return strCharsCall(lowerer, src, loc);
     if (src.type.kind === "dyn" && args.length === 1) {
       return lowerCheckedArrayFrom(lowerer, src, loc);
+    }
+    // `Array.from(untypedArray, mapper)`: the mapper runs per element of the
+    // checked-dynamic iteration; the result is checked into the call's type.
+    if (src.type.kind === "dyn" && args.length === 2) {
+      const mapped: IrExpr = {
+        kind: "call",
+        callee: arrayFromDirectHelper(lowerer, loc),
+        args: [src, lowerer.lowerExprExpecting(args[1]!, DYN), dynUndefinedExpr(loc)],
+        type: DYN,
+        loc,
+      };
+      const result = lowerer.mapTypeOf(lowerer.typeOf(call));
+      return result && result.kind !== "dyn" ? lowerer.coerceInto(call, mapped, result) : mapped;
     }
     // Array.from(sp): the checked-dynamic view's live pair iteration.
     if (src.type.kind === "searchParams" && args.length === 1) {

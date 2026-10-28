@@ -1,0 +1,7 @@
+{
+ "order": [
+  "<repo>/tests/corpus/1977-decorators-legacy-reflect-metadata/services.ts",
+  "<repo>/tests/corpus/1977-decorators-legacy-reflect-metadata/main.ts"
+ ],
+ "diags": []
+}

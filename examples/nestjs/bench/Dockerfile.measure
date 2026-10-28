@@ -1,0 +1,5 @@
+# scriptc-legacy-validation plus valgrind (callgrind_control needs perl, already in the base).
+# Built on demand by measure-docker.mjs as scriptc-bench:local.
+FROM scriptc-legacy-validation:local
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends valgrind && rm -rf /var/lib/apt/lists/*

@@ -1,3 +1,4 @@
+import { dirname } from "node:path";
 export interface ProvenancePackageSource {
   /** Package name ("cookie"). */
   name: string;
@@ -15,6 +16,9 @@ export interface ProvenancePackageSource {
   /** Absolute path of the package's directory inside the cached source
    * tree (== the tree root except in monorepos). */
   dir: string;
+  /** The installed package's directory: bare imports inside the source
+   * tree resolve from here, where the project's node_modules is. */
+  installedDir?: string;
   /** specifier → absolute mapped source file ("cookie" → …/src/index.ts). */
   entries: Record<string, string>;
 }
@@ -78,6 +82,19 @@ export function isProvenanceSourceFile(fileName: string): boolean {
   return false;
 }
 
+/** The directory bare imports of `fileName` resolve from: the installed
+ * package's for a provenance source file (the cached source tree has no
+ * node_modules), else the file's own. */
+export function resolutionDirOf(fileName: string): string {
+  if (state !== null) {
+    for (const pkg of state.sources.packages) {
+      const dir = pkg.dir.endsWith("/") ? pkg.dir : `${pkg.dir}/`;
+      if (pkg.installedDir !== undefined && fileName.startsWith(dir)) return pkg.installedDir;
+    }
+  }
+  return dirname(fileName);
+}
+
 /** tsconfig "paths" for the registered entries — loadProgram feeds these
  * to tsgo so the checker resolves registered bare specifiers to the same
  * source files the preflight resolver answers. */
@@ -85,5 +102,13 @@ export function provenancePaths(): Record<string, string[]> | null {
   if (state === null || state.bySpecifier.size === 0) return null;
   const paths: Record<string, string[]> = {};
   for (const [spec, file] of state.bySpecifier) paths[spec] = [file];
+  // The cached source tree has no node_modules: its other bare imports
+  // resolve from the project's installed packages, as they do at runtime.
+  const roots = new Set<string>();
+  for (const pkg of state.sources.packages) {
+    if (pkg.installedDir === undefined || pkg.installedDir === pkg.dir) continue;
+    roots.add(dirname(pkg.name.startsWith("@") ? dirname(pkg.installedDir) : pkg.installedDir));
+  }
+  if (roots.size > 0) paths["*"] = [...roots].map((root) => `${root}/*`);
   return paths;
 }

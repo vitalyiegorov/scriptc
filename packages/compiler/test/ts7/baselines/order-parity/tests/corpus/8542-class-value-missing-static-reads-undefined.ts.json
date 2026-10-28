@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8542-class-value-missing-static-reads-undefined.ts"
+ ],
+ "diags": []
+}

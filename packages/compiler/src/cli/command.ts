@@ -1,4 +1,11 @@
-import { rmSync, statSync } from "node:fs";
+import { existsSync, rmSync, statSync } from "node:fs";
+import {
+  feedbackInputs,
+  jsFeedbackSidecar,
+  mergeJsFeedback,
+  readJsFeedback,
+  writeJsFeedback,
+} from "../backend/js-feedback-profile.js";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { isExactExternalTypeSpecifier } from "../frontend/program.js";
@@ -189,11 +196,19 @@ async function main(args: string[], host: CliHost): Promise<number> {
     }
     const outputPath = resolve(values.out);
     try {
-      await host.mergeProfiles(
-        outputPath,
+      const { llvm, feedback } = feedbackInputs(
         inputs.map((input) => resolve(input)),
-        values.sparse,
+        existsSync,
       );
+      if (llvm.length === 0) throw new Error("merge-profiles needs at least one LLVM profile");
+      await host.mergeProfiles(outputPath, llvm, values.sparse);
+      // The JS-level feedback of the same runs rides along as a sidecar.
+      if (feedback.length > 0)
+        writeJsFeedback(
+          jsFeedbackSidecar(outputPath),
+          mergeJsFeedback(feedback.map((path) => readJsFeedback(path))),
+        );
+      else rmSync(jsFeedbackSidecar(outputPath), { force: true });
     } catch (error) {
       fail(`scriptc: ${error instanceof Error ? error.message : String(error)}`);
     }

@@ -155,6 +155,7 @@ typedef enum {
   X(CRYPTO_KEY, 56) /* WebCrypto CryptoKey (scr_webcrypto.c) */ \
   X(CUSTOM_EVENT, 40) /* ScrEvent with detail — new CustomEvent() */ \
   X(DATE, 30) /* JavaScript Date with stable native identity */ \
+  X(DATE_TIME_FORMAT, 81) /* native Intl.DateTimeFormat (scr_intl_datetime.c) */ \
   X(DECIPHER, 46) /* node:crypto Decipheriv (scr_cipher.c) */ \
   X(DGRAM_SOCKET, 62) /* dgram.Socket (scr_dgram.c) */ \
   X(DIFFIE_HELLMAN, 70) /* node:crypto DiffieHellman (scr_dh.c) */ \
@@ -493,6 +494,11 @@ struct ScrDyn {
        * every change to the key set resets it. Other programs never look
        * at it, so it may hold anything there. */
       struct ScrJsShape *shape;
+      /* True while any slot of `entries` (live or spare) may hold a counted
+       * (non-atom) key. A node that holds none frees without visiting its
+       * keys (scr_dyn_dispose); keys shared by two live objects become
+       * atoms (scr_json.c). Offset 88 is spare in the header union. */
+      bool rc_keys;
     } obj; /* owned */
     /* SCR_DYN_FUNC: the boxed closure (owned) + its call descriptor. `sig`
      * and `name` are static compiler-emitted literals (never freed); name
@@ -783,6 +789,8 @@ ScrDyn *scr_dyn_obj_entries(const ScrDyn *v);
  * like JS). scr_dyn_undefined returns THE immortal undefined value
  * (rc == SIZE_MAX — retains/releases are no-ops). */
 ScrDyn *scr_dyn_undefined(void);
+/* The immortal instance itself, referenced by name from emitted code. */
+extern ScrDyn scr_dyn_undefined_node;
 ScrDyn *scr_dyn_new_null(void);
 ScrDyn *scr_dyn_new_bool(bool b);
 ScrDyn *scr_dyn_new_num(double n);
@@ -794,6 +802,12 @@ ScrDyn *scr_dyn_native_map(ScrMap *value); /* borrowed backing, +1 box */
  * exception pending. */
 ScrDyn *scr_dyn_native_map_new(const ScrDyn *seed);
 bool scr_dyn_native_map_is(const ScrDyn *value);
+/* Optional native Map-subclass bridge. Storage and members answer +1. */
+void scr_map_class_storage_install(ScrDyn *callback);
+ScrDyn *scr_dyn_map_class_storage(const ScrDyn *value);
+ScrDyn *scr_dyn_map_class_member(const ScrDyn *value, const char *key, size_t len);
+ScrDyn *scr_dyn_map_class_invoke(ScrDyn *receiver, const char *method, ScrDyn *const *args, size_t argc);
+void scr_dyn_map_class_prototype(ScrDyn *constructor);
 void scr_regex_reset_last_index(ScrRegex *re, double index);
 ScrRegex *scr_regex_new_checked(const ScrDyn *pattern, const ScrDyn *flags);
 ScrDyn *scr_dyn_native_url(ScrUrl *value);
@@ -909,6 +923,8 @@ void scr_dyn_fn_seed_prototype(ScrDyn *function, ScrDyn *prototype);
 /* The interned builtin constructor `name` (Object, Date, RegExp, Map, Set,
  * Promise, WeakMap, WeakSet) as a dynamic function value: +1. */
 ScrDyn *scr_dyn_global_constructor(const ScrStr *name);
+/* Shared callable Function.prototype: +1. */
+ScrDyn *scr_dyn_function_prototype(void);
 /* The interned function value of an error constructor ("TypeError"), or
  * NULL for other names. */
 ScrDyn *scr_dyn_error_constructor(const char *name);
@@ -1024,6 +1040,13 @@ ScrDyn *scr_dyn_get_prototype_for_identity(ScrDyn *object);
 bool scr_dyn_bag_create_field(ScrDyn *bag, const ScrStr *key);
 bool scr_dyn_is_class_capsule(const ScrDyn *d);
 ScrDyn *scr_dyn_get_prototype(ScrDyn *object);
+/* Whether `prototype` is on the prototype chain of `value` (SameValue when
+ * `strict`, else identity), walking directly linked plain objects without a
+ * retain per hop. A read that throws ends it with the exception pending. */
+bool scr_dyn_chain_has(ScrDyn *value, const ScrDyn *prototype, bool strict);
+/* `callee.prototype` (+1) when the function's own property table holds it as
+ * a data property, else NULL: the caller falls back to the general read. */
+ScrDyn *scr_dyn_fn_prototype_fast(const ScrDyn *callee);
 ScrDyn *scr_dyn_get_own_property_descriptors(ScrDyn *object);
 ScrDyn *scr_dyn_set_prototype(ScrDyn *object, ScrDyn *prototype);
 ScrDyn *scr_dyn_prevent_extensions(ScrDyn *object);
@@ -1082,6 +1105,8 @@ ScrDyn *scr_dyn_new_typed_ref_observed(
     void (*commit)(void *, const ScrDyn *));
 bool scr_dyn_typed_ref_is(
     const ScrDyn *d, const char *type_key, size_t type_key_len);
+/* d is a capsule whose type key is among n {const char *, size_t} entries. */
+bool scr_dyn_typed_ref_in(const ScrDyn *d, const void *table, size_t n);
 bool scr_dyn_typed_ref_is_key(const ScrDyn *d, const ScrStr *type_key);
 void *scr_dyn_typed_ref_unbox(const ScrDyn *d); /* +1 */
 ScrDyn *scr_dyn_class_view_unavailable(void *ptr);
@@ -1317,6 +1342,8 @@ bool scr_dyn_inherits_error_prototype(const ScrDyn *value);
 ScrDyn *scr_dyn_error_capture_stack_trace(ScrDyn *target);
 ScrDyn *scr_dyn_error_capture_stack_trace_function(void);
 ScrDyn *scr_dyn_function_apply(void);
+ScrDyn *scr_dyn_function_call(void);
+ScrDyn *scr_dyn_function_bind(void);
 ScrDyn *scr_dyn_reflect_apply(ScrDyn *target, ScrDyn *receiver, ScrDyn *arguments_list);
 ScrDyn *scr_dyn_apply_array_like(const ScrDyn *target, const ScrDyn *receiver, const ScrDyn *arguments, const char *what);
 bool scr_dyn_same_value(const ScrDyn *left, const ScrDyn *right);
@@ -1842,6 +1869,9 @@ bool scr_dyn_is_nullish(const ScrDyn *d);
  * fn.apply(this, arguments)`) forwards the receiver without extra code. */
 void scr_dyn_this_push(void *h, ScrDynHandleTag tag); /* h BORROWED (the firing site holds it); NULL binds undefined */
 void scr_dyn_this_push_dyn(const ScrDyn *v);          /* retained for the window */
+/* The same binding without a reference: the caller keeps `v` alive until the
+ * matching pop (a borrowed call receiver it holds for the whole call). */
+void scr_dyn_this_push_borrowed(const ScrDyn *v);
 /* A class's typed-ref construction recipe, emitted once per class as a
  * constant (kind: 0 plain, 1 observed, 2 traced capsule). `view` names the
  * live view bound to the new capsule, as eager boxing binds it: 0 none,
@@ -1861,11 +1891,16 @@ typedef struct {
  * read. ptr is BORROWED: the caller holds the instance across the window. */
 void scr_dyn_this_push_typed(void *ptr, const ScrDynTypedRefRecipe *recipe);
 void scr_dyn_this_pop(void);
+/* push_borrowed(recv); scr_dyn_call(callee, args, argc, what); pop. */
+ScrDyn *scr_dyn_call_this(const ScrDyn *callee, const ScrDyn *recv, ScrDyn *const *args,
+                          size_t argc, const char *what);
 /* The innermost binding as a dyn value (+1): a boxed handle, the pushed
  * dyn value, or the undefined singleton (empty stack, NULL handle, or a
  * handle whose tag has no installed ops — a unit that fires without its
  * dyn half never binds). */
 ScrDyn *scr_dyn_this_get(void);
+/* The same binding without a reference (borrowed until the window pops). */
+ScrDyn *scr_dyn_this_peek(void);
 ScrDyn *scr_gen_receiver(void);
 
 /* The data-chunk encoding window (setEncoding — scr_json.c's note): the
@@ -1962,5 +1997,8 @@ void scr_dyn_tier_key_release(char *key, size_t key_len);
  * `obj` does not have, sharing `key`'s bytes and taking ownership of
  * `value`, exactly as an ordinary insertion would; leaves the shape reset. */
 void scr_dyn_tier_append(ScrDyn *obj, char *key, size_t key_len, ScrDyn *value);
+/* Moves a shaped `obj` to the shape of its key sequence plus `key` (borrowed),
+ * ahead of an ordinary insertion; an unshaped object stays so (scr_js_object.c). */
+void scr_js_shape_append(ScrDyn *obj, const char *key, size_t key_len);
 
 #endif /* SCR_DYN_H */

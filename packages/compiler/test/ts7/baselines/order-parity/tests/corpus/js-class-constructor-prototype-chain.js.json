@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/js-class-constructor-prototype-chain.js"
+ ],
+ "diags": []
+}

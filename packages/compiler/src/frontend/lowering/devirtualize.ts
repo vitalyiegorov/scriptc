@@ -7,6 +7,7 @@ import {
   typeEquals,
 } from "../../ir/ir.js";
 import { everyStmtList, transformStmtList } from "../../ir/traverse.js";
+import { nodeThrowExpr } from "../../ir/build.js";
 import type { ClassInfo } from "./lower-classes.js";
 import type { Lowerer } from "./lowerer.js";
 
@@ -116,17 +117,45 @@ class ConstructedClasses {
     if (this.open(info)) return e;
     const targets: ClassInfo[] = [];
     for (const candidate of this.descendants(info)) {
-      if (!this.mayInstantiate(candidate)) continue;
+      // An abstract class holds no instances of its own: only its
+      // concrete descendants can be the receiver.
+      if (candidate.def.abstract === true || !this.mayInstantiate(candidate)) continue;
       const found = lowerer.findMethodOn(candidate, e.method);
       if (!found || found.sig.abstract === true) return e;
       if (runtimeProvided(candidate) || runtimeProvided(found.declarer)) return e;
       if (!targets.includes(found.declarer)) targets.push(found.declarer);
     }
-    if (targets.length === 0) return e;
-    for (const target of targets) {
-      const callee = `%${target.def.name}.${e.method}`;
-      if (!this.facts.reachable.has(callee) || !this.lowered.has(callee)) return e;
+    if (targets.length === 0) {
+      // No class below the static one is ever constructed: the receiver can
+      // only be a non-value, and the call has no implementation to enter.
+      if (
+        !this.descendants(info).some(
+          (candidate) => candidate.def.abstract !== true && this.mayInstantiate(candidate),
+        )
+      )
+        return nodeThrowExpr(
+          0,
+          "",
+          `${e.method} has no implementation: no class implementing it is ever constructed`,
+          e.type,
+          e.loc,
+        );
+      return e;
     }
+    // An implementation reachability never retained belongs to a class that
+    // is only exposed, never constructed: no instance of it reaches the call.
+    for (let i = targets.length - 1; i >= 0; i--) {
+      const callee = `%${targets[i]!.def.name}.${e.method}`;
+      if (!this.facts.reachable.has(callee) || !this.lowered.has(callee)) targets.splice(i, 1);
+    }
+    if (targets.length === 0)
+      return nodeThrowExpr(
+        0,
+        "",
+        `${e.method} has no implementation: no class implementing it is ever constructed`,
+        e.type,
+        e.loc,
+      );
     if (targets.length === 1) return this.direct(e, info, targets[0]!) ?? e;
     // A small closed set: the backend tests the loaded slot against each
     // implementation and calls it directly (no indirect fallback; every

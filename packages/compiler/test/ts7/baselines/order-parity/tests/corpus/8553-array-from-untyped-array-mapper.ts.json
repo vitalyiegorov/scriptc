@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8553-array-from-untyped-array-mapper.ts"
+ ],
+ "diags": []
+}

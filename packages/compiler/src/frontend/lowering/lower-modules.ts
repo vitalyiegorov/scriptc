@@ -1,3 +1,5 @@
+import { isProvenanceSourceFile } from "../provenance-registry.js";
+import { mapClassStoragePrelude } from "./builtins/map-classes.js";
 import { THREADS_MODULE } from "../threads-import.js";
 import { positionTag } from "./structural-positions.js";
 import { EXPERIMENTAL_MODULE } from "../experimental-import.js";
@@ -126,8 +128,12 @@ import { objectFactoryGlobalType } from "./object-factory-new.js";
 import { streamClassAliasDecl } from "./lower-stream.js";
 import { isAssertClassNew } from "./assert-instances.js";
 import { stdlibGlobalAliasDecl, stdlibGlobalAliasNameOf, stdlibGlobalNameOf } from "./surfaces.js";
+import {
+  builtinStaticBindingType,
+  builtinStaticDestructureBindings,
+} from "./builtin-static-destructure.js";
 import { isNativeBuiltinValueInitializer } from "./lower-builtin-values.js";
-import { isPromisePrototypeRead } from "./expressions/property-access.js";
+import { isDynPrototypeValueRead } from "./expressions/property-access.js";
 import {
   collectNamespaceStmt,
   nsMemberIdentOf,
@@ -658,7 +664,12 @@ export function collectNpmImports(lowerer: Lowerer, parts: FileParts[]): void {
         npm === null && isRelativeSpecifier(spec)
           ? packageNameOfPath(resolvePath(dirnamePath(fp.sf.fileName), spec))
           : null;
-      const relIsJs = relPkg !== null && !/\.(ts|tsx|mts|cts)$/.test(spec);
+      // (A provenance-mapped package's relative imports are TypeScript
+      // program modules: its sources sit under node_modules but are not JS.)
+      const relIsJs =
+        relPkg !== null &&
+        !/\.(ts|tsx|mts|cts)$/.test(spec) &&
+        !isProvenanceSourceFile(fp.sf.fileName);
       // A relative import INTO an opted-in --npm-static package is the
       // program-module path too (preflight resolved the file edge).
       if (relIsJs && isNpmStaticPackage(relPkg)) continue;
@@ -1082,6 +1093,9 @@ export function moduleArtifacts(
         else delete rest.methods;
         if (abstractMethods.length > 0) rest.abstractMethods = abstractMethods;
         else delete rest.abstractMethods;
+        const optionalMethods = def.optionalMethods?.filter((m) => methods.includes(m)) ?? [];
+        if (optionalMethods.length > 0) rest.optionalMethods = optionalMethods;
+        else delete rest.optionalMethods;
         return rest;
       }),
     // Ids come from what each shape and union is (keyedHelperName), so
@@ -2041,6 +2055,30 @@ export function collectGlobals(
           })());
       if (stableStdlibAlias && stdlibGlobalAliasDecl(lowerer, decl.name, decl.initializer))
         continue;
+      // `const { isArray } = Array`: the bound statics hold the builtin
+      // member values; their storage type is the member's (overloaded
+      // statics included), which no declared-type mapping would give.
+      {
+        const staticBound = builtinStaticDestructureBindings(lowerer, decl);
+        if (staticBound !== null) {
+          for (const binding of staticBound) {
+            const symbol = lowerer.checker.getSymbolAtLocation(binding.name);
+            if (!symbol || lowerer.globalsBySymbol.has(symbol)) continue;
+            const g: IrGlobal = {
+              id: `%g.${tag}${nsPrefix}${binding.name.text}`,
+              name: binding.name.text,
+              type: builtinStaticBindingType(lowerer, decl, binding),
+              mutable: isLet,
+              source: bindingSource(binding.name),
+              ...(!isVarDeclared(decl) ? { tdz: true as const } : {}),
+            };
+            lowerer.globalsBySymbol.set(symbol, g);
+            lowerer.globalsList.push(g);
+            if (isVarDeclared(decl)) noteVarGlobalEntryInit(lowerer, sf, g);
+          }
+          continue;
+        }
+      }
       // Destructuring declarations register EVERY bound identifier (the
       // desugar in the init function assigns the pre-registered globals,
       // exactly like plain declarations).
@@ -2084,7 +2122,7 @@ export function collectGlobals(
           if (
             (nameNode === decl.name &&
               !decl.type &&
-              isPromisePrototypeRead(lowerer, decl.initializer)) ||
+              isDynPrototypeValueRead(lowerer, decl.initializer)) ||
             (isJsSourceFile(sf) &&
               nameNode === decl.name &&
               initializer &&
@@ -3445,6 +3483,7 @@ export function buildMain(lowerer: Lowerer): IrFunction {
     ...cjsModuleRegistryPrelude(lowerer, loc),
     ...handleEventReaderPrelude(lowerer, loc),
     ...dateClassOperationPrelude(lowerer, loc),
+    ...mapClassStoragePrelude(lowerer, loc),
   ];
   const roots = [lowerer.entry, ...lowerer.forkTargets, ...lowerer.workerTargets];
   const isAsync = roots.some((root) => lowerer.asyncInitFiles.has(root));

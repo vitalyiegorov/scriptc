@@ -79,15 +79,6 @@ intl.ts:19:17 - error SC2020: 'Number.prototype.toLocaleString with an options b
 
   hint: the embedded data covers DEFAULT options only (decimal notation, up to 3 fraction digits, grouping) — x.toLocaleString("en-US")
 
-intl.ts:22:14 - error SC2020: 'new Intl.DateTimeFormat' is part of the standard library types but has no scriptc lowering yet
-
-  21 | // The rest of Intl keeps the ICU story.
-  22 | const when = new Intl.DateTimeFormat("en-US").format();
-     |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  23 | const dur = new Intl.DurationFormat("en-US").format({ hours: 1, minutes: 23 });
-
-  hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
-
 intl.ts:23:13 - error SC2020: 'new Intl.DurationFormat' is part of the standard library types but has no scriptc lowering yet
 
   22 | const when = new Intl.DateTimeFormat("en-US").format();

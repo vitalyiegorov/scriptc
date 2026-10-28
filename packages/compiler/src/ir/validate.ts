@@ -3013,7 +3013,7 @@ function validateFunction(
             break;
           }
           const abiEqual = classValueAbiEquals(subClass, supClass, functions);
-          if (!abiEqual) {
+          if (!abiEqual && !supClass.ctorAdapted) {
             err(`classval upcast: "${sub}" and "${sup}" constructor ABIs differ`, e.loc);
           }
           break;

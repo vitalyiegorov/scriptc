@@ -37,6 +37,15 @@ static inline uint64_t scr_key_short_word(const char *bytes, size_t length) {
 static inline bool scr_key_equal(const char *a, const char *b, size_t length) {
   if (a == b) return true;
   if (length <= 8) return scr_key_short_word(a, length) == scr_key_short_word(b, length);
+  if (length <= 16) {
+    /* Two overlapping words cover every byte at lengths nine through 16. */
+    uint64_t a_first, a_last, b_first, b_last;
+    memcpy(&a_first, a, sizeof a_first);
+    memcpy(&b_first, b, sizeof b_first);
+    memcpy(&a_last, a + length - sizeof a_last, sizeof a_last);
+    memcpy(&b_last, b + length - sizeof b_last, sizeof b_last);
+    return a_first == b_first && a_last == b_last;
+  }
   return memcmp(a, b, length) == 0;
 }
 

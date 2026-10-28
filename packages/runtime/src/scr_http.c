@@ -374,6 +374,23 @@ static bool scr_http_trailer_single_value(const ScrStr *name);
  * first unless joinDuplicateHeaders is set. set-cookie joins with ", " in
  * this string form; its array form is scr_http_req_header_list. Always
  * +1. */
+/* Whether a Connection header value contains `token` (lowercase, ASCII),
+ * ignoring case: strcasestr without its setup for the few short tokens. */
+static bool scr_http_token_has(const char *hay, size_t len, const char *token, size_t n) {
+  if (len < n) return false;
+  for (size_t i = 0; i + n <= len; i++) {
+    size_t j = 0;
+    while (j < n) {
+      char c = hay[i + j];
+      if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+      if (c != token[j]) break;
+      j++;
+    }
+    if (j == n) return true;
+  }
+  return false;
+}
+
 static ScrStr *scr_http_field_value(ScrStr *const *names, ScrStr *const *values, size_t count,
                                     size_t index, bool join_dup) {
   const ScrStr *name = names[index];
@@ -3001,9 +3018,9 @@ static bool scr_http_conn_parse_head(ScrHttpConn *conn, size_t head_len, bool *o
       has_upgrade_hdr = true;
     } else if (n->len == 10 && memcmp(n->data, "connection", 10) == 0) {
       /* token scan, case-insensitive enough for close/keep-alive */
-      if (strcasestr(v->data, "upgrade") != NULL) conn_upgrade_token = true;
-      if (strcasestr(v->data, "close") != NULL) req_keep_alive = false;
-      else if (strcasestr(v->data, "keep-alive") != NULL) req_keep_alive = true;
+      if (scr_http_token_has(v->data, v->len, "upgrade", 7)) conn_upgrade_token = true;
+      if (scr_http_token_has(v->data, v->len, "close", 5)) req_keep_alive = false;
+      else if (scr_http_token_has(v->data, v->len, "keep-alive", 10)) req_keep_alive = true;
     }
   }
 
@@ -5924,11 +5941,11 @@ static bool scr_http_dynh_in(const char *m, const char *const *names) {
  * addListener (prepend* is unmodeled — these per-event lists know no
  * front). Answers the once flag; leaves reg=false for other names. */
 static bool scr_http_dynh_reg(const char *method, bool *once) {
-  if (strcmp(method, "on") == 0 || strcmp(method, "addListener") == 0) {
+  if (SCR_STREQ(method, "on") || SCR_STREQ(method, "addListener")) {
     *once = false;
     return true;
   }
-  if (strcmp(method, "once") == 0) {
+  if (SCR_STREQ(method, "once")) {
     *once = true;
     return true;
   }
@@ -6012,15 +6029,15 @@ static ScrDyn *scr_http_dynh_req_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_retain(self); /* chaining, like Node */
   }
-  if (strcmp(method, "resume") == 0) {
+  if (SCR_STREQ(method, "resume")) {
     scr_http_req_resume(r);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "pause") == 0) {
+  if (SCR_STREQ(method, "pause")) {
     scr_http_req_pause(r);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "setTimeout") == 0) {
+  if (SCR_STREQ(method, "setTimeout")) {
     const ScrDyn *ms = argc > 0 ? args[0] : scr_dyn_undefined();
     if (ms->kind != SCR_DYN_NUM) {
       scr_dyn_arg_type_fail("msecs", "of type number", ms);
@@ -6035,7 +6052,7 @@ static ScrDyn *scr_http_dynh_req_invoke(void *h, ScrDyn *self, const char *metho
     scr_http_req_set_timeout(r, ms->v.num, cb);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "setEncoding") == 0) {
+  if (SCR_STREQ(method, "setEncoding")) {
     const ScrDyn *enc = argc > 0 ? args[0] : scr_dyn_undefined();
     if (enc->kind != SCR_DYN_STR) {
       scr_dyn_arg_type_fail("encoding", "of type string", enc);
@@ -6045,7 +6062,7 @@ static ScrDyn *scr_http_dynh_req_invoke(void *h, ScrDyn *self, const char *metho
     if (scr_exc_pending()) return NULL;
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "destroy") == 0) {
+  if (SCR_STREQ(method, "destroy")) {
     if (argc > 0 && args[0]->kind != SCR_DYN_UNDEF) {
       scr_http_dynh_unsupported("IncomingMessage", "destroy", "destroy(error) carries a payload this surface does not model");
       return NULL;
@@ -6053,7 +6070,7 @@ static ScrDyn *scr_http_dynh_req_invoke(void *h, ScrDyn *self, const char *metho
     scr_http_req_destroy(r);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "pipe") == 0) {
+  if (SCR_STREQ(method, "pipe")) {
     const ScrDyn *dst = argc > 0 ? args[0] : scr_dyn_undefined();
     if (dst->kind == SCR_DYN_HANDLE && dst->v.handle.tag == SCR_DYNH_HTTP_RES) {
       scr_http_req_pipe_res(r, (ScrHttpRes *)dst->v.handle.ptr);
@@ -6066,7 +6083,7 @@ static ScrDyn *scr_http_dynh_req_invoke(void *h, ScrDyn *self, const char *metho
     scr_http_dynh_unsupported("IncomingMessage", "pipe", "only ServerResponse and Socket destinations are modeled");
     return NULL;
   }
-  if (strcmp(method, "toString") == 0) {
+  if (SCR_STREQ(method, "toString")) {
     ScrStr *s = scr_str_new("[object Object]", 15);
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
@@ -6090,13 +6107,13 @@ static ScrDyn *scr_http_dynh_req_invoke(void *h, ScrDyn *self, const char *metho
 static ScrDyn *scr_http_dynh_req_get(void *h, const char *key, size_t key_len) {
   ScrHttpReq *r = (ScrHttpReq *)h;
   (void)key_len;
-  if (strcmp(key, "url") == 0) {
+  if (SCR_STREQ(key, "url")) {
     ScrStr *s = scr_http_req_url(r);
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
     return d;
   }
-  if (strcmp(key, "httpVersion") == 0) {
+  if (SCR_STREQ(key, "httpVersion")) {
     /* The parsed request/status line's version — the 1.0 tests read it;
      * the h2 compat request answers Node's "2.0". */
     ScrStr *v = scr_str_new(r->http2 ? "2.0" : r->http10 ? "1.0" : "1.1", 3);
@@ -6104,15 +6121,15 @@ static ScrDyn *scr_http_dynh_req_get(void *h, const char *key, size_t key_len) {
     scr_str_release(v);
     return d;
   }
-  if (strcmp(key, "httpVersionMajor") == 0) return scr_dyn_new_num(r->http2 ? 2 : 1);
-  if (strcmp(key, "httpVersionMinor") == 0) return scr_dyn_new_num(r->http2 ? 0 : r->http10 ? 0 : 1);
-  if (strcmp(key, "method") == 0) {
+  if (SCR_STREQ(key, "httpVersionMajor")) return scr_dyn_new_num(r->http2 ? 2 : 1);
+  if (SCR_STREQ(key, "httpVersionMinor")) return scr_dyn_new_num(r->http2 ? 0 : r->http10 ? 0 : 1);
+  if (SCR_STREQ(key, "method")) {
     ScrStr *s = scr_http_req_method(r);
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
     return d;
   }
-  if (strcmp(key, "headers") == 0) {
+  if (SCR_STREQ(key, "headers")) {
     /* The snapshot object `{ ...req.headers }` builds — lowercased
      * names, arrival order, keep-first duplicates (joined under the
      * joinDuplicateHeaders option), the static lane's exact feed. */
@@ -6135,7 +6152,7 @@ static ScrDyn *scr_http_dynh_req_get(void *h, const char *key, size_t key_len) {
     scr_arr_release(pairs);
     return obj;
   }
-  if (strcmp(key, "rawHeaders") == 0) {
+  if (SCR_STREQ(key, "rawHeaders")) {
     ScrArr *raw = scr_http_req_raw_headers(r);
     ScrDyn *arr = scr_dyn_new_arr();
     size_t n = (size_t)scr_arr_len(raw);
@@ -6147,33 +6164,33 @@ static ScrDyn *scr_http_dynh_req_get(void *h, const char *key, size_t key_len) {
     scr_arr_release(raw);
     return arr;
   }
-  if (strcmp(key, "statusCode") == 0) {
+  if (SCR_STREQ(key, "statusCode")) {
     double st = scr_http_req_status(r);
     /* Node's IncomingMessage constructor sets statusCode = null; only a
      * client response assigns a number (the static lane's typed surface
      * spells this number|undefined — the checked-dynamic tree can afford Node's null). */
     return st < 0 ? scr_dyn_new_null() : scr_dyn_new_num(st);
   }
-  if (strcmp(key, "statusMessage") == 0) {
+  if (SCR_STREQ(key, "statusMessage")) {
     ScrStr *s = scr_http_req_status_message(r);
     if (!s) return scr_dyn_new_null(); /* null on server requests, like statusCode */
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
     return d;
   }
-  if (strcmp(key, "socket") == 0 || strcmp(key, "connection") == 0) {
+  if (SCR_STREQ(key, "socket") || SCR_STREQ(key, "connection")) {
     ScrNetSocket *s = scr_http_req_socket(r);
     if (!s) return NULL;
     ScrDyn *d = scr_dyn_new_handle(s, SCR_DYNH_NET_SOCKET);
     scr_net_sock_release(s);
     return d;
   }
-  if (strcmp(key, "aborted") == 0) return scr_dyn_new_bool(r->aborted);
-  if (strcmp(key, "complete") == 0) return scr_dyn_new_bool(r->ended);
-  if (strcmp(key, "destroyed") == 0) return scr_dyn_new_bool(scr_http_req_destroyed_flag(r));
-  if (strcmp(key, "readable") == 0) return scr_dyn_new_bool(scr_http_req_readable(r));
-  if (strcmp(key, "readableEnded") == 0) return scr_dyn_new_bool(r->ended);
-  if (strcmp(key, "closed") == 0) return scr_dyn_new_bool(r->close_emitted);
+  if (SCR_STREQ(key, "aborted")) return scr_dyn_new_bool(r->aborted);
+  if (SCR_STREQ(key, "complete")) return scr_dyn_new_bool(r->ended);
+  if (SCR_STREQ(key, "destroyed")) return scr_dyn_new_bool(scr_http_req_destroyed_flag(r));
+  if (SCR_STREQ(key, "readable")) return scr_dyn_new_bool(scr_http_req_readable(r));
+  if (SCR_STREQ(key, "readableEnded")) return scr_dyn_new_bool(r->ended);
+  if (SCR_STREQ(key, "closed")) return scr_dyn_new_bool(r->close_emitted);
   {
     /* Real instance properties without a modeled read throw "not supported
      * yet" instead of answering undefined where Node has a value. */
@@ -6308,7 +6325,7 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "end") == 0) {
+  if (SCR_STREQ(method, "end")) {
     /* end() / end(chunk) / end(chunk, enc) / end(cb) / end(chunk, cb) /
      * end(chunk, enc, cb) — Node's whole shape family. */
     size_t i = 0;
@@ -6344,7 +6361,7 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "write") == 0) {
+  if (SCR_STREQ(method, "write")) {
     const ScrDyn *chunk = argc > 0 ? args[0] : scr_dyn_undefined();
     if (!scr_http_dynh_chunk_ok(chunk)) return NULL;
     ScrBytes *decoded = NULL;
@@ -6371,19 +6388,19 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
      * (SEMANTICS.md — backpressure is not modeled). */
     return scr_dyn_new_bool(true);
   }
-  if (strcmp(method, "flushHeaders") == 0) {
+  if (SCR_STREQ(method, "flushHeaders")) {
     scr_http_res_flush_headers(r);
     return scr_dyn_retain(scr_dyn_undefined());
   }
-  if (strcmp(method, "cork") == 0) {
+  if (SCR_STREQ(method, "cork")) {
     scr_http_res_cork(r);
     return scr_dyn_retain(scr_dyn_undefined());
   }
-  if (strcmp(method, "uncork") == 0) {
+  if (SCR_STREQ(method, "uncork")) {
     scr_http_res_uncork(r);
     return scr_dyn_retain(scr_dyn_undefined());
   }
-  if (strcmp(method, "setTimeout") == 0) {
+  if (SCR_STREQ(method, "setTimeout")) {
     const ScrDyn *ms = argc > 0 ? args[0] : scr_dyn_undefined();
     if (ms->kind != SCR_DYN_NUM) {
       scr_dyn_arg_type_fail("msecs", "of type number", ms);
@@ -6398,8 +6415,8 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     scr_http_res_set_timeout(r, ms->v.num, tcb);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "getHeaders") == 0) return scr_http_res_get_headers(r);
-  if (strcmp(method, "getHeaderNames") == 0) {
+  if (SCR_STREQ(method, "getHeaders")) return scr_http_res_get_headers(r);
+  if (SCR_STREQ(method, "getHeaderNames")) {
     ScrArr *names = scr_http_res_get_header_names(r);
     ScrDyn *out = scr_dyn_new_arr();
     for (size_t k = 0; k < names->len; k++) {
@@ -6410,7 +6427,7 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     scr_arr_release(names);
     return out;
   }
-  if (strcmp(method, "writeHead") == 0) {
+  if (SCR_STREQ(method, "writeHead")) {
     const ScrDyn *st = argc > 0 ? args[0] : scr_dyn_undefined();
     if (st->kind != SCR_DYN_NUM) {
       scr_dyn_arg_type_fail("statusCode", "of type number", st);
@@ -6448,7 +6465,7 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_retain(self); /* chaining: writeHead(...).end(...) */
   }
-  if (strcmp(method, "setHeader") == 0) {
+  if (SCR_STREQ(method, "setHeader")) {
     const ScrDyn *name = argc > 0 ? args[0] : scr_dyn_undefined();
     const ScrDyn *value = argc > 1 ? args[1] : scr_dyn_undefined();
     if (name->kind != SCR_DYN_STR) {
@@ -6459,7 +6476,7 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     if (scr_exc_pending()) return NULL;
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "appendHeader") == 0) {
+  if (SCR_STREQ(method, "appendHeader")) {
     const ScrDyn *name = argc > 0 ? args[0] : scr_dyn_undefined();
     const ScrDyn *value = argc > 1 ? args[1] : scr_dyn_undefined();
     if (name->kind != SCR_DYN_STR) {
@@ -6470,7 +6487,7 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     if (scr_exc_pending()) return NULL;
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "getHeader") == 0) {
+  if (SCR_STREQ(method, "getHeader")) {
     const ScrDyn *name = argc > 0 ? args[0] : scr_dyn_undefined();
     if (name->kind != SCR_DYN_STR) {
       scr_dyn_arg_type_fail("name", "of type string", name);
@@ -6478,7 +6495,7 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_http_res_get_header_dyn(r, name->v.str);
   }
-  if (strcmp(method, "hasHeader") == 0) {
+  if (SCR_STREQ(method, "hasHeader")) {
     const ScrDyn *name = argc > 0 ? args[0] : scr_dyn_undefined();
     if (name->kind != SCR_DYN_STR) {
       scr_dyn_arg_type_fail("name", "of type string", name);
@@ -6486,7 +6503,7 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_new_bool(scr_http_res_has_header_named(r, name->v.str));
   }
-  if (strcmp(method, "removeHeader") == 0) {
+  if (SCR_STREQ(method, "removeHeader")) {
     const ScrDyn *name = argc > 0 ? args[0] : scr_dyn_undefined();
     if (name->kind != SCR_DYN_STR) {
       scr_dyn_arg_type_fail("name", "of type string", name);
@@ -6495,11 +6512,11 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
     scr_http_res_remove_header(r, name->v.str);
     return scr_dyn_retain(scr_dyn_undefined());
   }
-  if (strcmp(method, "destroy") == 0) {
+  if (SCR_STREQ(method, "destroy")) {
     scr_http_res_destroy(r);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "toString") == 0) {
+  if (SCR_STREQ(method, "toString")) {
     ScrStr *s = scr_str_new("[object Object]", 15);
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
@@ -6521,40 +6538,40 @@ static ScrDyn *scr_http_dynh_res_invoke(void *h, ScrDyn *self, const char *metho
 static ScrDyn *scr_http_dynh_res_get(void *h, const char *key, size_t key_len) {
   ScrHttpRes *r = (ScrHttpRes *)h;
   (void)key_len;
-  if (strcmp(key, "statusCode") == 0) return scr_dyn_new_num(scr_http_res_status_get(r));
-  if (strcmp(key, "statusMessage") == 0) {
+  if (SCR_STREQ(key, "statusCode")) return scr_dyn_new_num(scr_http_res_status_get(r));
+  if (SCR_STREQ(key, "statusMessage")) {
     ScrStr *s = scr_http_res_status_msg_get(r);
     if (!s) return scr_dyn_retain(scr_dyn_undefined());
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
     return d;
   }
-  if (strcmp(key, "headersSent") == 0) return scr_dyn_new_bool(scr_http_res_headers_sent(r));
-  if (strcmp(key, "finished") == 0 || strcmp(key, "writableEnded") == 0) {
+  if (SCR_STREQ(key, "headersSent")) return scr_dyn_new_bool(scr_http_res_headers_sent(r));
+  if (SCR_STREQ(key, "finished") || SCR_STREQ(key, "writableEnded")) {
     /* One flag serves both (Node splits ended-vs-flushed; this surface
      * flushes synchronously into the socket buffer — SEMANTICS.md). */
     return scr_dyn_new_bool(r->finished);
   }
-  if (strcmp(key, "socket") == 0 || strcmp(key, "connection") == 0) {
+  if (SCR_STREQ(key, "socket") || SCR_STREQ(key, "connection")) {
     ScrNetSocket *sock = scr_http_res_socket(r);
     if (!sock) return scr_dyn_new_null();
     ScrDyn *view = scr_dyn_new_handle(sock, SCR_DYNH_NET_SOCKET);
     scr_net_sock_release(sock);
     return view;
   }
-  if (strcmp(key, "req") == 0) {
+  if (SCR_STREQ(key, "req")) {
     if (r->req_cleared || r->req_ref == NULL) return scr_dyn_new_null();
     return scr_dyn_new_handle(r->req_ref, SCR_DYNH_HTTP_REQ);
   }
-  if (strcmp(key, "writableCorked") == 0) return scr_dyn_new_num(scr_http_res_writable_corked(r));
-  if (strcmp(key, "writableFinished") == 0) return scr_dyn_new_bool(scr_http_res_writable_finished(r));
-  if (strcmp(key, "writableHighWaterMark") == 0) {
+  if (SCR_STREQ(key, "writableCorked")) return scr_dyn_new_num(scr_http_res_writable_corked(r));
+  if (SCR_STREQ(key, "writableFinished")) return scr_dyn_new_bool(scr_http_res_writable_finished(r));
+  if (SCR_STREQ(key, "writableHighWaterMark")) {
     /* Node's default socket highWaterMark — a constant here (backpressure
      * is not modeled; SEMANTICS.md) */
     return scr_dyn_new_num(16384);
   }
-  if (strcmp(key, "destroyed") == 0) return scr_dyn_new_bool(scr_http_res_destroyed_flag(r));
-  if (strcmp(key, "closed") == 0) return scr_dyn_new_bool(r->close_emitted);
+  if (SCR_STREQ(key, "destroyed")) return scr_dyn_new_bool(scr_http_res_destroyed_flag(r));
+  if (SCR_STREQ(key, "closed")) return scr_dyn_new_bool(r->close_emitted);
   {
     static const char *const known[] = { "chunkedEncoding", "sendDate",
       "strictContentLength", "writableLength",
@@ -6570,7 +6587,7 @@ static ScrDyn *scr_http_dynh_res_get(void *h, const char *key, size_t key_len) {
 static bool scr_http_dynh_res_set(void *h, const char *key, size_t key_len, const ScrDyn *value) {
   ScrHttpRes *r = (ScrHttpRes *)h;
   (void)key_len;
-  if (strcmp(key, "statusCode") == 0) {
+  if (SCR_STREQ(key, "statusCode")) {
     if (value->kind != SCR_DYN_NUM) {
       scr_dyn_arg_type_fail("statusCode", "of type number", value);
       return true; /* handled: the exception is pending */
@@ -6578,7 +6595,7 @@ static bool scr_http_dynh_res_set(void *h, const char *key, size_t key_len, cons
     scr_http_res_status_set(r, value->v.num);
     return true;
   }
-  if (strcmp(key, "statusMessage") == 0) {
+  if (SCR_STREQ(key, "statusMessage")) {
     if (value->kind != SCR_DYN_STR) {
       scr_dyn_arg_type_fail("statusMessage", "of type string", value);
       return true;
@@ -6586,13 +6603,13 @@ static bool scr_http_dynh_res_set(void *h, const char *key, size_t key_len, cons
     scr_http_res_status_msg_set(r, value->v.str);
     return true;
   }
-  if (strcmp(key, "sendDate") == 0) {
+  if (SCR_STREQ(key, "sendDate")) {
     /* Node's boolean flag over the implicit Date header (ToBoolean, like
      * the property's own coercion). */
     r->no_date = !scr_dyn_truthy(value);
     return true;
   }
-  if (strcmp(key, "req") == 0 &&
+  if (SCR_STREQ(key, "req") &&
       (value->kind == SCR_DYN_NULL || value->kind == SCR_DYN_UNDEF)) {
     /* res.req is a plain property in Node — a null/undefined write
      * clears the read; other writes raise the named fence (the handle
@@ -6711,7 +6728,7 @@ static ScrDyn *scr_http_dynh_client_invoke(void *h, ScrDyn *self, const char *me
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "end") == 0) {
+  if (SCR_STREQ(method, "end")) {
     const ScrDyn *chunk = argc > 0 ? args[0] : scr_dyn_undefined();
     if (chunk->kind == SCR_DYN_STR) scr_http_client_end_str(c, chunk->v.str);
     else if (chunk->kind == SCR_DYN_BYTES) scr_http_client_end_bytes(c, chunk->v.bytes);
@@ -6722,18 +6739,18 @@ static ScrDyn *scr_http_dynh_client_invoke(void *h, ScrDyn *self, const char *me
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "write") == 0) {
+  if (SCR_STREQ(method, "write")) {
     const ScrDyn *chunk = argc > 0 ? args[0] : scr_dyn_undefined();
     if (!scr_http_dynh_chunk_ok(chunk)) return NULL;
     if (chunk->kind == SCR_DYN_STR) scr_http_client_write_str(c, chunk->v.str);
     else scr_http_client_write_bytes(c, chunk->v.bytes);
     return scr_dyn_new_bool(true);
   }
-  if (strcmp(method, "destroy") == 0) {
+  if (SCR_STREQ(method, "destroy")) {
     scr_http_client_destroy(c);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "setTimeout") == 0) {
+  if (SCR_STREQ(method, "setTimeout")) {
     const ScrDyn *ms = argc > 0 ? args[0] : scr_dyn_undefined();
     if (ms->kind != SCR_DYN_NUM) {
       scr_dyn_arg_type_fail("msecs", "of type number", ms);
@@ -6745,11 +6762,11 @@ static ScrDyn *scr_http_dynh_client_invoke(void *h, ScrDyn *self, const char *me
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "flushHeaders") == 0) {
+  if (SCR_STREQ(method, "flushHeaders")) {
     if (!c->head_sent && !c->destroyed) scr_http_client_send_head(c, -1);
     return scr_dyn_retain(scr_dyn_undefined());
   }
-  if (strcmp(method, "toString") == 0) {
+  if (SCR_STREQ(method, "toString")) {
     ScrStr *s = scr_str_new("[object Object]", 15);
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
@@ -6772,17 +6789,17 @@ static ScrDyn *scr_http_dynh_client_invoke(void *h, ScrDyn *self, const char *me
 static ScrDyn *scr_http_dynh_client_get(void *h, const char *key, size_t key_len) {
   ScrHttpClientReq *c = (ScrHttpClientReq *)h;
   (void)key_len;
-  if (strcmp(key, "socket") == 0 || strcmp(key, "connection") == 0) {
+  if (SCR_STREQ(key, "socket") || SCR_STREQ(key, "connection")) {
     if (!c->sock) return scr_dyn_new_null();
     return scr_dyn_new_handle(c->sock, SCR_DYNH_NET_SOCKET);
   }
-  if (strcmp(key, "destroyed") == 0) return scr_dyn_new_bool(scr_http_client_destroyed(c));
-  if (strcmp(key, "writableEnded") == 0) return scr_dyn_new_bool(c->ended);
-  if (strcmp(key, "path") == 0) {
+  if (SCR_STREQ(key, "destroyed")) return scr_dyn_new_bool(scr_http_client_destroyed(c));
+  if (SCR_STREQ(key, "writableEnded")) return scr_dyn_new_bool(c->ended);
+  if (SCR_STREQ(key, "path")) {
     ScrDyn *d = scr_dyn_new_str(c->path);
     return d;
   }
-  if (strcmp(key, "method") == 0) return scr_dyn_new_str(c->method);
+  if (SCR_STREQ(key, "method")) return scr_dyn_new_str(c->method);
   {
     static const char *const known[] = { "aborted", "host", "protocol", "res",
       "reusedSocket", "maxHeadersCount", "headersSent", "writableFinished", NULL };
@@ -6833,7 +6850,7 @@ static ScrDyn *scr_http_dynh_agent_invoke(void *h, ScrDyn *self, const char *met
     scr_http_dynh_event_unsupported("Agent", name);
     return NULL;
   }
-  if (strcmp(method, "getName") == 0) {
+  if (SCR_STREQ(method, "getName")) {
     const ScrDyn *opts = argc > 0 ? args[0] : scr_dyn_undefined();
     ScrDyn *view = opts->kind == SCR_DYN_TYPED_REF ? scr_dyn_typed_ref_materialize(opts) : NULL;
     if (view != NULL) opts = view;
@@ -6862,11 +6879,11 @@ static ScrDyn *scr_http_dynh_agent_invoke(void *h, ScrDyn *self, const char *met
     scr_str_release(name);
     return d;
   }
-  if (strcmp(method, "destroy") == 0) {
+  if (SCR_STREQ(method, "destroy")) {
     scr_http_agent_destroy(a);
     return scr_dyn_retain(scr_dyn_undefined());
   }
-  if (strcmp(method, "toString") == 0) {
+  if (SCR_STREQ(method, "toString")) {
     ScrStr *s = scr_str_new("[object Object]", 15);
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
@@ -6913,26 +6930,26 @@ static ScrDyn *scr_http_dynh_agent_table(ScrHttpAgent *a, bool queued) {
 static ScrDyn *scr_http_dynh_agent_get(void *h, const char *key, size_t key_len) {
   ScrHttpAgent *a = (ScrHttpAgent *)h;
   (void)key_len;
-  if (strcmp(key, "maxSockets") == 0) return scr_dyn_new_num(a->max_sockets);
-  if (strcmp(key, "maxFreeSockets") == 0) return scr_dyn_new_num(a->max_free);
-  if (strcmp(key, "keepAlive") == 0) return scr_dyn_new_bool(a->keep_alive);
-  if (strcmp(key, "keepAliveMsecs") == 0) return scr_dyn_new_num(a->ka_msecs);
-  if (strcmp(key, "scheduling") == 0) {
+  if (SCR_STREQ(key, "maxSockets")) return scr_dyn_new_num(a->max_sockets);
+  if (SCR_STREQ(key, "maxFreeSockets")) return scr_dyn_new_num(a->max_free);
+  if (SCR_STREQ(key, "keepAlive")) return scr_dyn_new_bool(a->keep_alive);
+  if (SCR_STREQ(key, "keepAliveMsecs")) return scr_dyn_new_num(a->ka_msecs);
+  if (SCR_STREQ(key, "scheduling")) {
     ScrStr *s = scr_str_new(a->fifo ? "fifo" : "lifo", 4);
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
     return d;
   }
-  if (strcmp(key, "defaultPort") == 0) return scr_dyn_new_num(a->default_port);
-  if (strcmp(key, "protocol") == 0) {
+  if (SCR_STREQ(key, "defaultPort")) return scr_dyn_new_num(a->default_port);
+  if (SCR_STREQ(key, "protocol")) {
     ScrStr *s = scr_str_new(a->secure ? "https:" : "http:", a->secure ? 6 : 5);
     ScrDyn *d = scr_dyn_new_str(s);
     scr_str_release(s);
     return d;
   }
-  if (strcmp(key, "sockets") == 0) return scr_http_dynh_agent_table(a, false);
-  if (strcmp(key, "requests") == 0) return scr_http_dynh_agent_table(a, true);
-  if (strcmp(key, "freeSockets") == 0) {
+  if (SCR_STREQ(key, "sockets")) return scr_http_dynh_agent_table(a, false);
+  if (SCR_STREQ(key, "requests")) return scr_http_dynh_agent_table(a, true);
+  if (SCR_STREQ(key, "freeSockets")) {
     /* { name: [socket, ...] }, oldest first like Node's arrays */
     ScrDyn *obj = scr_dyn_new_obj();
     for (ScrHttpAgentFree *f = a->free_socks; f; f = f->next) {
@@ -6955,7 +6972,7 @@ static ScrDyn *scr_http_dynh_agent_get(void *h, const char *key, size_t key_len)
     }
     return obj;
   }
-  if (strcmp(key, "totalSocketCount") == 0) return scr_dyn_new_num((double)a->sock_count->n);
+  if (SCR_STREQ(key, "totalSocketCount")) return scr_dyn_new_num((double)a->sock_count->n);
   {
     static const char *const known[] = { "options", "maxTotalSockets", NULL };
     if (scr_http_dynh_in(key, known)) {
@@ -6969,15 +6986,15 @@ static ScrDyn *scr_http_dynh_agent_get(void *h, const char *key, size_t key_len)
 static bool scr_http_dynh_agent_set(void *h, const char *key, size_t key_len, const ScrDyn *value) {
   ScrHttpAgent *a = (ScrHttpAgent *)h;
   (void)key_len;
-  if (strcmp(key, "defaultPort") == 0 || strcmp(key, "maxSockets") == 0 ||
-      strcmp(key, "maxFreeSockets") == 0 || strcmp(key, "keepAliveMsecs") == 0) {
+  if (SCR_STREQ(key, "defaultPort") || SCR_STREQ(key, "maxSockets") ||
+      SCR_STREQ(key, "maxFreeSockets") || SCR_STREQ(key, "keepAliveMsecs")) {
     if (value->kind != SCR_DYN_NUM) {
       scr_dyn_arg_type_fail(key, "of type number", value);
       return true; /* handled: the exception is pending */
     }
-    if (strcmp(key, "defaultPort") == 0) a->default_port = value->v.num;
-    else if (strcmp(key, "maxSockets") == 0) a->max_sockets = value->v.num;
-    else if (strcmp(key, "maxFreeSockets") == 0) a->max_free = value->v.num;
+    if (SCR_STREQ(key, "defaultPort")) a->default_port = value->v.num;
+    else if (SCR_STREQ(key, "maxSockets")) a->max_sockets = value->v.num;
+    else if (SCR_STREQ(key, "maxFreeSockets")) a->max_free = value->v.num;
     else a->ka_msecs = value->v.num;
     return true;
   }

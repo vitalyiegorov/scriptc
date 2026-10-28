@@ -1505,12 +1505,7 @@ function liveRecordOrderSelect(
  * classes and JavaScript classes with prototype data answer through their
  * own views. */
 function liveClassOpsEligible(meta: LlClassMeta): boolean {
-  return (
-    !meta.def.runtime &&
-    !meta.root.def.runtime &&
-    !meta.def.prototypeDataHelper &&
-    !meta.def.instancePrototypeHelper
-  );
+  return !meta.def.runtime && !meta.root.def.runtime && !meta.def.prototypeDataHelper;
 }
 
 /** The prototype member names of a class instance capsule

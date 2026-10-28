@@ -31,7 +31,7 @@ import { elemAccess, vAdapters } from "./shapes.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
 import { emitUnionWiden } from "./expr-records.js";
-import { emitJsIcMethod, jsIcMethods } from "./js-ic.js";
+import { emitJsIcMethod, jsIcMethods, recordCall } from "./js-ic.js";
 import { DYN_BUFFER_METHODS } from "../../ir/runtime-features.js";
 
 export function emitDynamicExpr(
@@ -70,11 +70,9 @@ export function emitDynamicExpr(
       if (e.value.kind === "unitLit") {
         const t = B.tmp();
         if (e.value.unit === "undefined") {
+          // The undefined value is immortal: its "+1" is the value itself.
           host.declare(`declare ptr @scr_dyn_undefined()`);
-          host.declare(`declare ptr @scr_dyn_retain_v(ptr)`);
-          const u = B.tmp();
-          B.line(`${u} = call ptr @scr_dyn_undefined()`);
-          B.line(`${t} = call ptr @scr_dyn_retain_v(ptr ${u})`);
+          B.line(`${t} = call ptr @scr_dyn_undefined()`);
         } else {
           host.declare(`declare ptr @scr_dyn_new_null()`);
           B.line(`${t} = call ptr @scr_dyn_new_null()`);
@@ -118,9 +116,23 @@ export function emitDynamicExpr(
         // the per-signature call thunk + the interned signature key. The
         // best-effort name rides along (null when the lowering had none).
         const name = e.fnName !== undefined && e.fnName !== "" ? host.cstr(e.fnName) : "null";
-        const box = host.dyn.dynFuncBoxHelper(v.type);
         const t = B.tmp();
-        B.line(`${t} = call ptr @${box}(ptr ${v.name}, ptr ${name})`);
+        if (host.ownsFrameTemp(v)) {
+          // A closure this expression just made (or any other owned temp):
+          // its reference moves into the function value, without the retain
+          // and the frame's later release that would leave the closure a
+          // cycle candidate for no reason.
+          host.declare(`declare ptr @scr_dyn_new_func(ptr, ptr, i32, ptr, ptr)`);
+          const thunk = host.dyn.dynFuncThunkHelper(v.type);
+          const arity = v.type.params.length - (v.type.restAbi === "typed" ? 1 : 0);
+          B.line(
+            `${t} = call ptr @scr_dyn_new_func(ptr ${v.name}, ptr @${thunk}, i32 ${arity}, ptr ${host.cstr(typeKey(v.type))}, ptr ${name})`,
+          );
+          host.toHeap(v);
+        } else {
+          const box = host.dyn.dynFuncBoxHelper(v.type);
+          B.line(`${t} = call ptr @${box}(ptr ${v.name}, ptr ${name})`);
+        }
         if (e.fnLength !== undefined) {
           host.declare(`declare void @scr_dyn_function_set_length(ptr, i32)`);
           B.line(`call void @scr_dyn_function_set_length(ptr ${t}, i32 ${e.fnLength})`);
@@ -147,7 +159,7 @@ export function emitDynamicExpr(
         B.line(`${data} = getelementptr inbounds %ScrStr, ptr ${name.name}, i32 1`);
         return data;
       };
-      host.declare("declare void @scr_dyn_this_push_dyn(ptr)");
+      host.declare("declare void @scr_dyn_this_push_borrowed(ptr)");
       host.declare("declare void @scr_dyn_this_pop()");
       if (e.spreads !== undefined && e.spreads.length > 0) {
         // The RUNTIME-ARITY form (`f(...args)`): one fresh dyn array
@@ -180,7 +192,7 @@ export function emitDynamicExpr(
         });
         const t = B.tmp();
         const name = calleeName();
-        B.line(`call void @scr_dyn_this_push_dyn(ptr ${receiver?.name ?? "null"})`);
+        B.line(`call void @scr_dyn_this_push_borrowed(ptr ${receiver?.name ?? "null"})`);
         B.line(`${t} = call ptr @scr_dyn_apply(ptr ${callee.name}, ptr ${pack}, ptr ${name})`);
         B.line("call void @scr_dyn_this_pop()");
         const out = host.own({ name: t, type: e.type });
@@ -201,14 +213,14 @@ export function emitDynamicExpr(
         });
         argsPtr = arr;
       }
-      host.declare(`declare ptr @scr_dyn_call(ptr, ptr, ${host.sizeType}, ptr)`);
+      host.declare(`declare ptr @scr_dyn_call_this(ptr, ptr, ptr, ${host.sizeType}, ptr)`);
+      recordCall(host, e, callee.name);
       const t = B.tmp();
       const name = calleeName();
-      B.line(`call void @scr_dyn_this_push_dyn(ptr ${receiver?.name ?? "null"})`);
+      // The receiver window, the call and its pop are one runtime call.
       B.line(
-        `${t} = call ptr @scr_dyn_call(ptr ${callee.name}, ptr ${argsPtr}, ${host.sizeType} ${args.length}, ptr ${name})`,
+        `${t} = call ptr @scr_dyn_call_this(ptr ${callee.name}, ptr ${receiver?.name ?? "null"}, ptr ${argsPtr}, ${host.sizeType} ${args.length}, ptr ${name})`,
       );
-      B.line("call void @scr_dyn_this_pop()");
       const out = host.own({ name: t, type: e.type });
       host.emitPendingCheck();
       return out;
@@ -232,6 +244,7 @@ export function emitDynamicExpr(
       host.own({ name: prepared, type: { kind: "dyn" } });
       host.emitPendingCheck();
       const args = e.args.map((a) => emitBorrowedInput(host, a));
+      recordCall(host, e, prepared);
       // A closure registered as a 'message' listener gets a typed message
       // entry: ports deliver messages of its parameter's layout without
       // decoding them to checked-dynamic values first.

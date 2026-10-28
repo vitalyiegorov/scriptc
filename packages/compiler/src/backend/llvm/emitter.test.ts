@@ -483,6 +483,10 @@ test("class constructor probes test the function tag and borrow across a literal
   expect(borrowed).toContain("icmp ne ptr");
   expect(borrowed).toContain("icmp eq i32 %t");
   expect(borrowed).toMatch(/icmp eq i32 %t\d+, 8\b/);
+  // A function without a class object, or a class object whose name starts
+  // with another byte ("E" is 69), misses without a runtime call.
+  expect(borrowed).toContain("; ->v.fn.class_obj");
+  expect(borrowed).toMatch(/icmp eq i8 %t\d+, 69\b/);
   expect(borrowed).toContain("call zeroext i1 @scr_dyn_class_is_key(");
   const computed = work(
     {
@@ -492,6 +496,8 @@ test("class constructor probes test the function tag and borrow across a literal
     dyn,
   );
   expect(computed).toContain("call ptr @scr_dyn_retain_v(");
+  expect(computed).toContain("; ->v.fn.class_obj");
+  expect(computed).not.toMatch(/icmp eq i8 /);
   expect(computed).toContain("call zeroext i1 @scr_dyn_class_is_key(");
 });
 

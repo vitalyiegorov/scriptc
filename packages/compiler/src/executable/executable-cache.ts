@@ -63,6 +63,10 @@ export interface EarlyExecutableNativeFeatures {
   warningReplace?: boolean;
   stdioExtended?: boolean;
   moduleNamespace?: boolean;
+  /** Native Map subclass storage and inherited operations. */
+  mapClass?: boolean;
+  functionPrototype?: boolean;
+  intlDateTimeFormat?: boolean;
   zlib: boolean;
   brotli?: boolean;
   assert: boolean;
@@ -153,6 +157,8 @@ export interface EarlyExecutableCacheOptions {
   checker?: string;
   /** Omitted unless SCRIPTC_YOUNG_NURSERY=1 (backend/young-nursery.ts). */
   youngNursery?: true;
+  /** Omitted unless SCRIPTC_RUNTIME_STATS=1 (backend/runtime-stats.ts). */
+  runtimeStats?: true;
   npmStatic: readonly string[] | "auto" | null;
   /** Raw manifest identity: path and bytes. Native archives remain under the
    * stricter native cache's independent dependency validation. */
@@ -292,6 +298,7 @@ function cacheKey(options: EarlyExecutableCacheOptions): string {
     ...(options.profile !== undefined ? [options.profile] : []),
     ...(options.checker !== undefined ? [`checker:${options.checker}`] : []),
     ...(options.youngNursery ? ["young-nursery"] : []),
+    ...(options.runtimeStats ? ["runtime-stats"] : []),
     options.npmStatic === null
       ? "<npm-static-off>"
       : options.npmStatic === "auto"
@@ -335,6 +342,7 @@ function routeKey(options: Omit<EarlyExecutableRouteOptions, "nativeEnvironment"
   if (options.profile !== undefined) hash.update(`${options.profile}\0`);
   if (options.checker !== undefined) hash.update(`checker:${options.checker}\0`);
   if (options.youngNursery) hash.update("young-nursery\0");
+  if (options.runtimeStats) hash.update("runtime-stats\0");
   hash
     .update(
       options.npmStatic === null

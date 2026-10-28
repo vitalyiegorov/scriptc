@@ -1,3 +1,5 @@
+import { isProvenanceSourceFile } from "../provenance-registry.js";
+import { proxyFlowOf } from "./proxy-flow.js";
 import { staticNameBindings } from "./static-function-names.js";
 import { positionTag } from "./structural-positions.js";
 import { keyedHelperName } from "./stable-names.js";
@@ -377,6 +379,26 @@ export function genericCallInstance(
       ...(named ? { staticFnNames: named.names } : {}),
     });
   }
+  // A checked-dynamic parameter erases what its type argument was (an
+  // input typed `SourceInput<T>` maps to dyn for every T), so the IR
+  // signature alone under-discriminates: `f<string>` and `f<number>` map to
+  // one signature while their bodies convert elements to different types.
+  // The bound types key such instances apart.
+  if (params.some((p) => p.type.kind === "dyn") && info.typeParams.length > 0) {
+    const tsBindings = new Map<ts.Symbol, ts.Type>();
+    const bindings = lowerer.inferTypeParamBindings(expr, info, rsig, tsBindings);
+    const bound = info.typeParams
+      .map((tp) => {
+        const b = bindings.get(tp);
+        return b ? typeKey(b) : "_";
+      })
+      .join(",");
+    return internGenericInstance(lowerer, expr, info, params, returnType, () => bindings, {
+      extraKey: `@dyn<${bound}>${named?.key ?? ""}`,
+      tsBindings,
+      ...(named ? { staticFnNames: named.names } : {}),
+    });
+  }
   return internGenericInstance(
     lowerer,
     expr,
@@ -418,7 +440,13 @@ function overloadCallInstance(
     impl.parameters.nodes
       .slice(rdecl.parameters.nodes.length)
       .some((p) => p.questionToken === undefined && p.initializer === undefined) ||
-    rdecl.parameters.nodes.some((p) => p.dotDotDotToken !== undefined)
+    // A rest parameter of the overload (`...values: A`) pairs with the
+    // implementation's rest parameter at the same position, where the
+    // spread arguments collect the same way.
+    rdecl.parameters.nodes.some(
+      (p, i) =>
+        p.dotDotDotToken !== undefined && impl.parameters.nodes[i]?.dotDotDotToken === undefined,
+    )
   )
     return null;
   const declSig = lowerer.checker.getSignatureFromDeclaration(impl);
@@ -486,6 +514,8 @@ function overloadCallInstance(
  * declared result says. An async body's promise is always present and
  * settles with undefined there. */
 function runtimeReturnType(lowerer: Lowerer, info: GenericFnInfo, mapped: IrType): IrType {
+  if (mapped.kind !== "dyn" && proxyFlowOf(lowerer).isProducer(info.decl))
+    return mapped.kind === "promise" ? { kind: "promise", inner: DYN } : DYN;
   if (!lowerer.runtimeOptionalGenericReturns.has(info.decl)) return mapped;
   return mapped.kind === "promise"
     ? { kind: "promise", inner: lowerer.runtimeOptionalType(mapped.inner) }
@@ -758,7 +788,7 @@ function withInstanceScope<T>(
  * (`const f: (x: number) => number = identity`) reuse one compiled
  * instance. `makeBindings` runs only for a NEW key (binding inference
  * costs checker walks). */
-function internGenericInstance(
+export function internGenericInstance(
   lowerer: Lowerer,
   blame: ts.Node,
   info: GenericFnInfo,
@@ -775,7 +805,29 @@ function internGenericInstance(
   // (extraKey): the IR signature alone under-discriminates there — two
   // literals can map to one IR signature while their bodies read
   // different fields.
-  const key = `${params.map((s) => typeKey(s.type)).join(",")}=>${typeKey(returnType)}${opts?.extraKey ?? ""}`;
+  let key = `${params.map((s) => typeKey(s.type)).join(",")}=>${typeKey(returnType)}${opts?.extraKey ?? ""}`;
+  // A checked-dynamic slot ANYWHERE in the signature (a `dyn` element of a
+  // rest array, a dyn result inside a container, a closure type) erases
+  // what the type parameters were bound to, exactly as a bare dyn
+  // parameter does: `f<string>` and `f<number>` share one IR signature
+  // while their bodies convert to different types. Key those instances on
+  // the bound types too.
+  let earlyBindings: Map<ts.Symbol, IrType> | undefined;
+  const earlyTsBindings = opts?.tsBindings ?? new Map<ts.Symbol, ts.Type>();
+  if (
+    info.typeParams.length > 0 &&
+    !key.includes("@dyn<") &&
+    /(^|[<(,>])dyn($|[<>),=])/.test(key)
+  ) {
+    earlyBindings = makeBindings(earlyTsBindings);
+    const bound = info.typeParams
+      .map((tp) => {
+        const b = earlyBindings!.get(tp);
+        return b ? typeKey(b) : "_";
+      })
+      .join(",");
+    key += `@dynbound<${bound}>`;
+  }
   let inst = info.instances.get(key);
   if (!inst) {
     const path = extendInstantiationPath(lowerer.genericInstantiationPath, info.decl);
@@ -787,8 +839,8 @@ function internGenericInstance(
           `${MAX_INSTANTIATION_RECURSION} recursive specializations on one demand path)`,
       );
     }
-    const tsBindings = opts?.tsBindings ?? new Map<ts.Symbol, ts.Type>();
-    const bindings = makeBindings(tsBindings);
+    const tsBindings = earlyTsBindings;
+    const bindings = earlyBindings ?? makeBindings(tsBindings);
     const rendered = info.typeParams
       .map((tp) => {
         // A literal-bound keyof parameter renders its literal — the
@@ -1638,6 +1690,49 @@ export function implicitMonoFile(sf: ts.SourceFile): boolean {
   return isJsSourceFile(sf) && npmStaticPackageOfPath(sf.fileName) !== null;
 }
 
+const COLLECTION_NAMES = new Set([
+  "Map",
+  "Set",
+  "WeakMap",
+  "WeakSet",
+  "ReadonlyMap",
+  "ReadonlySet",
+]);
+
+/** A collection parameter typed with `any` arguments (`Map<Key, any>`): the
+ * declaration promises nothing about the values, and callers hold the same
+ * map under their own element types. The compiled collections are invariant
+ * in their element types, so such a parameter binds like an untyped one. */
+export function broadCollectionType(lowerer: Lowerer, type: ts.Type): boolean {
+  const symbol = type.getSymbol();
+  if (
+    symbol === undefined ||
+    !COLLECTION_NAMES.has(ts.symbolName(symbol)) ||
+    !lowerer.isStdlibSymbol(symbol)
+  )
+    return false;
+  if ((type.flags & ts.TypeFlags.Object) === 0) return false;
+  return lowerer.checker
+    .getTypeArguments(type as ts.TypeReference)
+    .some((argument) => (argument.flags & ts.TypeFlags.Any) !== 0);
+}
+
+/** The implicit monomorphization gate for one declaration: functions of an
+ * opted-in package's JS files, and TypeScript functions that take a broad
+ * collection. */
+export function implicitMonoDeclaration(
+  lowerer: Lowerer,
+  decl: ts.FunctionDeclaration | ts.MethodDeclaration | ts.FunctionExpression | ts.ArrowFunction,
+): boolean {
+  const sf = ts.getSourceFileOfNode(decl);
+  if (implicitMonoFile(sf)) return true;
+  if (sf.isDeclarationFile) return false;
+  return decl.parameters.nodes.some(
+    (param) =>
+      ts.isIdentifier(param.name) && broadCollectionType(lowerer, lowerer.typeOf(param.name)),
+  );
+}
+
 /** True when the body (or a nested function capturing it) ever WRITES the
  * parameter symbol — assignment, compound assignment, ++/--, a
  * destructuring-assignment target, or a for-in/of cursor. A written
@@ -1865,12 +1960,16 @@ export function implicitAnyParamSymbolsOf(
     const broadPromise = broadPromiseParam(lowerer, t);
     const declaredKind = classParams ? lowerer.mapTypeOf(t)?.kind : undefined;
     const classParam = classParams && (declaredKind === "object" || declaredKind === "array");
+    const broadCollection = broadCollectionType(lowerer, t);
+    // Fetched TypeScript declares its types: only a broad collection binds.
+    if (!isJsSourceFile(ts.getSourceFileOfNode(decl)) && !broadCollection) return null;
     if (
       (t.flags & ts.TypeFlags.Any) === 0 &&
       !broadFunction &&
       !broadArray &&
       !broadPromise &&
-      !classParam
+      !classParam &&
+      !broadCollection
     )
       return null;
     const sym = lowerer.checker.getSymbolAtLocation(param.name);
@@ -2763,6 +2862,28 @@ export function bindingContextualGenericFnNodeOf(
  * body, the class-expression rule) — so every genericFnOf consumer
  * (calls, pinned values, instantiation expressions, namespace and CJS
  * member paths) resolves it like a top-level generic declaration. */
+/** A generic arrow/function-expression binding declared inside a function
+ * whose body uses that function's frame. Its compiled instantiations would be
+ * module functions that cannot capture, so such a binding is an ordinary
+ * closure value instead: it lowers once, erased (see lowerLambda). */
+export function bindingGenericFnCapturesFrame(
+  lowerer: Lowerer,
+  decl: ts.VariableDeclaration,
+  fnNode: ts.FunctionExpression | ts.ArrowFunction,
+): boolean {
+  if (lowerer.bindingGenericFns.has(fnNode)) return false;
+  // Only a dependency's TypeScript runs erased, as JavaScript runs it.
+  if (!isProvenanceSourceFile(ts.getSourceFileOfNode(decl).fileName)) return false;
+  for (
+    let n: ts.Node | undefined = decl.parent;
+    n !== undefined && !ts.isSourceFile(n);
+    n = n.parent
+  ) {
+    if (ts.isFunctionLike(n)) return capturesEnclosingFrame(lowerer, fnNode, decl, fnNode);
+  }
+  return false;
+}
+
 export function bindingGenericFnInfoOf(
   lowerer: Lowerer,
   decl: ts.VariableDeclaration,

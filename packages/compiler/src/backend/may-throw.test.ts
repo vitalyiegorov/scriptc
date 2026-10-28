@@ -717,3 +717,22 @@ test("unreachable statements do not seed", () => {
   );
   expect([...answer.fns].sort()).toEqual(["reachable", "thrower"]);
 });
+
+test.each(["dyn.setPrototype", "dyn.literalPrototype"] as const)(
+  "%s preserves catchable native prototype failures",
+  (operation) => {
+    const call: IrExpr = {
+      kind: "libCall",
+      fn: operation,
+      args: [
+        { kind: "dynObjLit", fields: [], type: DYN, loc },
+        { kind: "dynObjLit", fields: [], type: DYN, loc },
+      ],
+      type: DYN,
+      loc,
+    };
+    expect(computeMayThrow(moduleWith(fn("caller", [exprStmt(call)], []))).fns.has("caller")).toBe(
+      true,
+    );
+  },
+);

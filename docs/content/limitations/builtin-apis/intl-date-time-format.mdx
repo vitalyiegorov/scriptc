@@ -1,0 +1,5 @@
+- **Intl.DateTimeFormat:** Numeric year/month/day, hour/minute/second, and combined profiles compile for the default US-English locale or explicit `en-US`, including the stable bound `format` getter.
+  Components accept `numeric` or `2-digit`, and `hour12` selects twelve- or twenty-four-hour output.
+  With no components, formatting defaults to numeric year/month/day.
+  Explicit time zones support `UTC`; the default zone uses native Date behavior, and changing a non-UTC default `TZ` after construction is unsupported.
+  Other locales, calendars, numbering systems, partial component profiles, named components, date/time styles, primitive options, and formatter methods other than `format` are unsupported.

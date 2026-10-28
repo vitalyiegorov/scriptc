@@ -94,3 +94,10 @@ export function nativeProfileKey(profile: NativeProfileOptions | undefined): str
 export function profileGenerateLinkerArgs(generate: boolean): string[] {
   return generate ? ["-fprofile-generate"] : [];
 }
+
+/** Where an instrumented executable writes its JS-level type feedback
+ * (backend/llvm/js-feedback.ts): the raw profile pattern with its
+ * `.profraw` extension replaced by `.jsfb`. */
+export function jsFeedbackPattern(generate: string): string {
+  return `${generate.replace(/\.profraw$/, "")}.jsfb`;
+}

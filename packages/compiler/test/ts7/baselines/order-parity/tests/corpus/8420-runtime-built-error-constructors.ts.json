@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8420-runtime-built-error-constructors.ts"
+ ],
+ "diags": []
+}

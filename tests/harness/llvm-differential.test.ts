@@ -11,7 +11,12 @@ import { describe, expect, test } from "vitest";
 import ts5 from "typescript";
 import { compile } from "@scriptc/compiler";
 import { corpusSelect, shardSuffix } from "./shard.js";
-import { tscJsxOracleEntry, wantsTscJsx } from "./jsx-oracle.js";
+import {
+  tscJsxOracleEntry,
+  wantsTscJsx,
+  tscLegacyDecoratorsOracleEntry,
+  wantsTscLegacyDecorators,
+} from "./jsx-oracle.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -121,6 +126,8 @@ function wantsTscDecorators(file: string): boolean {
 }
 
 function nodeOracleFile(file: string): string {
+  if (wantsTscLegacyDecorators(directiveHead(file)))
+    return tscLegacyDecoratorsOracleEntry(file, cacheDir);
   if (wantsTscJsx(directiveHead(file))) return tscJsxOracleEntry(file, cacheDir);
   if (!wantsTscDecorators(file)) return file;
   const src = readFileSync(file, "utf8");

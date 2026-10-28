@@ -42,3 +42,32 @@ Object.freeze(frozen);
 console.log(Object.isSealed(frozen), Object.isFrozen(frozen), Object.getOwnPropertyDescriptor(frozen, 'first').writable);
 try { frozen.first = 4; } catch (error) { console.log(error.name); }
 console.log(frozen.first);
+// Literal prototype setters retain inherited reads while defining own fields.
+const trace = [];
+const literalParent = {
+  /** @param {number} value */
+  set own(value) { trace.push('setter:' + value); },
+  inherited: 9,
+};
+const literalChild = {
+  before: (trace.push('before'), 1),
+  __proto__: (trace.push('prototype'), literalParent),
+  own: (trace.push('own'), 2),
+  after: (trace.push('after'), 3),
+};
+console.log(trace.join(','), literalChild.inherited, literalChild.own);
+console.log(Object.getPrototypeOf(literalChild) === literalParent, Object.keys(literalChild).join(','));
+for (const primitive of [undefined, true, 1, 'ignored']) {
+  const ignored = { __proto__: primitive, value: 5 };
+  console.log(Object.getPrototypeOf(ignored) === Object.prototype, Object.hasOwn(ignored, '__proto__'), ignored.value);
+}
+const arrayPrototype = [];
+const arrayChild = { __proto__: arrayPrototype };
+console.log(Object.getPrototypeOf(arrayChild) === arrayPrototype, arrayChild instanceof Array, Array.isArray(arrayChild));
+function callablePrototype() {}
+const callableChild = { __proto__: callablePrototype };
+console.log(Object.getPrototypeOf(callableChild) === callablePrototype, typeof callableChild);
+const nativeRecord = { count: 1 };
+console.log(Object.isExtensible(nativeRecord), Object.isSealed(nativeRecord));
+Object.freeze(nativeRecord);
+console.log(Object.isExtensible(nativeRecord), Object.isSealed(nativeRecord));

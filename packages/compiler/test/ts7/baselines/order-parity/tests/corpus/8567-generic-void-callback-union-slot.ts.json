@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8567-generic-void-callback-union-slot.ts"
+ ],
+ "diags": []
+}

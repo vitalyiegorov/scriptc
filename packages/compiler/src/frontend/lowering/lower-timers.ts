@@ -14,6 +14,7 @@ import {
   type SrcLoc,
   typeKey,
 } from "../../ir/ir.js";
+import { checkedIterableSpread } from "./checked-iterable-spread.js";
 import { buildFunctionAdapter } from "./coercions/builders.js";
 import type { Lowerer } from "./lowerer.js";
 
@@ -199,10 +200,24 @@ function makeTimerArgsThunk(
       "the callback must be a boxable function (or wrap it: () => cb(...))",
     );
   }
-  const args = argNodes.map((a) => lowerer.lowerExprExpecting(a, DYN));
+  // A spread trailing argument (`setTimeout(cb, ms, ...args)`) is
+  // iterated NOW (Node copies the arguments when the timer is set) into
+  // a fresh dyn array; the thunk spreads that captured array into the
+  // callback call at fire time.
+  const spreadAt: number[] = [];
+  const args = argNodes.map((a, i) => {
+    if (!ts.isSpreadElement(a)) return lowerer.lowerExprExpecting(a, DYN);
+    spreadAt.push(i);
+    return checkedIterableSpread(
+      lowerer,
+      lowerer.coerceInto(a.expression, lowerer.lowerExpr(a.expression), DYN),
+      ts.getTextOfNode(a.expression),
+      loc,
+    );
+  });
   const n = args.length;
   const toT: IrType = { kind: "func", params: [], ret: VOID };
-  const key = `timer.argsthunk:${n}`;
+  const key = `timer.argsthunk:${n}${spreadAt.length > 0 ? `:s${spreadAt.join(",")}` : ""}`;
   const existing = lowerer.arrHofHelpers.get(key);
   const name = existing ?? keyedHelperName(lowerer, "%timer.argsthunk", key);
   if (!existing) {
@@ -233,6 +248,9 @@ function makeTimerArgsThunk(
             args: args.map(
               (_, i) => ({ kind: "varRef", localId: `a${i}.0`, type: DYN, loc }) as IrExpr,
             ),
+            ...(spreadAt.length > 0
+              ? { spreads: spreadAt.map((arg) => ({ arg, what: "arguments" })) }
+              : {}),
             type: DYN,
             loc,
           },
@@ -409,6 +427,20 @@ function lowerTimerCall(
         type: F64,
         loc,
       };
+    }
+    // An optional delay (`timeout?: number`): undefined is Node's NaN.
+    if (ms.type.kind === "union") {
+      const arms = lowerer.unions.get(ms.type.unionId)?.arms ?? [];
+      const present = arms.filter((arm) => !isUnitType(arm));
+      if (present.length === 1 && present[0]!.kind === "f64") {
+        ms = {
+          kind: "nullish",
+          left: ms,
+          right: { kind: "numLit", value: NaN, type: F64, loc },
+          type: F64,
+          loc,
+        };
+      }
     }
     if (member === "setInterval") {
       return { kind: "libCall", fn: "timers.setInterval", args: [cb, ms], type: F64, loc };

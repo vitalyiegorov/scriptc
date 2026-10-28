@@ -47,6 +47,8 @@ import {
   runtimeOptionalUseOf,
 } from "../lower-exprs.js";
 import { isConstAssertionTypeNode, unitOnlyUnion } from "../../type-mapper.js";
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
+import { isProtocolRecord } from "../proxy-flow.js";
 import { assertsGlobalObject, extractionCopiesReference } from "../assertion-identity.js";
 import { iterableSlotValue, iterableUnionOf } from "../iterable-values.js";
 import { isDeclBoundaryTypeNode } from "../../decl-projection.js";
@@ -171,8 +173,19 @@ export function lowerTernary(
     // with nested empty-array branches. Carry the whole record layout
     // through those branches before constructing their fresh fields.
     const ownJoin = lowerer.mapTypeOf(lowerer.typeOf(expr));
+    // A destructuring pattern's `[any, any]` context says nothing about the
+    // positions: the checker's own tuple join decides them.
+    const anyPatternTuple = (type: IrType | null): boolean => {
+      if (type?.kind !== "record") return false;
+      const shape = lowerer.shapes.get(type.shapeId);
+      return shape?.tuple === true && shape.fields.every((field) => field.type.kind === "dyn");
+    };
     const recordJoin =
-      ctxMapped?.kind === "record" ? ctxMapped : ownJoin?.kind === "record" ? ownJoin : undefined;
+      ctxMapped?.kind === "record" && !(anyPatternTuple(ctxMapped) && ownJoin?.kind === "record")
+        ? ctxMapped
+        : ownJoin?.kind === "record"
+          ? ownJoin
+          : undefined;
     const lowerArm = (e: ts.Expression, siblingType?: IrType): IrExpr => {
       let fresh = e;
       while (ts.isParenthesizedExpression(fresh)) fresh = fresh.expression;
@@ -183,6 +196,13 @@ export function lowerTernary(
       }
       const lit = armLiteral(e);
       if (lit && ctxArray) return lowerer.lowerArrayLiteral(lit, ctxArray);
+      // A tuple literal arm builds as the join's tuple layout: tsc joined
+      // the arms' tuple types into one (`[string, undefined] |
+      // [string | undefined, T | undefined]` reduces to the second), and an
+      // arm lowered alone would take a destructuring pattern's `any`
+      // positions instead.
+      if (lit && recordJoin && lowerer.shapes.get(recordJoin.shapeId)?.tuple === true)
+        return lowerer.lowerArrayLiteral(lit, recordJoin);
       if (lit && siblingType?.kind === "array") {
         if (emptyUntypedArrayArm(e)) {
           return { kind: "arrayLit", elems: [], type: siblingType, loc: locOf(lit) };
@@ -391,6 +411,24 @@ export function lowerTernary(
  * the same union (unnarrowed use), to a SUB-union (partial narrowing —
  * unrepresentable without a re-tag), or to nothing (`never` in an
  * exhaustive default) leaves the expression union-typed. */
+function narrowsDynToClass(
+  lowerer: Lowerer,
+  node: ts.Identifier,
+  narrowed: IrType & { kind: "object" },
+): boolean {
+  if (!isProvenanceSourceFile(ts.getSourceFileOfNode(node).fileName)) return false;
+  if (!isDynTypedRefType(narrowed)) return false;
+  const info = lowerer.classes.get(narrowed.className);
+  if (!info || info.def.runtime || info.builtinError || info.builtinEmitter || info.builtinStream)
+    return false;
+  // Only a flow narrowing: the binding's declared type is not the class.
+  const symbol = lowerer.checker.getSymbolAtLocation(node);
+  if (!symbol) return false;
+  const declared = lowerer.checker.getTypeOfSymbol(symbol);
+  const here = lowerer.typeOf(node);
+  return declared !== here && !(declared.flags & ts.TypeFlags.Any);
+}
+
 export function maybeNarrow(lowerer: Lowerer, expr: IrExpr, node: ts.Node): IrExpr {
   if (
     (expr.type.kind === "union" || expr.type.kind === "dyn") &&
@@ -586,6 +624,17 @@ export function maybeNarrow(lowerer: Lowerer, expr: IrExpr, node: ts.Node): IrEx
     if (narrowed?.kind === "object" && narrowed.className === "%Error") {
       return { kind: "dynCheck", value: expr, type: narrowed, loc: expr.loc };
     }
+    // An `instanceof C` narrow of a checked-dynamic binding in a dependency's
+    // shipped TypeScript: after the guard the value is a class instance, so
+    // the read extracts the native view once (the cast accepts subclasses and
+    // preserves identity) and members and arguments stay native instead of
+    // crossing back through boxes.
+    if (
+      narrowed?.kind === "object" &&
+      ts.isIdentifier(node) &&
+      narrowsDynToClass(lowerer, node, narrowed)
+    )
+      return { kind: "dynCheck", value: expr, type: narrowed, loc: expr.loc };
     return expr;
   }
   // instanceof narrowing for classes: tsc types this USE as a subclass of
@@ -1379,9 +1428,29 @@ export function lowerAsExpression(
     if (!bridged) lowerer.unsupported("SC1063", expr);
   }
   const inner = lowerer.lowerExpr(expr.expression);
+  // A package cast of an untyped value to a protocol (a methods-only
+  // interface) is unchecked in JavaScript: the members are probed later.
+  // The value stays checked-dynamic (see declaredReturnType).
+  if (
+    inner.type.kind === "dyn" &&
+    isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName) &&
+    isProtocolRecord(lowerer, lowerer.mapTypeOf(lowerer.typeOf(expr)))
+  )
+    return inner;
   const use = runtimeOptionalUseOf(expr);
   if (inner.type.kind === "union" && runtimeOptionalAssertionErases(lowerer, expr, inner, use))
     return inner;
+  // A package's `(logger as boolean) !== true` over a value that is in fact
+  // another arm: the assertion checks nothing in TypeScript's emit, and the
+  // equality compares the value as it is.
+  if (
+    (inner.type.kind === "union" || inner.type.kind === "dyn") &&
+    isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName) &&
+    isEqualityOperandOf(expr)
+  ) {
+    const asserted = lowerer.mapTypeOf(lowerer.checker.getTypeFromTypeNode(expr.type));
+    if (asserted !== null && asserted.kind !== "union") return inner;
+  }
   if (inner.type.kind !== "dyn") {
     const targetTs0 = lowerer.checker.getTypeFromTypeNode(expr.type);
     const target = lowerer.mapTypeOf(targetTs0);
@@ -1693,4 +1762,18 @@ function declBoundaryCast(
     type: target,
     loc,
   };
+}
+
+/** An operand of `===`, `!==`, `==` or `!=` (through parentheses). */
+function isEqualityOperandOf(node: ts.Expression): boolean {
+  let outer: ts.Expression = node;
+  while (ts.isParenthesizedExpression(outer.parent)) outer = outer.parent;
+  const parent = outer.parent;
+  return (
+    ts.isBinaryExpression(parent) &&
+    (parent.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+      parent.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken ||
+      parent.operatorToken.kind === ts.SyntaxKind.EqualsEqualsToken ||
+      parent.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsToken)
+  );
 }

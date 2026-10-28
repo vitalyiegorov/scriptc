@@ -52,6 +52,7 @@ import { runtimeOptionalReceiverRead } from "./narrowing.js";
 import { iterableUnionOf } from "../iterable-values.js";
 import { builtinGlobalValueAt } from "./property-access.js";
 import { varRef } from "../../../ir/build.js";
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
 import {
   ambientUndefReadType,
   ambientUndefinedFnSymbolOf,
@@ -468,7 +469,27 @@ export function lowerIdentifierExpr(lowerer: Lowerer, expr: ts.Identifier, loc: 
     // instantiation expression) names the instance; unpinned
     // references fence inside (lowerGenericFnValue).
     const gfn = lowerer.genericFnOf(expr);
-    if (gfn) return lowerer.lowerGenericFnValue(expr, gfn);
+    if (gfn) {
+      // A generic function whose class extends its parameter, pinned at
+      // an `any` base (a legacy class decorator `return class extends
+      // target {}`), would extend a runtime value, which cannot
+      // initialize a native base class.
+      const pinned = lowerer.checker.getContextualType(expr);
+      const base = pinned
+        ? lowerer.checker.getCallSignatures(pinned)[0]?.getParameters()[0]
+        : undefined;
+      if (
+        base &&
+        (lowerer.checker.getTypeOfSymbol(base).flags & ts.TypeFlags.Any) !== 0 &&
+        extendsOwnParameter(lowerer, gfn.decl)
+      )
+        lowerer.unsupported(
+          "SC1090",
+          expr,
+          `the generic function '${expr.text}' as a value whose class extends its untyped parameter (such as a class decorator returning 'class extends target')`,
+        );
+      return lowerer.lowerGenericFnValue(expr, gfn);
+    }
   }
   // A CJS export-table ACCESSOR read (`tmpdir.path`, or a destructured
   // binding aliasing one): the getter is a real function of module
@@ -708,7 +729,13 @@ export function lowerIdentifierExpr(lowerer: Lowerer, expr: ts.Identifier, loc: 
   }
   if (lowerer.isStdlibGlobal(expr, "ArrayBuffer"))
     return { kind: "libCall", fn: "arrayBuffer.constructor", args: [], type: DYN, loc };
-  if (isJsSourceFile(ts.getSourceFileOfNode(expr)) && lowerer.isStdlibGlobal(expr, "Array"))
+  // TypeScript reads it only into an `any` slot (`design:type` metadata
+  // for an array-typed decorated member).
+  if (
+    lowerer.isStdlibGlobal(expr, "Array") &&
+    (isJsSourceFile(ts.getSourceFileOfNode(expr)) ||
+      ((lowerer.checker.getContextualType(expr)?.flags ?? 0) & ts.TypeFlags.Any) !== 0)
+  )
     return { kind: "libCall", fn: "dyn.arrayConstructor", args: [], type: DYN, loc };
   if (
     Object.values(BYTES_ELEMENT_NAME).includes(expr.text) &&
@@ -783,6 +810,16 @@ export function lowerIdentifierExpr(lowerer: Lowerer, expr: ts.Identifier, loc: 
     if (isJsSourceFile(ts.getSourceFileOfNode(expr)))
       return { kind: "libCall", fn: "buffer.constructor", args: [], type: DYN, loc };
     return { kind: "strLit", value: "[builtin Buffer]", type: STRING, loc };
+  }
+  if (nativeAlias !== null && nativeAlias !== expr.text) {
+    const value = builtinGlobalValueAt(
+      lowerer,
+      expr,
+      nativeAlias,
+      loc,
+      isJsSourceFile(ts.getSourceFileOfNode(expr)),
+    );
+    if (value !== null) return value;
   }
   if (lowerer.isStdlibGlobal(expr, "fetch")) {
     return { kind: "libCall", fn: "fetch.function", args: [], type: DYN, loc };
@@ -1058,6 +1095,18 @@ export function lowerIdentifierExpr(lowerer: Lowerer, expr: ts.Identifier, loc: 
       );
     }
   }
+  // A name NOTHING declares, in a dependency's shipped TypeScript (its
+  // checker diagnostics are suppressed — the DOM globals rxjs reads, such
+  // as requestAnimationFrame): Node throws the catchable ReferenceError
+  // "<name> is not defined" when the read executes, and so does this.
+  if (
+    lowerer.resolveValueSymbol(expr) === null &&
+    lowerer.checker.getSymbolAtLocation(expr) === undefined &&
+    isProvenanceSourceFile(ts.getSourceFileOfNode(expr).fileName)
+  ) {
+    const t = ambientUndefReadType(lowerer, expr) ?? contextualUndefReadType(lowerer, expr) ?? DYN;
+    return nsUndefRead(lowerer, expr.text, expr, t);
+  }
   // Preflight guarantees no unresolved identifiers; anything else here
   // is a blocked declaration's binding (the SC2004 cascade) or a
   // binding form we don't model yet.
@@ -1065,6 +1114,29 @@ export function lowerIdentifierExpr(lowerer: Lowerer, expr: ts.Identifier, loc: 
     expr,
     `the reference to '${expr.text}' (a binding form with no lowering)`,
   );
+}
+
+/** A class in the function's body extends one of its own parameters. */
+function extendsOwnParameter(lowerer: Lowerer, fn: ts.SignatureDeclaration): boolean {
+  const parameters = new Set(
+    fn.parameters.nodes.map((parameter) => lowerer.checker.getSymbolAtLocation(parameter.name)),
+  );
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isHeritageClause(node) && node.token === ts.SyntaxKind.ExtendsKeyword) {
+      const base = node.types.nodes[0]?.expression;
+      if (
+        base &&
+        ts.isIdentifier(base) &&
+        parameters.has(lowerer.checker.getSymbolAtLocation(base))
+      )
+        found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(fn);
+  return found;
 }
 
 function moduleFileName(lowerer: Lowerer, sf: ts.SourceFile): string {

@@ -221,7 +221,8 @@ function scanSites(statements: IrStmt[]): FunctionSites {
         case "call":
           if (
             (expr.callee === "%dyn.class.properties" ||
-              expr.callee === "%dyn.class.readProperties") &&
+              expr.callee === "%dyn.class.readProperties" ||
+              expr.callee === "%dyn.class.readOwnProperties") &&
             expr.args[0]?.kind === "dynFrom" &&
             isDynTypedRefType(expr.args[0].value.type)
           )

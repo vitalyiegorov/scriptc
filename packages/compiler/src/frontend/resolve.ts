@@ -27,7 +27,7 @@ import {
   packageShimFor,
   throughBundledShimForwarder,
 } from "./package-shims.js";
-import { provenanceEntryFor } from "./provenance-registry.js";
+import { provenanceEntryFor, resolutionDirOf } from "./provenance-registry.js";
 import {
   trackedAccessibleEntries,
   trackedDirectoryExists,
@@ -963,7 +963,7 @@ export function resolveBareModule(
   };
 
   const passOnce = (pass: ResolutionPass): BareResolution | null => {
-    for (let dir = dirname(resolve(fromFile)); ;) {
+    for (let dir = resolutionDirOf(resolve(fromFile)); ;) {
       const nm = join(dir, "node_modules");
       if (isDirectory(nm)) {
         // 1. The package directory.
@@ -1000,7 +1000,7 @@ export function resolveBareModule(
  * the nearest node_modules/<dirName>/package.json declares when it
  * differs from the directory name, else null. */
 function aliasedPackageOf(fromFile: string, dirName: string): string | null {
-  for (let dir = dirname(resolve(fromFile)); ;) {
+  for (let dir = resolutionDirOf(resolve(fromFile)); ;) {
     const pkgDir = join(dir, "node_modules", dirName);
     if (isDirectory(pkgDir)) {
       const name = pkgJsonOf(pkgDir)?.name;

@@ -575,7 +575,16 @@ export class CheckerFacade {
     this.autoPrefetch(node, "types");
     if (this.cache.typeAtLocation.has(node))
       return this.cache.typeAtLocation.get(node) ?? this.anyType();
-    const type = this.raw.getTypeAtLocation(node);
+    // The direct (memo-miss) path wears the sweep's panic fence, as
+    // getTypeOfSymbol does: nodes outside TYPE_PREFETCH_KINDS reach the
+    // server here first (observed: GetTypeAtLocation's TupleType
+    // conversion on the `[]` of `entries[0] ?? []`, a tuple-typed element
+    // access defaulted to an empty array literal), and the fence's answer
+    // is the sweep's — undefined, presented as `any`.
+    const [type] = withPanicFence(
+      [node],
+      (c) => this.raw.getTypeAtLocation(c) as (Type | undefined)[],
+    );
     this.cache.typeAtLocation.set(node, type);
     return type ?? this.anyType();
   }

@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8565-unassigned-union-field-read/main.ts"
+ ],
+ "diags": []
+}

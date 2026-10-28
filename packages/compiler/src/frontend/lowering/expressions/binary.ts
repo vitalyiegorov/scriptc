@@ -23,11 +23,13 @@ import {
   UNDEFINED_T,
   VOID,
   canBoxFuncIntoDyn,
+  isDynTypedRefType,
   isUnitType,
   typeEquals,
   typeKey,
 } from "../../../ir/ir.js";
 import { isSafeToDiscard, isSafeToRepeat } from "./evaluation-safety.js";
+import { classInstanceOf } from "../class-dynamic-dispatch.js";
 import {
   bigintCompoundValue,
   compoundUnsupported,
@@ -334,6 +336,95 @@ function isMemberReceiver(node: ts.Expression): boolean {
   );
 }
 
+/** `const { a, b } = record ?? {}`: the destructuring reads every member as
+ * possibly absent, so the record is copied into the same shape with each
+ * member's type holding undefined (the empty default has them all absent).
+ * The copy is invisible: only the pattern reads it. Null for any other
+ * use of `?? {}`. */
+function destructuredEmptyFallback(
+  lowerer: Lowerer,
+  expr: ts.BinaryExpression,
+  left: IrExpr,
+  arms: readonly IrType[],
+  loc: SrcLoc,
+): IrExpr | null {
+  if (left.type.kind !== "union") return null;
+  const leftType = left.type;
+  let right: ts.Expression = expr.right;
+  while (ts.isParenthesizedExpression(right)) right = right.expression;
+  if (!ts.isObjectLiteralExpression(right) || right.properties.nodes.length !== 0) return null;
+  let outer: ts.Node = expr;
+  while (outer.parent !== undefined && ts.isParenthesizedExpression(outer.parent))
+    outer = outer.parent;
+  const declaration = outer.parent;
+  if (
+    declaration === undefined ||
+    !ts.isVariableDeclaration(declaration) ||
+    declaration.initializer !== outer ||
+    !ts.isObjectBindingPattern(declaration.name)
+  )
+    return null;
+  const present = arms.flatMap((arm, tag) => (isUnitType(arm) ? [] : [{ arm, tag }]));
+  if (present.length !== 1 || present[0]!.arm.kind !== "record") return null;
+  const source = present[0]!.arm;
+  const shape = lowerer.shapes.get(source.shapeId);
+  if (!shape || shape.tuple || shape.indexValue !== undefined) return null;
+  const types = shape.fields.map((field) => lowerer.withUndefinedArmOf(field.type));
+  if (types.some((t) => t === null)) return null;
+  const widened: IrType = {
+    kind: "record",
+    shapeId: lowerer.shapes.intern(
+      shape.fields.map((field, i) => ({ name: field.name, type: types[i]! })),
+    ),
+  };
+  return nullishBranches(
+    lowerer,
+    left,
+    leftType,
+    arms,
+    widened,
+    loc,
+    () => ({
+      kind: "recordLit",
+      fields: shape.fields.map((field, i) => ({
+        name: field.name,
+        value: lowerer.wrappedUndefined(types[i]!, loc)!,
+      })),
+      type: widened,
+      loc,
+    }),
+    (stable) => {
+      const narrowed: IrExpr = {
+        kind: "unionNarrow",
+        unionId: leftType.unionId,
+        tag: present[0]!.tag,
+        value: stable,
+        type: source,
+        loc,
+      };
+      return {
+        kind: "recordLit",
+        fields: shape.fields.map((field, i) => ({
+          name: field.name,
+          value: lowerer.coerceToExpected(
+            {
+              kind: "recordGet",
+              obj: narrowed,
+              shapeId: source.shapeId,
+              field: field.name,
+              type: field.type,
+              loc,
+            },
+            types[i]!,
+          ),
+        })),
+        type: widened,
+        loc,
+      };
+    },
+  );
+}
+
 export function lowerNullishPair(
   lowerer: Lowerer,
   expr: ts.BinaryExpression,
@@ -346,7 +437,7 @@ export function lowerNullishPair(
     // Both sides live in the checked-dynamic tree — the right converts through
     // the usual boundary and evaluates lazily in its branch; a default
     // with no dyn representation keeps the fence.
-    const right = lowerer.coerceToExpected(lowerer.lowerExpr(expr.right), DYN);
+    const right = lowerer.coerceToExpected(lowerer.lowerExprExpecting(expr.right, DYN), DYN);
     if (right.type.kind !== "dyn") {
       lowerer.unsupported(
         "SC1100",
@@ -367,6 +458,8 @@ export function lowerNullishPair(
   // arm that has no first-class union representation.
   const fresh = rest.length === 1 ? lowerer.emptyCollectionFor(expr.right, rest[0]!) : null;
   if (fresh) return { kind: "nullish", left, right: fresh, type: fresh.type, loc };
+  const widenedRecord = destructuredEmptyFallback(lowerer, expr, left, def.arms, loc);
+  if (widenedRecord) return widenedRecord;
   let type = lowerer.irTypeOf(expr);
   // A runtime-optional read can reach the default even when declarations
   // call the left side present. Preserve a differently typed primitive
@@ -1537,6 +1630,43 @@ export function lowerBinary(lowerer: Lowerer, expr: ts.BinaryExpression): IrExpr
       const dynSide = left.type.kind === "dyn" ? left : right;
       const scalarSide = dynSide === left ? right : left;
       const reference = scalarSide.type;
+      // A checked-dynamic value against a class instance: the capsule test
+      // and one identity compare on the extracted instance, instead of
+      // boxing the instance into a fresh capsule for the runtime's compare.
+      if (
+        reference.kind === "object" &&
+        dynSide.type.kind === "dyn" &&
+        !isJsSourceFile(expr.getSourceFile()) &&
+        isDynTypedRefType(reference) &&
+        isSafeToRepeat(dynSide) &&
+        isSafeToRepeat(scalarSide)
+      ) {
+        const info = lowerer.classes.get(reference.className);
+        if (
+          info &&
+          !info.def.runtime &&
+          !info.builtinError &&
+          !info.builtinEmitter &&
+          !info.builtinStream
+        ) {
+          const same: IrExpr = {
+            kind: "ternary",
+            cond: classInstanceOf(lowerer, dynSide, info, loc),
+            then: {
+              kind: "bin",
+              op: "===",
+              left: { kind: "dynCheck", value: dynSide, type: reference, loc },
+              right: scalarSide,
+              type: BOOL,
+              loc,
+            },
+            else_: { kind: "boolLit", value: false, type: BOOL, loc },
+            type: BOOL,
+            loc,
+          };
+          return negated ? { kind: "unary", op: "!", operand: same, type: BOOL, loc } : same;
+        }
+      }
       if (
         (reference.kind === "object" ||
           reference.kind === "record" ||
@@ -2582,6 +2712,19 @@ function lowerLogicalChain(lowerer: Lowerer, expr: ts.BinaryExpression): IrExpr 
   return result;
 }
 
+/** An operand the checked-dynamic logical operator takes back into the
+ * dynamic tree: a typed read that was only a checked view of a dynamic value
+ * (`fn.name`, typed `string` by the library but absent on a symbol or a
+ * string at run time) contributes the dynamic value itself, so an undefined
+ * property falls through to the other operand as in JavaScript. */
+function uncheckedDynOperand(operand: IrExpr): IrExpr {
+  return operand.kind === "dynFrom" &&
+    operand.value.kind === "dynCheck" &&
+    operand.value.value.type.kind === "dyn"
+    ? operand.value.value
+    : operand;
+}
+
 function lowerLogicalPair(lowerer: Lowerer, expr: ts.BinaryExpression, left: IrExpr): IrExpr {
   const op = expr.operatorToken.kind;
   const loc = locOf(expr);
@@ -2620,8 +2763,8 @@ function lowerLogicalPair(lowerer: Lowerer, expr: ts.BinaryExpression, left: IrE
     // (scr_dyn_truthy) — JS value semantics exactly, result dyn. The
     // non-dyn side converts through the usual boundary; a value with
     // no dyn representation keeps the fence.
-    const l = lowerer.coerceToExpected(left, DYN);
-    const r = lowerer.coerceToExpected(right, DYN);
+    const l = uncheckedDynOperand(lowerer.coerceToExpected(left, DYN));
+    const r = uncheckedDynOperand(lowerer.coerceToExpected(right, DYN));
     if (l.type.kind !== "dyn" || r.type.kind !== "dyn") {
       lowerer.unsupported("SC1100", expr, "logical operators on 'unknown' values");
     }

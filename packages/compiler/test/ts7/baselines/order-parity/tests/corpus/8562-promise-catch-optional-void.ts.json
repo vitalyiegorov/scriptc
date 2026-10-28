@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8562-promise-catch-optional-void.ts"
+ ],
+ "diags": []
+}

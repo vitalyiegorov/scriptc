@@ -31,11 +31,41 @@
  * ordinary build, where this expands to nothing. */
 #ifdef SCR_JS_TIER
 #define SCR_JS_SHAPE_RESET(d) ((d)->v.obj.shape = NULL)
+#define SCR_JS_SHAPE_APPEND(d, key, len) scr_js_shape_append(d, key, len)
 #else
 #define SCR_JS_SHAPE_RESET(d) ((void)0)
+#define SCR_JS_SHAPE_APPEND(d, key, len) ((void)0)
 #endif
 
 static SCR_TL ScrDyn *scr_builtin_object_prototype;
+
+#ifdef SCR_MAP_CLASS
+static SCR_TL ScrDyn *scr_map_class_storage_callback;
+
+static void scr_map_class_storage_cleanup(void) {
+  ScrDyn *callback = scr_map_class_storage_callback;
+  scr_map_class_storage_callback = NULL;
+  scr_dyn_release(callback);
+}
+
+void scr_map_class_storage_install(ScrDyn *callback) {
+  if (!scr_map_class_storage_callback) scr_atexit(scr_map_class_storage_cleanup);
+  scr_dyn_release(scr_map_class_storage_callback);
+  scr_map_class_storage_callback = scr_dyn_retain(callback);
+}
+
+ScrDyn *scr_dyn_map_class_storage(const ScrDyn *value) {
+  if (!value) return NULL;
+  if (value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_MAP)
+    return scr_dyn_retain((ScrDyn *)value);
+  if (!scr_map_class_storage_callback || value->kind != SCR_DYN_TYPED_REF) return NULL;
+  ScrDyn *args[] = { (ScrDyn *)value };
+  ScrDyn *storage = scr_dyn_call(scr_map_class_storage_callback, args, 1, "Map");
+  if (storage && storage->kind == SCR_DYN_HANDLE && storage->v.handle.tag == SCR_DYNH_MAP) return storage;
+  scr_dyn_release(storage);
+  return NULL;
+}
+#endif
 
 const ScrDateClassHooks *scr_date_class_hooks = NULL;
 
@@ -802,6 +832,8 @@ bool scr_dyn_array_prototype_element_fence(const ScrDyn *recv) {
 #define SCR_DYN_KEY_SHARE_LENGTH 64
 typedef struct {
   size_t rc;
+  uint32_t hash;   /* atoms only */
+  uint32_t length; /* atoms only */
   char bytes[];
 } ScrDynKey;
 typedef struct {
@@ -820,7 +852,85 @@ static size_t scr_dyn_key_slot(const char *key, size_t length) {
   return hash % SCR_DYN_KEY_SHARE_SLOTS;
 }
 
-static char *scr_dyn_key_copy(const char *key, size_t length) {
+/* Short keys are interned as atoms, as every JS engine does: one immortal
+ * ScrDynKey per spelling, found through a process-wide open-addressed table
+ * that is only ever inserted into (compare-and-swap, so threads share it
+ * and never wait). An atom's count is pinned at SCR_DYN_ATOM_RC, so holders
+ * neither count it nor release it, a node that holds only atoms frees
+ * without visiting its keys (scr_dyn_obj_drop_keys), and equal spellings
+ * are one pointer. The table is bounded: once SCR_DYN_ATOM_MAX spellings
+ * exist, further keys are ordinary counted keys. Its static storage keeps
+ * the atoms reachable for leak checkers, and they are never freed. */
+#define SCR_DYN_ATOM_RC ((size_t)1 << (sizeof(size_t) * 8 - 1))
+#define SCR_DYN_ATOM_SLOTS 16384
+#define SCR_DYN_ATOM_MAX (SCR_DYN_ATOM_SLOTS / 2)
+static ScrDynKey *scr_dyn_atoms[SCR_DYN_ATOM_SLOTS];
+static size_t scr_dyn_atom_count;
+
+static inline bool scr_dyn_key_is_atom(const char *key) {
+  return ((const ScrDynKey *)(key - offsetof(ScrDynKey, bytes)))->rc >= SCR_DYN_ATOM_RC;
+}
+
+/* A new reference to a key's bytes (the key may be an atom). */
+static inline void scr_dyn_key_retain(char *key) {
+  ScrDynKey *owned = (ScrDynKey *)(key - offsetof(ScrDynKey, bytes));
+  if (owned->rc < SCR_DYN_ATOM_RC) owned->rc++;
+}
+
+/* The atom for a short spelling, or NULL when the table is full. */
+static __attribute__((noinline)) ScrDynKey *scr_dyn_atom_intern(const char *key, size_t length) {
+  uint32_t hash = (uint32_t)scr_key_hash(key, length);
+  ScrDynKey *fresh = NULL;
+  for (size_t slot = hash & (SCR_DYN_ATOM_SLOTS - 1);; slot = (slot + 1) & (SCR_DYN_ATOM_SLOTS - 1)) {
+    ScrDynKey *found = __atomic_load_n(&scr_dyn_atoms[slot], __ATOMIC_ACQUIRE);
+    if (!found) {
+      if (!fresh) {
+        if (__atomic_load_n(&scr_dyn_atom_count, __ATOMIC_RELAXED) >= SCR_DYN_ATOM_MAX) return NULL;
+        fresh = malloc(sizeof *fresh + length + 1);
+        if (!fresh) scr_json_oom();
+        fresh->rc = SCR_DYN_ATOM_RC;
+        fresh->hash = hash;
+        fresh->length = (uint32_t)length;
+        memcpy(fresh->bytes, key, length);
+        fresh->bytes[length] = '\0';
+      }
+      if (__atomic_compare_exchange_n(&scr_dyn_atoms[slot], &found, fresh, false, __ATOMIC_RELEASE,
+                                      __ATOMIC_ACQUIRE)) {
+        __atomic_fetch_add(&scr_dyn_atom_count, 1, __ATOMIC_RELAXED);
+        return fresh;
+      }
+      /* Another thread took the slot first; look at what it put there. */
+    }
+    if (found->hash == hash && found->length == length && !memcmp(found->bytes, key, length)) {
+      free(fresh);
+      return found;
+    }
+  }
+}
+
+/* The copy of `key`; `*counted` is set when the result is a counted key
+ * (not an atom), which the holding object must visit when it dies. */
+/* The atoms recently found for a spelling, by the address it came from: the
+ * names the runtime and compiled code pass over and over are literals. The
+ * slot only chooses where to look; the atom's bytes are compared before it
+ * answers, so a buffer reused for another spelling cannot confuse it. */
+#define SCR_DYN_ATOM_CACHE_SLOTS 64
+static SCR_TL ScrDynKey *scr_dyn_atom_cache[SCR_DYN_ATOM_CACHE_SLOTS];
+
+static char *scr_dyn_key_copy_flag(const char *key, size_t length, bool *counted) {
+  if (length <= SCR_DYN_KEY_SHARE_LENGTH) {
+    size_t cached = (((uintptr_t)key >> 3) ^ length) & (SCR_DYN_ATOM_CACHE_SLOTS - 1);
+    ScrDynKey *atom = scr_dyn_atom_cache[cached];
+    if (!atom || atom->length != length || memcmp(atom->bytes, key, length) != 0) {
+      atom = scr_dyn_atom_intern(key, length);
+      if (atom) scr_dyn_atom_cache[cached] = atom;
+    }
+    if (atom) {
+      *counted = false;
+      return atom->bytes;
+    }
+  }
+  *counted = true;
   ScrDynKeySlot *slot = length <= SCR_DYN_KEY_SHARE_LENGTH
     ? &scr_dyn_keys[scr_dyn_key_slot(key, length)] : NULL;
   if (slot && slot->key && slot->length == length &&
@@ -841,9 +951,15 @@ static char *scr_dyn_key_copy(const char *key, size_t length) {
   return owned->bytes;
 }
 
+static char *scr_dyn_key_copy(const char *key, size_t length) {
+  bool counted;
+  return scr_dyn_key_copy_flag(key, length, &counted);
+}
+
 static void scr_dyn_key_release(char *key, size_t length) {
   if (!key) return;
   ScrDynKey *owned = (ScrDynKey *)(key - offsetof(ScrDynKey, bytes));
+  if (owned->rc >= SCR_DYN_ATOM_RC) return;
   if (--owned->rc) return;
   if (length <= SCR_DYN_KEY_SHARE_LENGTH) {
     ScrDynKeySlot *slot = &scr_dyn_keys[scr_dyn_key_slot(key, length)];
@@ -878,25 +994,37 @@ static SCR_TL size_t scr_dyn_cached_key_bytes;
  * them back without walking its slots. */
 static size_t scr_dyn_obj_drop_keys(ScrDyn *d, bool cache) {
   size_t kept = 0;
+  /* Atoms need no release and no pooling: a node whose slots hold none
+   * but atoms is done. */
+  if (!d->v.obj.rc_keys) return 0;
+#ifndef SCR_RC_AUDIT
+  /* The key cache's budget is read once and written back once. */
+  bool can_cache = cache && d->v.obj.cap <= SCR_DYN_KEY_CACHE_SLOTS;
+  size_t budget = SCR_DYN_KEY_CACHE_MAX - scr_dyn_cached_key_bytes;
+#else
+  (void)cache;
+#endif
   for (size_t i = 0; i < d->v.obj.cap; i++) {
     ScrDynEntry *entry = &d->v.obj.entries[i];
-    if (!entry->key) continue;
+    if (!entry->key || scr_dyn_key_is_atom(entry->key)) continue;
 #ifndef SCR_RC_AUDIT
-    size_t bytes = sizeof(ScrDynKey) + entry->key_len + 1;
-    if (cache && d->v.obj.cap <= SCR_DYN_KEY_CACHE_SLOTS &&
-        entry->key_len <= SCR_DYN_KEY_CACHE_LENGTH &&
-        bytes <= SCR_DYN_KEY_CACHE_MAX - scr_dyn_cached_key_bytes) {
-      scr_dyn_cached_key_bytes += bytes;
-      kept += bytes;
-      continue;
+    if (can_cache && entry->key_len <= SCR_DYN_KEY_CACHE_LENGTH) {
+      size_t bytes = sizeof(ScrDynKey) + entry->key_len + 1;
+      if (bytes <= budget) {
+        budget -= bytes;
+        kept += bytes;
+        continue;
+      }
     }
-#else
-    (void)cache;
 #endif
     scr_dyn_key_release(entry->key, entry->key_len);
     entry->key = NULL;
     entry->key_len = 0;
   }
+#ifndef SCR_RC_AUDIT
+  scr_dyn_cached_key_bytes += kept;
+#endif
+  d->v.obj.rc_keys = kept != 0;
   return kept;
 }
 
@@ -1069,7 +1197,19 @@ static void scr_dyn_region_leave(ScrDyn *d) {
   *slot = NULL;
 }
 
+#ifdef SCR_STATS
+#define SCR_STAT_DYN_ALLOC(kind)                                                                   \
+  ((kind) == SCR_DYN_OBJ    ? SCR_STAT(dyn_alloc_object)                                           \
+   : (kind) == SCR_DYN_ARR  ? SCR_STAT(dyn_alloc_array)                                            \
+   : (kind) == SCR_DYN_FUNC ? SCR_STAT(dyn_alloc_closure)                                          \
+   : (kind) == SCR_DYN_STR  ? SCR_STAT(dyn_alloc_string)                                           \
+                            : SCR_STAT(dyn_alloc_box))
+#else
+#define SCR_STAT_DYN_ALLOC(kind) ((void)0)
+#endif
+
 static ScrDyn *scr_dyn_alloc(ScrDynKind kind) {
+  SCR_STAT_DYN_ALLOC(kind);
 #ifndef SCR_RC_AUDIT
   ScrDyn **list = kind == SCR_DYN_ARR   ? &scr_dyn_free_arr
                   : kind == SCR_DYN_OBJ ? &scr_dyn_free_obj
@@ -1114,6 +1254,7 @@ static ScrDyn *scr_dyn_alloc(ScrDynKind kind) {
   }
 #endif
   static ScrCycType cyc_type = { &scr_dyn_trace_v, &scr_dyn_gcfree, SCR_CYC_KIND_DYN };
+  SCR_STAT(dyn_alloc_fresh);
   ScrDyn *fresh = scr_cyc_alloc_inline(sizeof *fresh, &cyc_type);
   if (!fresh) scr_json_oom();
   fresh->rc = 1;
@@ -1138,6 +1279,7 @@ static ScrDyn *scr_dyn_alloc(ScrDynKind kind) {
  * through the misc pool without the generic disposal and reset. Every
  * pooled node has a NULL prototype and symbol tables. */
 static inline ScrDyn *scr_dyn_leaf_alloc(ScrDynKind kind) {
+  SCR_STAT_DYN_ALLOC(kind);
 #ifndef SCR_RC_AUDIT
   ScrDyn *d = scr_dyn_free_misc;
   if (d) {
@@ -1158,15 +1300,72 @@ static inline ScrDyn *scr_dyn_leaf_alloc(ScrDynKind kind) {
   return scr_dyn_alloc(kind);
 }
 
+/* A function value's node: scr_dyn_new_func stores every field of the
+ * payload, so the pooled node needs only its header reset (every pooled
+ * node has NULL prototype and symbol tables, see above). */
+static inline ScrDyn *scr_dyn_func_alloc(void) {
+#ifndef SCR_RC_AUDIT
+  ScrDyn *d = scr_dyn_free_misc;
+  if (d) {
+    SCR_STAT(dyn_alloc_closure);
+    scr_dyn_free_misc = (ScrDyn *)d->v.str; /* freelist link */
+    scr_dyn_free_count--;
+    ScrCycHdr *header = scr_cyc_hdr(d);
+    scr_cyc_set_color(header, SCR_CYC_BLACK);
+    scr_cyc_set_gen(header, SCR_CYC_NURSERY);
+    d->rc = 1;
+    d->kind = SCR_DYN_FUNC;
+    d->buffer = false;
+    d->null_proto = false;
+    d->copied_from_native = false;
+    d->non_extensible = false;
+    return d;
+  }
+#endif
+  return scr_dyn_alloc(SCR_DYN_FUNC);
+}
+
 static void scr_dyn_handle_release(void *h, ScrDynHandleTag tag);
 static bool scr_dyn_to_primitive_result_is_object(const ScrDyn *d);
 
 /* Pooled dyn nodes report their disposal to weak collections only: they
  * are never the native records the kept-source table is keyed by. */
+/* Mixed in 64 bits on every target: uintptr_t is 32 bits on wasm32, where
+ * these shifts would exceed its width. */
+static inline size_t scr_weak_mix(uint64_t bits) {
+  bits ^= bits >> 33;
+  bits *= UINT64_C(0xff51afd7ed558ccd);
+  bits ^= bits >> 29;
+  return (size_t)bits;
+}
+static inline size_t scr_weak_key_hash(const void *key) { return scr_weak_mix((uint64_t)(uintptr_t)key); }
+
+/* A bit per hashed key pointer, set when the key is first indexed and
+ * cleared with the table: a disposal of a key that never was a weak key
+ * (almost all of them) skips the probe of a table far larger than a
+ * cache line. */
+#define SCR_WEAK_FILTER_BITS 16
+static SCR_TL uint64_t scr_weak_key_filter[((size_t)1 << SCR_WEAK_FILTER_BITS) / 64];
+static inline size_t scr_weak_filter_bit(const void *key) {
+  /* Only a presence filter: a collision costs the table probe it guards, so
+   * a shift and a fold of the pointer's bits replace the 64-bit mix. */
+  uintptr_t bits = (uintptr_t)key;
+  return ((size_t)(bits >> 4) ^ (size_t)(bits >> 20)) & (((size_t)1 << SCR_WEAK_FILTER_BITS) - 1);
+}
+
 static SCR_TL bool scr_weak_observing;
 static void scr_weak_disposed(void *key);
+/* The filter test is inline: a key that never was a weak key (almost all
+ * of them) pays this test and no call. */
+static inline __attribute__((always_inline)) void scr_weak_dispose_filtered(void *key) {
+  SCR_STAT(weak_disposed);
+  size_t bit = scr_weak_filter_bit(key);
+  if (!(scr_weak_key_filter[bit >> 6] & (UINT64_C(1) << (bit & 63)))) return;
+  SCR_STAT(weak_filter_pass);
+  scr_weak_disposed(key);
+}
 static inline void scr_dyn_weak_dispose(ScrDyn *d) {
-  if (scr_weak_observing) scr_weak_disposed(d);
+  if (scr_weak_observing) scr_weak_dispose_filtered(d);
 }
 
 /* A disposed node's child: most getters, setters, prototypes and symbol
@@ -1175,7 +1374,8 @@ static inline void scr_dyn_release_child(ScrDyn *child) {
   if (child) scr_dyn_release(child);
 }
 
-static void scr_dyn_dispose(ScrDyn *d, bool collected) {
+static inline __attribute__((always_inline)) void scr_dyn_dispose(ScrDyn *d, bool collected) {
+  SCR_STAT(dyn_free);
 #ifndef SCR_RC_AUDIT
   /* A capsule with nothing but its referent and adapters: the common end
    * of a value that crossed into a dyn slot for one call. */
@@ -1190,8 +1390,19 @@ static void scr_dyn_dispose(ScrDyn *d, bool collected) {
     scr_dyn_free_count++;
     return;
   }
+  /* A function value with nothing but its closure: the common end of the
+   * function values a program makes per call. */
+  if (d->kind == SCR_DYN_FUNC && !collected && !d->prototype && !d->symbol_properties &&
+      !d->symbol_keys && scr_dyn_free_count < SCR_DYN_FREE_MAX) {
+    scr_closure_release(d->v.fn.clo); /* sig/name are static literals */
+    scr_dyn_weak_dispose(d);
+    d->v.str = (ScrStr *)scr_dyn_free_misc;
+    scr_dyn_free_misc = d;
+    scr_dyn_free_count++;
+    return;
+  }
 #endif
-  if (d->kind == SCR_DYN_OBJ) {
+  if (d->kind == SCR_DYN_OBJ && d->v.obj.index) {
     free(d->v.obj.index);
     d->v.obj.index = NULL;
   }
@@ -1217,8 +1428,10 @@ static void scr_dyn_dispose(ScrDyn *d, bool collected) {
     scr_bytes_release(d->v.bytes);
     break;
   case SCR_DYN_ARR:
-    free(d->v.arr.presence);
-    d->v.arr.presence = NULL;
+    if (d->v.arr.presence) {
+      free(d->v.arr.presence);
+      d->v.arr.presence = NULL;
+    }
     if (!collected) {
       for (size_t i = 0; i < d->v.arr.len; i++) scr_dyn_release_child(d->v.arr.items[i]);
       scr_dyn_release_child(d->v.arr.properties);
@@ -1278,7 +1491,10 @@ static void scr_dyn_dispose(ScrDyn *d, bool collected) {
   scr_live_dyns--;
 #endif
 #ifndef SCR_RC_AUDIT
-  if (!collected && scr_dyn_free_count < SCR_DYN_FREE_MAX) {
+  if (scr_dyn_free_count < SCR_DYN_FREE_MAX) {
+    /* A node the collector frees is pooled as well: its children are the
+     * collector's, and its header is reset when it is taken again. */
+    if (collected && scr_cyc_gen(scr_cyc_hdr(d)) == SCR_CYC_OLD) scr_cyc_old_freed++;
     if (d->kind == SCR_DYN_OBJ) d->v.obj.cached_key_bytes = scr_dyn_obj_drop_keys(d, true);
     /* Pooled blocks retain their headers and count toward the bounded
      * allocated heap, but never remain in a candidate buffer. */
@@ -1300,9 +1516,30 @@ static void scr_dyn_dispose(ScrDyn *d, bool collected) {
   scr_cyc_free_inline(d);
 }
 
-static void scr_dyn_gcfree(void *ptr) { scr_dyn_dispose(ptr, true); }
+/* Each flavor gets its own copy, so the collected checks fold away. */
+static __attribute__((noinline)) void scr_dyn_gcfree(void *ptr) { scr_dyn_dispose(ptr, true); }
 
-static void scr_dyn_destroy(void *ptr) { scr_dyn_dispose(ptr, false); }
+static __attribute__((noinline)) void scr_dyn_destroy(void *ptr) { scr_dyn_dispose(ptr, false); }
+
+#ifndef SCR_RC_AUDIT
+/* A node whose count reached zero is torn down in place, without the
+ * disposal queue's bookkeeping (scr_rc_destroy), for as many nested levels
+ * as the stack comfortably holds. Deeper teardown (a long chain of nodes)
+ * takes the queued path, which bounds the stack for any depth. */
+#define SCR_DYN_FAST_DESTROY_DEPTH 32
+static SCR_TL unsigned scr_dyn_fast_destroy_depth;
+static inline void scr_dyn_destroy_dead(ScrDyn *d) {
+  if (scr_dyn_fast_destroy_depth >= SCR_DYN_FAST_DESTROY_DEPTH) {
+    scr_rc_destroy(d, scr_dyn_destroy);
+    return;
+  }
+  scr_dyn_fast_destroy_depth++;
+  scr_dyn_destroy(d);
+  scr_dyn_fast_destroy_depth--;
+}
+#else
+static inline void scr_dyn_destroy_dead(ScrDyn *d) { scr_rc_destroy(d, scr_dyn_destroy); }
+#endif
 
 /* The cycle bookkeeping of a value that survives a release. Compiled
  * release fast paths decrement first and call this for the kinds whose
@@ -1322,26 +1559,11 @@ void scr_dyn_release_survivor(ScrDyn *d) {
     scr_cyc_released(d);
 }
 
-void scr_dyn_release(ScrDyn *d) {
-  if (!d || d->rc == SIZE_MAX) return;
-  if (--d->rc != 0) {
-    /* A container of an intact parse region cannot lie on a cycle
-     * (ScrDynRegion). */
-    if (d->kind == SCR_DYN_ARR || d->kind == SCR_DYN_OBJ) {
-      ScrDynRegion *region = d->kind == SCR_DYN_ARR ? d->v.arr.region : d->v.obj.region;
-      if (!region || !region->intact) scr_cyc_released(d);
-      return;
-    }
-    /* A capsule without a snapshot, casts or a traced referent has no
-     * outgoing edge, so it cannot be part of a cycle until it gains one. */
-    if (d->kind == SCR_DYN_FUNC || d->kind == SCR_DYN_PROXY ||
-        (d->kind == SCR_DYN_TYPED_REF &&
-         (d->v.typed_ref.materialized || d->v.typed_ref.casts || d->v.typed_ref.traced ||
-          d->prototype || d->symbol_properties || d->symbol_keys)) ||
-        (d->kind == SCR_DYN_HANDLE && d->v.handle.traced))
-      scr_cyc_released(d);
-    return;
-  }
+/* The release of a node whose count reached zero. Its own function, so the
+ * release most calls make (a null, an immortal, a survivor) is a leaf that
+ * saves no registers. */
+static __attribute__((noinline)) void scr_dyn_release_dead(ScrDyn *d) {
+  SCR_STAT(dyn_rc_zero);
 #ifndef SCR_RC_AUDIT
   /* Number and string boxes own at most one string and cannot be weak
    * keys: return them to the free list. Their releases never buffer them,
@@ -1368,7 +1590,31 @@ void scr_dyn_release(ScrDyn *d) {
     return;
   }
 #endif
-  scr_rc_destroy(d, scr_dyn_destroy);
+  scr_dyn_destroy_dead(d);
+}
+
+void scr_dyn_release(ScrDyn *d) {
+  if (!d || d->rc == SIZE_MAX) return;
+  if (--d->rc != 0) {
+    /* A container of an intact parse region cannot lie on a cycle
+     * (ScrDynRegion). */
+    if (d->kind == SCR_DYN_ARR || d->kind == SCR_DYN_OBJ) {
+      ScrDynRegion *region = d->kind == SCR_DYN_ARR ? d->v.arr.region : d->v.obj.region;
+      if (!region || !region->intact) scr_cyc_released(d);
+      return;
+    }
+    /* A function value or a proxy can be part of a cycle; a capsule without
+     * a snapshot, casts or a traced referent has no outgoing edge, so it
+     * cannot until it gains one (scr_dyn_release_survivor tests that, and
+     * the handle's tracing). */
+    if (d->kind == SCR_DYN_FUNC || d->kind == SCR_DYN_PROXY) {
+      scr_cyc_released(d);
+      return;
+    }
+    if (d->kind == SCR_DYN_TYPED_REF || d->kind == SCR_DYN_HANDLE) scr_dyn_release_survivor(d);
+    return;
+  }
+  scr_dyn_release_dead(d);
 }
 
 /* Small objects retain their compact linear representation. A wide object
@@ -1415,6 +1661,7 @@ static __attribute__((noinline)) void scr_dyn_index_append(ScrDyn *object) {
 static SCR_TL size_t scr_dyn_property_hints[SCR_DYN_PROPERTY_HINTS];
 
 static ScrDynEntry *scr_dyn_find_linear_entry(const ScrDyn *object, const char *key, size_t length) {
+  SCR_STAT(find_linear);
   for (size_t i = 0; i < object->v.obj.len; i++) {
     ScrDynEntry *entry = &object->v.obj.entries[i];
     if (entry->key_len == length && scr_key_equal(entry->key, key, length)) return entry;
@@ -1424,6 +1671,7 @@ static ScrDynEntry *scr_dyn_find_linear_entry(const ScrDyn *object, const char *
 
 static __attribute__((noinline)) ScrDynEntry *scr_dyn_find_indexed_entry(
     const ScrDyn *object, const char *key, size_t length) {
+  SCR_STAT(find_hashed);
   const ScrDynObjectIndex *index = object->v.obj.index;
   size_t slot = scr_key_hash(key, length) & (index->buckets - 1);
   while (index->slots[slot]) {
@@ -1441,7 +1689,10 @@ static ScrDynEntry *scr_dyn_find_entry(const ScrDyn *object, const char *key, si
   size_t hint = scr_dyn_property_hints[slot];
   if (hint < object->v.obj.len) {
     ScrDynEntry *entry = &object->v.obj.entries[hint];
-    if (entry->key_len == length && scr_key_equal(entry->key, key, length)) return entry;
+    if (entry->key_len == length && scr_key_equal(entry->key, key, length)) {
+      SCR_STAT(find_hint_hit);
+      return entry;
+    }
   }
   ScrDynEntry *entry = scr_dyn_find_linear_entry(object, key, length);
   if (entry) scr_dyn_property_hints[slot] = (size_t)(entry - object->v.obj.entries);
@@ -1707,6 +1958,17 @@ double scr_dyn_math_fold(const ScrDyn *src, bool max, const ScrStr *what) {
 }
 
 ScrDyn *scr_dyn_iter_pack(const ScrDyn *src, const ScrStr *msg) {
+#ifdef SCR_MAP_CLASS
+  if (src->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *storage = scr_dyn_map_class_storage(src);
+    if (scr_exc_pending()) return NULL;
+    if (storage) {
+      ScrDyn *result = scr_dyn_iter_pack(storage, msg);
+      scr_dyn_release(storage);
+      return result;
+    }
+  }
+#endif
   if (src->kind == SCR_DYN_HANDLE && scr_dyn_handle_ops_of(src)->iter_pack)
     return scr_dyn_handle_ops_of(src)->iter_pack(src->v.handle.ptr);
   if (src->kind == SCR_DYN_TYPED_REF) {
@@ -1829,6 +2091,7 @@ ScrDyn *scr_dyn_arr_named_get(const ScrDyn *d, const ScrStr *key) {
  * original spelling/storage and insertion position; the later value wins.
  * A recycled entry can reuse equal key bytes without a malloc/free pair. */
 static void scr_dyn_obj_put(ScrDyn *obj, const char *key, size_t key_len, ScrDyn *value) {
+  SCR_STAT(obj_put);
   scr_dyn_region_store(obj, value);
   /* Construction usually appends an absent name. Avoid a read hint that
    * repeats comparisons on compact objects; wide objects use their index. */
@@ -1869,12 +2132,14 @@ static void scr_dyn_obj_put(ScrDyn *obj, const char *key, size_t key_len, ScrDyn
     obj->v.obj.entries = entries;
     obj->v.obj.cap = cap;
   }
-  SCR_JS_SHAPE_RESET(obj);
+  SCR_JS_SHAPE_APPEND(obj, key, key_len);
   ScrDynEntry *e = &obj->v.obj.entries[obj->v.obj.len++];
   if (!e->key || e->key_len != key_len || !scr_key_equal(e->key, key, key_len)) {
-    char *owned = scr_dyn_key_copy(key, key_len);
+    bool counted;
+    char *owned = scr_dyn_key_copy_flag(key, key_len, &counted);
     scr_dyn_key_release(e->key, e->key_len);
     e->key = owned;
+    if (counted) obj->v.obj.rc_keys = true;
   }
   e->key_len = key_len;
   e->value = value;
@@ -1892,10 +2157,10 @@ static void scr_dyn_obj_put(ScrDyn *obj, const char *key, size_t key_len, ScrDyn
 
 /* THE undefined value: one immortal node (rc == SIZE_MAX skips every
  * retain/release and the freelists never see it). */
-ScrDyn *scr_dyn_undefined(void) {
-  static ScrDyn undef = { .rc = SIZE_MAX, .kind = SCR_DYN_UNDEF };
-  return &undef;
-}
+/* Exported by name: emitted modules inline the accessor to this node's
+ * address (llvm/emit-module.ts). */
+ScrDyn scr_dyn_undefined_node = { .rc = SIZE_MAX, .kind = SCR_DYN_UNDEF };
+ScrDyn *scr_dyn_undefined(void) { return &scr_dyn_undefined_node; }
 
 /* Primitive nodes have no mutable properties or observable box identity.
  * As with undefined, SIZE_MAX keeps them out of RC and cycle bookkeeping;
@@ -2358,6 +2623,16 @@ ScrDyn *scr_dyn_get_prototype(ScrDyn *object) {
     scr_dyn_release(table);
     if (result) return result;
   }
+#ifdef SCR_FUNCTION_PROTOTYPE
+  if (object->kind == SCR_DYN_FUNC) {
+    ScrDyn *prototype = scr_dyn_function_prototype();
+    if (object == prototype) {
+      scr_dyn_release(prototype);
+      return scr_dyn_object_prototype();
+    }
+    return prototype;
+  }
+#endif
   if (object->kind == SCR_DYN_ARR && object != scr_builtin_array_prototype) {
     if (object->prototype) return scr_dyn_retain(object->prototype);
     return scr_dyn_array_prototype_base();
@@ -2383,13 +2658,14 @@ ScrDyn *scr_dyn_get_prototype(ScrDyn *object) {
  * Date, RegExp, Map, Set, WeakMap or WeakSet, or a promise, has only builtin
  * prototypes on its chain, and no program class extends these (a class
  * extending Date makes instances of its own), so the walk ends there with
- * null. */
+ * null. A net or http Server handle is the same: programs cannot extend
+ * the native Server class. */
 ScrDyn *scr_dyn_get_prototype_for_identity(ScrDyn *object) {
   if (object->kind == SCR_DYN_PROMISE) return scr_dyn_new_null();
   if (object->kind == SCR_DYN_HANDLE) {
     switch (object->v.handle.tag) {
     case SCR_DYNH_DATE: case SCR_DYNH_REGEXP: case SCR_DYNH_MAP: case SCR_DYNH_SET:
-    case SCR_DYNH_WEAK_MAP: case SCR_DYNH_WEAK_SET:
+    case SCR_DYNH_WEAK_MAP: case SCR_DYNH_WEAK_SET: case SCR_DYNH_NET_SERVER:
       return scr_dyn_new_null();
     default:
       break;
@@ -2406,6 +2682,12 @@ ScrDyn *scr_dyn_set_prototype(ScrDyn *object, ScrDyn *prototype) {
       object->kind == SCR_DYN_BIGINT || object->kind == SCR_DYN_SYMBOL) {
     return scr_dyn_prototype_valid(prototype) ? scr_dyn_retain(object) : NULL;
   }
+  /* An ordinary object already inherits Object.prototype: naming it is the
+   * default, not a mutation of Object.prototype, so a checked view built
+   * for a class without prototype data keeps its default chain. */
+  if (object->kind == SCR_DYN_OBJ && prototype == scr_builtin_object_prototype &&
+      object != scr_builtin_object_prototype && !object->prototype && !object->null_proto)
+    return scr_dyn_retain(object);
   if (scr_dyn_class_reflection_fence(object) || scr_dyn_error_prototype_fence(object) || scr_dyn_class_reflection_fence(prototype)) return NULL;
   if (object->kind == SCR_DYN_TYPED_REF) {
     ScrDyn *view = scr_dyn_typed_ref_materialize(object);
@@ -2847,26 +3129,34 @@ static void scr_dyn_proxy_invariant(void) {
   scr_throw_error_msg(SCR_ERR_TYPE, msg, sizeof msg - 1);
 }
 
+/* A native record or class instance whose own properties are all writable,
+ * configurable data: no Proxy invariant can name one of them, so traps
+ * need no descriptor checks against the target. */
+static bool scr_dyn_proxy_plain_typed_target(const ScrDyn *target) {
+  if (target->kind != SCR_DYN_TYPED_REF ||
+      (strncmp(target->v.typed_ref.type_key, "record:", 7) != 0 &&
+       strncmp(target->v.typed_ref.type_key, "object:", 7) != 0))
+    return false;
+  ScrDyn *view = scr_dyn_typed_ref_materialize(target);
+  bool plain = view && view->kind == SCR_DYN_OBJ && !view->non_extensible && !target->non_extensible;
+  if (plain) for (size_t i = 0; i < view->v.obj.len; i++) {
+    ScrDynEntry *entry = &view->v.obj.entries[i];
+    if (entry->accessor || !entry->configurable || !entry->writable) plain = false;
+  }
+  scr_dyn_release(view);
+  return plain && !scr_exc_pending();
+}
+
 ScrDyn *scr_dyn_proxy_new(const ScrDyn *target, const ScrDyn *handler) {
   if (!scr_dyn_to_primitive_result_is_object(target) || !scr_dyn_to_primitive_result_is_object(handler)) {
     static const char msg[] = "Cannot create proxy with a non-object as target or handler";
     scr_throw_error_msg(SCR_ERR_TYPE, msg, sizeof msg - 1);
     return NULL;
   }
-  bool native_record = target->kind == SCR_DYN_TYPED_REF &&
-    strncmp(target->v.typed_ref.type_key, "record:", 7) == 0;
-  if (native_record) {
-    ScrDyn *view = scr_dyn_typed_ref_materialize(target);
-    bool plain = view && view->kind == SCR_DYN_OBJ;
-    if (plain) for (size_t i = 0; i < view->v.obj.len; i++) {
-      ScrDynEntry *entry = &view->v.obj.entries[i];
-      if (entry->accessor || !entry->configurable || !entry->writable) plain = false;
-    }
-    scr_dyn_release(view);
-    if (scr_exc_pending()) return NULL;
-    native_record = plain;
-  }
-  if ((target->kind != SCR_DYN_OBJ && target->kind != SCR_DYN_FUNC && !native_record) || handler->kind != SCR_DYN_OBJ) {
+  bool native_record = scr_dyn_proxy_plain_typed_target(target);
+  if (scr_exc_pending()) return NULL;
+  if ((target->kind != SCR_DYN_OBJ && target->kind != SCR_DYN_FUNC && target->kind != SCR_DYN_PROXY && !native_record) ||
+      handler->kind != SCR_DYN_OBJ) {
     scr_dyn_proxy_unsupported("non-plain targets or handlers");
     return NULL;
   }
@@ -2894,9 +3184,9 @@ static ScrDyn *scr_dyn_proxy_trap(const ScrDyn *proxy, const char *name) {
     scr_dyn_release(method);
     return NULL;
   }
-  if (proxy->v.proxy.target->kind == SCR_DYN_TYPED_REF) {
+  if (proxy->v.proxy.target->kind == SCR_DYN_TYPED_REF && !scr_dyn_proxy_plain_typed_target(proxy->v.proxy.target)) {
     scr_dyn_release(method);
-    scr_dyn_proxy_unsupported("traps over typed native targets");
+    if (!scr_exc_pending()) scr_dyn_proxy_unsupported("traps over typed native targets with fixed properties");
     return NULL;
   }
   return method;
@@ -3092,10 +3382,21 @@ static ScrDyn *scr_dyn_proxy_get_receiver(const ScrDyn *proxy, const ScrStr *key
   if (scr_exc_pending()) return NULL;
   if (!trap) {
     ScrDyn *target = proxy->v.proxy.target;
+    if (target->kind == SCR_DYN_PROXY) return scr_dyn_proxy_get_receiver(target, key, receiver);
     if (target->kind == SCR_DYN_TYPED_REF) {
       ScrDyn *view = scr_dyn_typed_ref_materialize(target);
       ScrDyn *result = scr_exc_pending() ? NULL : scr_dyn_obj_read_receiver(view, key->data, key->len, receiver);
+      bool own = view->kind == SCR_DYN_OBJ && scr_dyn_find_entry(view, key->data, key->len);
       scr_dyn_release(view);
+      /* A class instance's view holds only its fields; its compiled
+       * methods and accessors have no checked value to forward. */
+      if (result && result->kind == SCR_DYN_UNDEF && !own && !target->v.typed_ref.record &&
+          strncmp(target->v.typed_ref.type_key, "object:", 7) == 0 && scr_dyn_in(target, key) &&
+          !scr_exc_pending()) {
+        scr_dyn_release(result);
+        scr_dyn_proxy_unsupported("compiled class member reads without a get trap");
+        return NULL;
+      }
       return result;
     }
     if (!scr_dyn_obj_get(target, key->data, key->len) && scr_dyn_object_proto_key(target, key)) {
@@ -3478,9 +3779,23 @@ static void scr_record_source_disposed(void *rec) {
 
 /* The single native dispose hook serves weak collections and the table
  * above; each observer runs only while it has entries to forget. */
-static void scr_dispose_observers(void *object) {
-  if (scr_weak_observing) scr_weak_disposed(object);
+static __attribute__((noinline)) void scr_dispose_observers_slow(void *object) {
+  if (scr_weak_observing) scr_weak_dispose_filtered(object);
   if (scr_record_source_count) scr_record_source_disposed(object);
+}
+
+/* The hook runs for every native free: its common answer (neither observer
+ * knows the object) is a bit test that needs no frame, so the work with
+ * calls and saved registers stays in the slow half. */
+static void scr_dispose_observers(void *object) {
+  if (scr_weak_observing) {
+    size_t bit = scr_weak_filter_bit(object);
+    if (scr_weak_key_filter[bit >> 6] & (UINT64_C(1) << (bit & 63))) {
+      scr_dispose_observers_slow(object);
+      return;
+    }
+  }
+  if (scr_record_source_count) scr_dispose_observers_slow(object);
 }
 
 /* Keeps live entries plus deleted markers at most half the table: grows
@@ -3960,6 +4275,26 @@ bool scr_dyn_typed_ref_is(
          memcmp(d->v.typed_ref.type_key, type_key, type_key_len) == 0;
 }
 
+/* The emitted table of a many-subclass class check: {key, length} pairs. */
+typedef struct {
+  const char *key;
+  size_t len;
+} ScrTypeKeyEntry;
+
+/* Whether `d` is a capsule whose type key is one of the n table entries.
+ * A capsule boxed by the emitting program carries the key constant itself,
+ * so the pointers decide it; the bytes are compared only for entries of
+ * the capsule's own length (a key from another unit or the runtime). */
+bool scr_dyn_typed_ref_in(const ScrDyn *d, const void *table, size_t n) {
+  if (!d || d->kind != SCR_DYN_TYPED_REF) return false;
+  const ScrTypeKeyEntry *keys = table;
+  const char *key = d->v.typed_ref.type_key;
+  size_t len = d->v.typed_ref.type_key_len;
+  for (size_t i = 0; i < n; i++)
+    if (keys[i].key == key || (keys[i].len == len && memcmp(keys[i].key, key, len) == 0)) return true;
+  return false;
+}
+
 bool scr_dyn_typed_ref_is_key(const ScrDyn *d, const ScrStr *type_key) {
   return scr_dyn_typed_ref_is(d, type_key->data, type_key->len);
 }
@@ -4418,6 +4753,10 @@ ScrDyn *scr_dyn_typed_ref_key_get(const ScrDyn *d, const ScrStr *key) {
   }
   ScrDyn *date_method = scr_dyn_date_class_member(d, key->data, key->len);
   if (date_method) return date_method;
+#ifdef SCR_MAP_CLASS
+  ScrDyn *map_member = scr_dyn_map_class_member(d, key->data, key->len);
+  if (map_member || scr_exc_pending()) return map_member;
+#endif
   if (!scr_dyn_typed_ref_array_ops(d)) return NULL;
   if (scr_typed_ref_is_length(key)) return scr_dyn_new_num((double)((ScrArr *)d->v.typed_ref.ptr)->len);
   double number;
@@ -4526,7 +4865,11 @@ bool scr_dyn_util_type_is(const ScrDyn *value, const ScrStr *probe) {
   if (PROBE("isFloat16Array")) return scr_dyn_typed_array_is(value, SCR_BYTES_F16);
   if (PROBE("isFloat32Array")) return scr_dyn_typed_array_is(value, SCR_BYTES_F32);
   if (PROBE("isFloat64Array")) return scr_dyn_typed_array_is(value, SCR_BYTES_F64);
+#ifdef SCR_MAP_CLASS
+  if (PROBE("isMap")) return scr_dyn_native_map_is(value);
+#else
   if (PROBE("isMap")) return value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_MAP;
+#endif
   if (PROBE("isSet")) return value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_SET;
   if (PROBE("isWeakMap")) return value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_WEAK_MAP;
   if (PROBE("isWeakSet")) return value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_WEAK_SET;
@@ -4914,6 +5257,9 @@ static int scr_dyn_global_constructor_instanceof(const ScrDyn *value, const ScrD
   int tag = -1;
   for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++)
     if (strcmp(callee->v.fn.name, kinds[i].name) == 0) tag = kinds[i].tag;
+#ifdef SCR_MAP_CLASS
+  if (tag == SCR_DYNH_MAP && value->kind == SCR_DYN_TYPED_REF) return scr_dyn_native_map_is(value);
+#endif
   if (value->kind == SCR_DYN_TYPED_REF) {
     if (strncmp(value->v.typed_ref.type_key, "record:", 7) == 0 || scr_dyn_ref_is_array(value)) return 0;
     return (promise || tag >= 0) && strncmp(value->v.typed_ref.type_key, "object:", 7) == 0 ? 0 : -1;
@@ -5063,6 +5409,89 @@ static bool scr_dyn_instanceof_function(const ScrDyn *value) {
   return false;
 }
 
+#ifdef SCR_FUNCTION_PROTOTYPE
+/* Array.isArray tests an internal slot; instanceof Array instead searches
+ * for Array.prototype, including ordinary objects that inherit from it. */
+static bool scr_dyn_instanceof_array(const ScrDyn *value) {
+  if (value->kind != SCR_DYN_OBJ && value->kind != SCR_DYN_ARR && value->kind != SCR_DYN_FUNC &&
+      !scr_dyn_ref_is_array(value)) return false;
+  ScrDyn *prototype = scr_dyn_array_prototype_base();
+  ScrDyn *current = scr_dyn_get_prototype((ScrDyn *)value);
+  bool found = false;
+  while (current && current->kind != SCR_DYN_NULL) {
+    if (current == prototype) { found = true; break; }
+    ScrDyn *next = scr_dyn_get_prototype(current);
+    scr_dyn_release(current);
+    current = next;
+  }
+  scr_dyn_release(current);
+  scr_dyn_release(prototype);
+  return found;
+}
+
+#endif
+
+/* The prototype an object holds directly, borrowed: a plain object with its
+ * own prototype link that scr_dyn_get_prototype would answer unchanged. NULL
+ * when the step needs the general read (builtin Object.prototype, an error
+ * view on Error.prototype, arrays, functions, null prototypes, typed
+ * references). */
+static const ScrDyn *scr_dyn_prototype_direct(const ScrDyn *object) {
+  if (object->kind != SCR_DYN_OBJ || !object->prototype || object == scr_builtin_object_prototype)
+    return NULL;
+  if (scr_dyn_error_view_on_error_prototype(object)) return NULL;
+  return object->prototype;
+}
+
+/* Whether `prototype` is on the prototype chain of `value`: the walk of
+ * repeated scr_dyn_get_prototype reads without a retain and release per
+ * hop. Each hop a plain object links directly is borrowed from the object
+ * before it (no user code runs during the walk, so no link changes); the
+ * chain's first prototype and every hop that needs the general read are
+ * held. `strict` compares with SameValue, else by identity. A read that
+ * throws ends the walk with the exception pending. */
+bool scr_dyn_chain_has(ScrDyn *value, const ScrDyn *prototype, bool strict) {
+  /* `value` is borrowed for the whole call, and so is the prototype a plain
+   * object links directly. */
+  const ScrDyn *first = scr_dyn_prototype_direct(value);
+  ScrDyn *held = first ? NULL : scr_dyn_get_prototype(value);
+  const ScrDyn *current = first ? first : held;
+  bool found = false;
+  while (current && current->kind != SCR_DYN_NULL) {
+    if (current == prototype || (strict && scr_dyn_strict_eq(current, prototype))) {
+      found = true;
+      break;
+    }
+    const ScrDyn *direct = scr_dyn_prototype_direct(current);
+    if (direct) {
+      current = direct;
+      continue;
+    }
+    ScrDyn *next = scr_dyn_get_prototype((ScrDyn *)current);
+    scr_dyn_release(held);
+    held = next;
+    current = next;
+  }
+  scr_dyn_release(held);
+  return found;
+}
+
+/* `callee.prototype` as Reflect.get reads it, for a function that already
+ * owns its property table holding the prototype as a data property: +1.
+ * NULL leaves the general read (a table not created yet, an accessor, an
+ * inherited prototype) to the caller. */
+ScrDyn *scr_dyn_fn_prototype_fast(const ScrDyn *callee) {
+  if (callee->kind != SCR_DYN_FUNC) return NULL;
+  const ScrBox *props = scr_closure_identity(callee->v.fn.clo)->props;
+  if (!props || props->kind != SCR_BOX_OBJ) return NULL;
+  ScrDyn *table;
+  memcpy(&table, &props->slot, sizeof table);
+  if (!table || table->kind != SCR_DYN_OBJ || table == scr_builtin_object_prototype) return NULL;
+  const ScrDynEntry *entry = scr_dyn_find_entry(table, "prototype", 9);
+  if (!entry || entry->accessor) return NULL;
+  return scr_dyn_retain(entry->value);
+}
+
 bool scr_bytes_instanceof_at(const ScrDyn *value, const ScrDyn *callee, const ScrStr *refusal) {
   if (!callee || callee->kind != SCR_DYN_FUNC) {
     static const char message[] = "Right-hand side of 'instanceof' is not callable";
@@ -5071,7 +5500,16 @@ bool scr_bytes_instanceof_at(const ScrDyn *value, const ScrDyn *callee, const Sc
   }
   int hooked = scr_dyn_has_instance_hook(value, callee);
   if (hooked >= 0) return hooked == 1;
-  if (callee->v.fn.sig && callee->v.fn.name) {
+  /* Every signature tested below starts "native:": one prefix test spares an
+   * ordinary constructor the full comparisons. */
+  const bool native_sig = callee->v.fn.sig && strncmp(callee->v.fn.sig, "native:", 7) == 0;
+  /* The runtime's constructor values carry a "native:" signature, or the
+   * typed-array constructors' own; a function the program compiled carries
+   * its type's key, and goes straight to the prototype walk. */
+  const bool builtin_ctor =
+      !callee->v.fn.sig || native_sig || strcmp(callee->v.fn.sig, "typed-array-constructor") == 0;
+  if (!builtin_ctor) goto ordinary;
+  if (native_sig && callee->v.fn.name) {
     if (strcmp(callee->v.fn.sig, "native:constructor") == 0 && strcmp(callee->v.fn.name, "Object") == 0)
       return scr_dyn_instanceof_object(value);
     if (strcmp(callee->v.fn.sig, "native:function-constructor") == 0 &&
@@ -5086,9 +5524,14 @@ bool scr_bytes_instanceof_at(const ScrDyn *value, const ScrDyn *callee, const Sc
     return scr_dyn_err_instanceof(value, (double)i) || (i == 0 && scr_dyn_inherits_error_prototype(value));
   }
   if (scr_array_buffer_ctor && callee->v.fn.clo == scr_array_buffer_ctor->v.fn.clo) return scr_array_buffer_is(value);
-  if (scr_array_ctor && callee->v.fn.clo == scr_array_ctor->v.fn.clo) return value->kind == SCR_DYN_ARR || scr_dyn_ref_is_array(value);
+  if (scr_array_ctor && callee->v.fn.clo == scr_array_ctor->v.fn.clo)
+#ifdef SCR_FUNCTION_PROTOTYPE
+    return scr_dyn_instanceof_array(value);
+#else
+    return value->kind == SCR_DYN_ARR || scr_dyn_ref_is_array(value);
+#endif
   /* The Buffer function value: Buffer instances, not other Uint8Arrays. */
-  if (callee->v.fn.sig && strcmp(callee->v.fn.sig, "native:Buffer") == 0)
+  if (native_sig && strcmp(callee->v.fn.sig, "native:Buffer") == 0)
     return value->kind == SCR_DYN_BYTES && value->buffer;
   for (size_t i = 0; i < SCR_BYTES_ELEM_COUNT; i++) {
     if (scr_bytes_ctors[i] && callee->v.fn.clo == scr_bytes_ctors[i]->v.fn.clo)
@@ -5096,31 +5539,24 @@ bool scr_bytes_instanceof_at(const ScrDyn *value, const ScrDyn *callee, const Sc
   }
   int global = scr_dyn_global_constructor_instanceof(value, callee);
   if (global >= 0) return global;
+ordinary:
   /* An ordinary constructor function (an untyped JavaScript function whose
    * prototype is an object): OrdinaryHasInstance walks the value's
    * prototype chain for callee.prototype. */
   {
-    ScrStr *name = scr_str_new("prototype", 9);
-    ScrDyn *key = scr_dyn_new_str(name);
-    scr_str_release(name);
-    ScrDyn *prototype = scr_dyn_reflect_get((ScrDyn *)callee, key, (ScrDyn *)callee);
-    scr_dyn_release(key);
+    ScrDyn *prototype = scr_dyn_fn_prototype_fast(callee);
+    if (!prototype) {
+      ScrStr *name = scr_str_new("prototype", 9);
+      ScrDyn *key = scr_dyn_new_str(name);
+      scr_str_release(name);
+      prototype = scr_dyn_reflect_get((ScrDyn *)callee, key, (ScrDyn *)callee);
+      scr_dyn_release(key);
+    }
     if (!prototype) return false; /* the read threw: pending */
     if (prototype->kind == SCR_DYN_OBJ) {
       bool found = false;
-      if (value->kind == SCR_DYN_OBJ || value->kind == SCR_DYN_ARR || value->kind == SCR_DYN_FUNC) {
-        ScrDyn *current = scr_dyn_get_prototype((ScrDyn *)value);
-        while (current && current->kind != SCR_DYN_NULL) {
-          if (current == prototype) {
-            found = true;
-            break;
-          }
-          ScrDyn *next = scr_dyn_get_prototype(current);
-          scr_dyn_release(current);
-          current = next;
-        }
-        if (current) scr_dyn_release(current);
-      }
+      if (value->kind == SCR_DYN_OBJ || value->kind == SCR_DYN_ARR || value->kind == SCR_DYN_FUNC)
+        found = scr_dyn_chain_has((ScrDyn *)value, prototype, false);
       scr_dyn_release(prototype);
       return found;
     }
@@ -5816,7 +6252,7 @@ ScrDyn *scr_dyn_new_func(ScrClosure *clo, ScrDynThunk thunk, uint32_t arity, con
     scr_closure_release(clo);
     return original;
   }
-  ScrDyn *d = scr_dyn_alloc(SCR_DYN_FUNC);
+  ScrDyn *d = scr_dyn_func_alloc();
   d->v.fn.clo = clo;
   d->v.fn.thunk = thunk;
   d->v.fn.sig = sig;
@@ -5866,6 +6302,7 @@ bool scr_dyn_class_is(const ScrDyn *value, const char *type_key) {
 }
 
 bool scr_dyn_class_is_key(const ScrDyn *value, const ScrStr *type_key) {
+  SCR_STAT(dyn_class_is_key);
   return scr_dyn_class_is(value, type_key->data);
 }
 
@@ -6534,7 +6971,8 @@ static bool scr_dyn_handle_in(const ScrDyn *d, const ScrStr *k) {
 typedef struct {
   void *ptr;            /* handle entry (borrowed); NULL when dv or undefined */
   ScrDynHandleTag tag;
-  ScrDyn *dv;           /* dyn entry (+1); NULL for handle/undefined entries */
+  ScrDyn *dv;           /* dyn entry (+1, or borrowed when `borrowed`); NULL for handle/undefined entries */
+  bool borrowed;        /* dv is held by the pushing caller for the window, so pop releases nothing */
   /* A deferred typed-ref entry (scr_dyn_this_push_typed): the borrowed
    * instance in `ptr` boxes with this recipe on the first read, and dv
    * caches the box. */
@@ -6570,6 +7008,7 @@ void scr_dyn_this_push(void *h, ScrDynHandleTag tag) {
   e->ptr = h;
   e->tag = tag;
   e->dv = NULL;
+  e->borrowed = false;
   e->recipe = NULL;
 }
 
@@ -6578,6 +7017,16 @@ void scr_dyn_this_push_dyn(const ScrDyn *v) {
   e->ptr = NULL;
   e->tag = 0;
   e->dv = v ? scr_dyn_retain((ScrDyn *)v) : NULL;
+  e->borrowed = false;
+  e->recipe = NULL;
+}
+
+void scr_dyn_this_push_borrowed(const ScrDyn *v) {
+  ScrDynThisEnt *e = scr_dyn_this_grow();
+  e->ptr = NULL;
+  e->tag = 0;
+  e->dv = (ScrDyn *)v;
+  e->borrowed = true;
   e->recipe = NULL;
 }
 
@@ -6586,6 +7035,7 @@ void scr_dyn_this_push_typed(void *ptr, const ScrDynTypedRefRecipe *recipe) {
   e->ptr = ptr;
   e->tag = 0;
   e->dv = NULL;
+  e->borrowed = false;
   e->recipe = recipe;
 }
 
@@ -6594,37 +7044,76 @@ void scr_dyn_this_pop(void) {
     scr_trap("scriptc: internal error: receiver stack underflow\n");
   }
   ScrDynThisEnt *e = &scr_dyn_this_stack[--scr_dyn_this_n];
-  if (e->dv) scr_dyn_release(e->dv);
+  if (e->dv && !e->borrowed) scr_dyn_release(e->dv);
+}
+
+/* scr_dyn_this_push_borrowed(recv); scr_dyn_call(callee, ...);
+ * scr_dyn_this_pop() as one call: the method-call form of every dyn
+ * invoke, without the three calls and the second kind test. The borrowed
+ * entry owns nothing, so its pop only drops the depth (the stack may have
+ * been reallocated by the callee's own pushes). */
+ScrDyn *scr_dyn_call_this(const ScrDyn *callee, const ScrDyn *recv, ScrDyn *const *args,
+                          size_t argc, const char *what) {
+  ScrDynThisEnt *e = scr_dyn_this_grow();
+  e->ptr = NULL;
+  e->tag = 0;
+  e->dv = (ScrDyn *)recv;
+  e->borrowed = true;
+  e->recipe = NULL;
+  ScrDyn *result = callee->kind == SCR_DYN_FUNC ? callee->v.fn.thunk(callee->v.fn.clo, args, argc)
+                                                 : scr_dyn_call(callee, args, argc, what);
+  scr_dyn_this_n--;
+  return result;
+}
+
+/* The dyn value a deferred typed-ref entry stands for, boxed on first read
+ * and cached in the entry (+1, released at pop). */
+static ScrDyn *scr_dyn_this_materialize(ScrDynThisEnt *e) {
+  const ScrDynTypedRefRecipe *r = e->recipe;
+  e->dv = r->kind == 2
+      ? scr_dyn_new_typed_ref_traced(e->ptr, r->retain, r->release, r->type_key,
+                                     r->type_key_len, r->materialize, r->commit)
+      : r->kind == 1
+          ? scr_dyn_new_typed_ref_observed(e->ptr, r->retain, r->release, r->type_key,
+                                           r->type_key_len, r->materialize, r->commit)
+          : scr_dyn_new_typed_ref(e->ptr, r->retain, r->release, r->type_key,
+                                  r->type_key_len, r->materialize, r->commit);
+  if (r->view == 1)
+    scr_dyn_typed_ref_bind_array(e->dv, (const ScrDynTypedArrayOps *)r->ops);
+  else if (r->view == 2)
+    scr_dyn_typed_ref_bind_record(e->dv, (const ScrDynTypedRecordOps *)r->ops);
+  else if (r->view == 3)
+    scr_dyn_typed_ref_bind_class(e->dv, (const ScrDynTypedClassOps *)r->ops);
+  else if (r->view == 4)
+    scr_dyn_typed_ref_bind_bag_class(e->dv, (const ScrDynTypedBagClassOps *)r->ops);
+  return e->dv;
 }
 
 ScrDyn *scr_dyn_this_get(void) {
   if (scr_dyn_this_n > 0) {
     ScrDynThisEnt *e = &scr_dyn_this_stack[scr_dyn_this_n - 1];
-    if (!e->dv && e->recipe) {
-      const ScrDynTypedRefRecipe *r = e->recipe;
-      e->dv = r->kind == 2
-          ? scr_dyn_new_typed_ref_traced(e->ptr, r->retain, r->release, r->type_key,
-                                         r->type_key_len, r->materialize, r->commit)
-          : r->kind == 1
-              ? scr_dyn_new_typed_ref_observed(e->ptr, r->retain, r->release, r->type_key,
-                                               r->type_key_len, r->materialize, r->commit)
-              : scr_dyn_new_typed_ref(e->ptr, r->retain, r->release, r->type_key,
-                                      r->type_key_len, r->materialize, r->commit);
-      if (r->view == 1)
-        scr_dyn_typed_ref_bind_array(e->dv, (const ScrDynTypedArrayOps *)r->ops);
-      else if (r->view == 2)
-        scr_dyn_typed_ref_bind_record(e->dv, (const ScrDynTypedRecordOps *)r->ops);
-      else if (r->view == 3)
-        scr_dyn_typed_ref_bind_class(e->dv, (const ScrDynTypedClassOps *)r->ops);
-      else if (r->view == 4)
-        scr_dyn_typed_ref_bind_bag_class(e->dv, (const ScrDynTypedBagClassOps *)r->ops);
-    }
+    if (!e->dv && e->recipe) scr_dyn_this_materialize(e);
     if (e->dv) return scr_dyn_retain(e->dv);
     /* An uninstalled tag never binds: a unit that fires without its dyn
      * half (no boxes can exist there) keeps the undefined answer. */
     if (e->ptr && scr_dynh_ops[e->tag]) return scr_dyn_new_handle(e->ptr, e->tag);
   }
   return scr_dyn_retain(scr_dyn_undefined());
+}
+
+/* scr_dyn_this_get without the reference: the innermost binding itself,
+ * valid until that window pops. A function body that is not resumable runs
+ * entirely inside its window, so its `this` binding can hold this pointer.
+ * A handle binding boxes once and keeps the box in its entry (pop releases
+ * it), so repeated reads in one window answer one object. */
+ScrDyn *scr_dyn_this_peek(void) {
+  if (scr_dyn_this_n > 0) {
+    ScrDynThisEnt *e = &scr_dyn_this_stack[scr_dyn_this_n - 1];
+    if (!e->dv && e->recipe) scr_dyn_this_materialize(e);
+    if (!e->dv && e->ptr && scr_dynh_ops[e->tag]) e->dv = scr_dyn_new_handle(e->ptr, e->tag);
+    if (e->dv) return e->dv;
+  }
+  return scr_dyn_undefined();
 }
 
 /* The keyed-write arm (see scr_dyn_key_set): modeled setters land on the
@@ -6702,7 +7191,11 @@ static ScrStr *scr_dyn_property_key(const ScrDyn *key) {
   return scr_dyn_string_coerce_js(key);
 }
 
+/* A Proxy target's non-configurable own properties are exactly those of its
+ * own target (the inner traps' invariants enforce that), so invariant checks
+ * against a proxied Proxy consult the innermost target. */
 static ScrDynEntry *scr_dyn_entry(ScrDyn *obj, const ScrStr *key) {
+  while (obj->kind == SCR_DYN_PROXY) obj = obj->v.proxy.target;
   return scr_dyn_find_entry(obj, key->data, key->len);
 }
 
@@ -6947,6 +7440,20 @@ bool scr_dyn_data_view_is(const ScrDyn *value) {
   return value->kind == SCR_DYN_BYTES && value->v.bytes->is_data_view;
 }
 
+#ifdef SCR_FUNCTION_PROTOTYPE
+/* A legacy decorator can replace its constructor. The compiler initializes
+ * a known original base directly; another native class has a different
+ * storage layout and cannot initialize this receiver through a function call. */
+void scr_dyn_legacy_class_super(ScrDyn *constructor, ScrDyn *receiver, ScrDyn *arguments) {
+  if (constructor && constructor->kind == SCR_DYN_FUNC && constructor->v.fn.class_obj) {
+    static const char message[] = "Extending a replacement native class has no native storage lowering";
+    scr_throw_error_msg_code(SCR_ERR_ERROR, message, sizeof message - 1, "SC2020");
+    return;
+  }
+  scr_dyn_class_super(constructor, receiver, arguments);
+}
+#endif
+
 /* util.inspect names an object after the function held by the first own
  * `constructor` data property on its prototype chain (Node's
  * getConstructorName). The dyn printer reads runtime class names
@@ -7016,6 +7523,7 @@ void scr_dyn_name_class_prototype(ScrDyn *prototype, const ScrStr *name) {
 /* Ordinary native function constructors retain their live prototype table.
  * A constructor may replace the fresh receiver with another object. */
 ScrDyn *scr_dyn_construct(const ScrDyn *callee, const ScrDyn *args, const ScrStr *what) {
+  SCR_STAT(dyn_construct);
   if (callee->kind != SCR_DYN_FUNC || callee->v.fn.class_obj || scr_closure_identity(callee->v.fn.clo)->function_kind != 4)
     return scr_bytes_construct(callee, args, what);
   ScrDyn *prototype = scr_dyn_fn_get(callee, "prototype", 9);
@@ -11246,6 +11754,10 @@ bool scr_dyn_in(const ScrDyn *v, const ScrStr *key) {
        * contributes the compiled methods and accessors. */
       out = scr_dyn_property_owner(materialized, key->data, key->len) ||
             scr_dyn_name_in_strs(key, klass->names, klass->count) || scr_dyn_object_proto_name(key);
+    } else if (klass && materialized->kind == SCR_DYN_OBJ && !materialized->null_proto) {
+      /* A view with its own class prototype data holds only the members the
+       * program observed so far: the compiled names still answer. */
+      out = scr_dyn_in(materialized, key) || scr_dyn_name_in_strs(key, klass->names, klass->count);
     } else {
       out = scr_dyn_in(materialized, key);
     }
@@ -12559,7 +13071,7 @@ static uint32_t scr_json_shape_add(ScrJsonP *p, uint32_t shape, const ScrDynEntr
     p->shape_cap *= 2;
   }
   uint32_t added = p->nshapes++;
-  ((ScrDynKey *)(entry->key - offsetof(ScrDynKey, bytes)))->rc++;
+  scr_dyn_key_retain(entry->key);
   p->shapes[added] = (ScrJsonShape){entry->key, entry->key_len, 0, p->shapes[shape].child};
   p->shapes[shape].child = added;
   return added;
@@ -12567,22 +13079,25 @@ static uint32_t scr_json_shape_add(ScrJsonP *p, uint32_t shape, const ScrDynEntr
 
 /* scr_dyn_obj_put for a fresh parser object and a key it does not hold yet,
  * sharing the transition's key bytes. */
+static __attribute__((noinline)) void scr_dyn_obj_grow(ScrDyn *obj) {
+  size_t cap = obj->v.obj.cap ? obj->v.obj.cap * 2 : 4;
+  ScrDynEntry *entries = scr_mem_realloc(obj->v.obj.entries, cap * sizeof *entries);
+  if (!entries) scr_json_oom();
+  memset(entries + obj->v.obj.cap, 0, (cap - obj->v.obj.cap) * sizeof *entries);
+  obj->v.obj.entries = entries;
+  obj->v.obj.cap = cap;
+}
+
 static void scr_dyn_obj_append_shared(ScrDyn *obj, char *key, size_t key_len, ScrDyn *value) {
   scr_dyn_region_store(obj, value);
-  if (obj->v.obj.len == obj->v.obj.cap) {
-    size_t cap = obj->v.obj.cap ? obj->v.obj.cap * 2 : 4;
-    ScrDynEntry *entries = scr_mem_realloc(obj->v.obj.entries, cap * sizeof *entries);
-    if (!entries) scr_json_oom();
-    memset(entries + obj->v.obj.cap, 0, (cap - obj->v.obj.cap) * sizeof *entries);
-    obj->v.obj.entries = entries;
-    obj->v.obj.cap = cap;
-  }
+  if (obj->v.obj.len == obj->v.obj.cap) scr_dyn_obj_grow(obj);
   SCR_JS_SHAPE_RESET(obj);
   ScrDynEntry *e = &obj->v.obj.entries[obj->v.obj.len++];
   if (e->key != key) {
-    ((ScrDynKey *)(key - offsetof(ScrDynKey, bytes)))->rc++;
+    scr_dyn_key_retain(key);
     scr_dyn_key_release(e->key, e->key_len);
     e->key = key;
+    if (!scr_dyn_key_is_atom(key)) obj->v.obj.rc_keys = true;
   }
   e->key_len = key_len;
   e->value = value;
@@ -14467,6 +14982,31 @@ bool scr_dyn_abstract_eq(const ScrDyn *a, const ScrDyn *b) {
   return scr_dyn_number_coerce_js(a, &left) && scr_dyn_number_coerce_js(b, &right) && left == right;
 }
 
+#ifdef SCR_FUNCTION_PROTOTYPE
+static SCR_TL ScrDyn *scr_builtin_function_prototype;
+
+static void scr_function_prototype_cleanup(void) {
+  ScrDyn *value = scr_builtin_function_prototype;
+  scr_builtin_function_prototype = NULL;
+  scr_dyn_release(value);
+}
+
+static ScrDyn *scr_function_prototype_call(ScrClosure *closure, ScrDyn *const *args, size_t argc) {
+  (void)closure; (void)args; (void)argc;
+  return scr_dyn_retain(scr_dyn_undefined());
+}
+
+ScrDyn *scr_dyn_function_prototype(void) {
+  if (!scr_builtin_function_prototype) {
+    scr_builtin_function_prototype = scr_dyn_new_func(scr_closure_new(NULL, 0),
+      scr_function_prototype_call, 0, "native:Function.prototype", "");
+    scr_atexit(scr_function_prototype_cleanup);
+  }
+  return scr_dyn_retain(scr_builtin_function_prototype);
+}
+
+#endif
+
 static SCR_TL ScrDyn *scr_function_constructors[4];
 static SCR_TL bool scr_function_constructors_registered;
 
@@ -14508,11 +15048,15 @@ ScrDyn *scr_dyn_fn_get(const ScrDyn *d, const char *key, size_t key_len) {
   if (d->v.fn.class_obj && d->v.fn.class_obj->static_data && !owner->props)
     owner->props = scr_box_retain(d->v.fn.class_obj->static_data);
   if (d->v.fn.thunk == scr_function_constructor_call && key_len == 9 && !memcmp(key, "prototype", 9)) {
+#ifdef SCR_FUNCTION_PROTOTYPE
+    return scr_dyn_function_prototype();
+#else
     /* A function's `constructor.prototype`: Function.prototype has no value
      * here, and undefined would be a wrong answer. */
     static const char function_prototype[] = "Function.prototype through a constructor value is not supported yet";
     scr_throw_error_msg_code(SCR_ERR_ERROR, function_prototype, sizeof function_prototype - 1, "SC2020");
     return NULL;
+#endif
   }
   if (!d->v.fn.class_obj && key_len == 9 && !memcmp(key, "prototype", 9) && !owner->props) {
     if (owner->function_kind & 1) {
@@ -14525,8 +15069,17 @@ ScrDyn *scr_dyn_fn_get(const ScrDyn *d, const char *key, size_t key_len) {
   }
   if (owner->props) {
     ScrDyn *table = (ScrDyn *)scr_box_get_ref(owner->props); /* +1 */
-    ScrDyn *m = table ? scr_dyn_obj_get(table, key, key_len) : NULL;
-    ScrDyn *r = m ? scr_dyn_obj_read_receiver(table, key, key_len, d) : NULL;
+    ScrDyn *m = NULL;
+    ScrDyn *r = NULL;
+    if (table && table->kind == SCR_DYN_OBJ && table != scr_builtin_object_prototype) {
+      /* One lookup answers a plain data property. */
+      const ScrDynEntry *entry = scr_dyn_find_entry(table, key, key_len);
+      m = entry ? entry->value : NULL;
+      if (m) r = !entry->accessor ? scr_dyn_retain(m) : scr_dyn_obj_read_receiver(table, key, key_len, d);
+    } else {
+      m = table ? scr_dyn_obj_get(table, key, key_len) : NULL;
+      r = m ? scr_dyn_obj_read_receiver(table, key, key_len, d) : NULL;
+    }
     bool custom_prototype = table && (table->prototype || table->null_proto);
     if (!m && !scr_exc_pending() && custom_prototype)
       r = table->prototype ? scr_dyn_obj_read_receiver(table->prototype, key, key_len, d)
@@ -14555,6 +15108,8 @@ ScrDyn *scr_dyn_fn_get(const ScrDyn *d, const char *key, size_t key_len) {
     return scr_dyn_new_num((double)d->v.fn.arity);
   }
   if (key_len == 5 && memcmp(key, "apply", 5) == 0) return scr_dyn_function_apply();
+  if (key_len == 4 && memcmp(key, "call", 4) == 0) return scr_dyn_function_call();
+  if (key_len == 4 && memcmp(key, "bind", 4) == 0) return scr_dyn_function_bind();
   if (d->v.fn.class_obj && !d->v.fn.class_obj->static_data) {
     static const char message[] = "scriptc: class properties through unknown other than name and length are not supported";
     scr_throw_error_msg(SCR_ERR_TYPE, message, sizeof message - 1);
@@ -14917,7 +15472,22 @@ static void scr_function_apply_cleanup(void) {
 
 ScrDyn *scr_dyn_apply_array_like(const ScrDyn *target, const ScrDyn *receiver, const ScrDyn *arguments, const char *what) {
   ScrDyn *list = scr_dyn_new_arr();
-  if (arguments && arguments->kind != SCR_DYN_UNDEF && arguments->kind != SCR_DYN_NULL) {
+  bool dense = false;
+  /* A plain dense array hands over its elements directly: no length read,
+   * and no index key formatted and looked up per argument. */
+  if (arguments && arguments->kind == SCR_DYN_ARR && !arguments->v.arr.properties &&
+      !arguments->prototype) {
+    dense = true;
+    for (size_t i = 0; i < arguments->v.arr.len; i++)
+      if (!scr_dyn_arr_has_index(arguments, i)) {
+        dense = false;
+        break;
+      }
+    if (dense)
+      for (size_t i = 0; i < arguments->v.arr.len; i++)
+        scr_dyn_arr_push(list, scr_dyn_retain(arguments->v.arr.items[i]));
+  }
+  if (!dense && arguments && arguments->kind != SCR_DYN_UNDEF && arguments->kind != SCR_DYN_NULL) {
     if (!scr_iterator_object(arguments)) {
       static const char message[] = "CreateListFromArrayLike called on non-object";
       scr_throw_error_msg(SCR_ERR_TYPE, message, sizeof message - 1);
@@ -14972,6 +15542,66 @@ ScrDyn *scr_dyn_function_apply(void) {
   return scr_dyn_retain(scr_function_apply_value);
 }
 
+/* Function.prototype.call and bind read as values (`fn.call(t, ...args)`,
+ * `typeof fn.bind`): the receiver is the function they run. */
+static SCR_TL ScrDyn *scr_function_call_value;
+static SCR_TL ScrDyn *scr_function_bind_value;
+
+static void scr_function_call_bind_cleanup(void) {
+  scr_dyn_release(scr_function_call_value);
+  scr_dyn_release(scr_function_bind_value);
+  scr_function_call_value = NULL;
+  scr_function_bind_value = NULL;
+}
+
+static ScrDyn *scr_function_receiver(const char *message) {
+  ScrDyn *receiver = scr_dyn_this_get();
+  if (receiver->kind == SCR_DYN_FUNC) return receiver;
+  scr_dyn_release(receiver);
+  scr_throw_error_msg(SCR_ERR_TYPE, message, strlen(message));
+  return NULL;
+}
+
+static ScrDyn *scr_function_call_call(ScrClosure *closure, ScrDyn *const *args, size_t argc) {
+  (void)closure;
+  ScrDyn *receiver = scr_function_receiver("Function.prototype.call was called on a non-callable value");
+  if (!receiver) return NULL;
+  scr_dyn_this_push_dyn(argc >= 1 ? args[0] : scr_dyn_undefined());
+  ScrDyn *result = scr_dyn_call(receiver, argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0,
+    "Function.prototype.call");
+  scr_dyn_this_pop();
+  scr_dyn_release(receiver);
+  return result;
+}
+
+static ScrDyn *scr_function_bind_call(ScrClosure *closure, ScrDyn *const *args, size_t argc) {
+  (void)closure;
+  ScrDyn *receiver = scr_function_receiver("Bind must be called on a function");
+  if (!receiver) return NULL;
+  ScrDyn *result = scr_dyn_bind(receiver, args, argc);
+  scr_dyn_release(receiver);
+  return result;
+}
+
+static void scr_function_call_bind_init(void) {
+  if (scr_function_call_value) return;
+  scr_function_call_value = scr_dyn_new_func(scr_closure_new(NULL, 0), scr_function_call_call,
+    1, "native:Function.prototype.call", "call");
+  scr_function_bind_value = scr_dyn_new_func(scr_closure_new(NULL, 0), scr_function_bind_call,
+    1, "native:Function.prototype.bind", "bind");
+  scr_atexit(scr_function_call_bind_cleanup);
+}
+
+ScrDyn *scr_dyn_function_call(void) {
+  scr_function_call_bind_init();
+  return scr_dyn_retain(scr_function_call_value);
+}
+
+ScrDyn *scr_dyn_function_bind(void) {
+  scr_function_call_bind_init();
+  return scr_dyn_retain(scr_function_bind_value);
+}
+
 ScrDyn *scr_dyn_obj_read(const ScrDyn *d, const char *key, size_t key_len) {
   if (d->kind == SCR_DYN_PROXY) {
     ScrStr *name = scr_str_new(key, key_len);
@@ -15003,11 +15633,12 @@ static void scr_dyn_read_ics_reset(void) {
 
 static __attribute__((noinline)) ScrDyn *scr_dyn_obj_read_ic_miss(const ScrDyn *d, const ScrStr *key,
                                                                   ScrDynReadIc *ic) {
+  SCR_STAT(prop_read_ic_miss);
 #ifndef SCR_RC_AUDIT
   ScrDynEntry *entry = d != scr_builtin_object_prototype ? scr_dyn_find_entry(d, key->data, key->len) : NULL;
   if (entry && !entry->accessor) {
     if (ic->key != entry->key) {
-      ((ScrDynKey *)(entry->key - offsetof(ScrDynKey, bytes)))->rc++;
+      scr_dyn_key_retain(entry->key);
       if (ic->key) {
         scr_dyn_key_release(ic->key, ic->key_len);
       } else {
@@ -15038,8 +15669,10 @@ ScrDyn *scr_dyn_obj_read_ic(const ScrDyn *d, const ScrStr *key, ScrDynReadIc *ic
     const ScrDynEntry *entry = &d->v.obj.entries[index];
     if ((entry->key == ic->key ||
          (entry->key_len == key->len && scr_key_equal(entry->key, key->data, key->len))) &&
-        !entry->accessor && d != scr_builtin_object_prototype)
+        !entry->accessor && d != scr_builtin_object_prototype) {
+      SCR_STAT(prop_read_ic_hit);
       return scr_dyn_retain(entry->value);
+    }
   }
   return scr_dyn_obj_read_ic_miss(d, key, ic);
 }
@@ -17321,19 +17954,10 @@ typedef struct { void *key; ScrWeakEntry *head; } ScrWeakKeySlot;
 static SCR_TL ScrWeakKeySlot *scr_weak_keys;
 static SCR_TL size_t scr_weak_keys_mask, scr_weak_keys_used;
 
-/* Mixed in 64 bits on every target: uintptr_t is 32 bits on wasm32, where
- * these shifts would exceed its width. */
-static inline size_t scr_weak_mix(uint64_t bits) {
-  bits ^= bits >> 33;
-  bits *= UINT64_C(0xff51afd7ed558ccd);
-  bits ^= bits >> 29;
-  return (size_t)bits;
-}
 static inline size_t scr_weak_entry_hash(const ScrWeakMap *owner, const void *key, unsigned kind) {
   return scr_weak_mix((uint64_t)(uintptr_t)key ^ ((uint64_t)(uintptr_t)owner * UINT64_C(0x9E3779B97F4A7C15)) ^
                       ((uint64_t)kind << 56));
 }
-static inline size_t scr_weak_key_hash(const void *key) { return scr_weak_mix((uint64_t)(uintptr_t)key); }
 
 static void scr_weak_index_put(ScrWeakEntry *entry) {
   size_t j = scr_weak_entry_hash(entry->owner, entry->key, entry->kind) & scr_weak_index_mask;
@@ -17410,6 +18034,8 @@ static ScrWeakKeySlot *scr_weak_key_slot_put(void *key) {
   size_t j = scr_weak_key_hash(key) & scr_weak_keys_mask;
   while (scr_weak_keys[j].key && scr_weak_keys[j].key != key) j = (j + 1) & scr_weak_keys_mask;
   if (!scr_weak_keys[j].key) {
+    size_t bit = scr_weak_filter_bit(key);
+    scr_weak_key_filter[bit >> 6] |= UINT64_C(1) << (bit & 63);
     scr_weak_keys[j].key = key;
     scr_weak_keys[j].head = NULL;
     scr_weak_keys_used++;
@@ -17422,6 +18048,7 @@ static void scr_weak_key_slot_delete(ScrWeakKeySlot *slot) {
   if (--scr_weak_keys_used == 0) {
     free(scr_weak_keys);
     scr_weak_keys = NULL;
+    memset(scr_weak_key_filter, 0, sizeof scr_weak_key_filter);
     return;
   }
   for (size_t k = i;;) {
@@ -18237,17 +18864,143 @@ ScrDyn *scr_dyn_native_map_new(const ScrDyn *seed) {
   return result;
 }
 
+#ifdef SCR_MAP_CLASS
+static SCR_TL ScrDyn *scr_map_class_prototype_value;
+
+ScrDyn *scr_dyn_map_class_invoke(ScrDyn *receiver, const char *method, ScrDyn *const *args, size_t argc) {
+  ScrDyn *storage = scr_dyn_map_class_storage(receiver);
+  if (!storage) {
+    if (!scr_exc_pending()) {
+      static const char message[] = "Method Map.prototype called on incompatible receiver";
+      scr_throw_error_msg(SCR_ERR_TYPE, message, sizeof message - 1);
+    }
+    return NULL;
+  }
+  ScrDyn *result;
+  if (!strcmp(method, "keys") || !strcmp(method, "values") || !strcmp(method, "entries")) {
+    unsigned selection = !strcmp(method, "keys") ? 1 : !strcmp(method, "values") ? 0 : 2;
+    result = scr_native_collection_iterator(storage, selection);
+  } else result = scr_native_map_invoke(storage->v.handle.ptr, receiver, method, args, argc, method);
+  scr_dyn_release(storage);
+  return result;
+}
+
+static ScrDyn *scr_map_size_getter(ScrClosure *closure, ScrDyn *const *args, size_t argc) {
+  (void)closure; (void)args; (void)argc;
+  ScrDyn *receiver = scr_dyn_this_get();
+  ScrDyn *storage = scr_dyn_map_class_storage(receiver);
+  ScrDyn *result = storage ? scr_dyn_new_num(scr_map_size(storage->v.handle.ptr)) : NULL;
+  if (!storage && !scr_exc_pending()) {
+    static const char message[] = "Method get Map.prototype.size called on incompatible receiver";
+    scr_throw_error_msg(SCR_ERR_TYPE, message, sizeof message - 1);
+  }
+  scr_dyn_release(storage);
+  scr_dyn_release(receiver);
+  return result;
+}
+
+/* Populate the constructor's ordinary prototype table once; the constructor
+ * owns its lifetime, just as for ordinary function prototypes. */
+void scr_dyn_map_class_prototype(ScrDyn *constructor) {
+  ScrDyn *prototype = scr_dyn_new_obj();
+  scr_dyn_fn_seed_prototype(constructor, scr_dyn_retain(prototype));
+  ScrStr *constructor_name = scr_str_new("constructor", 11);
+  scr_dyn_define_hidden(prototype, constructor_name, constructor);
+  scr_str_release(constructor_name);
+  scr_map_class_prototype_value = prototype;
+  static const char *const methods[] = {"get", "set", "has", "delete", "clear", "forEach", "values", "keys", "entries"};
+  ScrStr *family = scr_str_new("Map", 3);
+  for (size_t i = 0; i < sizeof methods / sizeof methods[0]; i++) {
+    ScrStr *name = scr_str_new(methods[i], strlen(methods[i]));
+    ScrDyn *method = scr_dyn_builtin_method(family, name);
+    ScrDyn *descriptor = scr_dyn_new_obj();
+    scr_dyn_obj_set(descriptor, "value", 5, method);
+    scr_dyn_obj_set(descriptor, "writable", 8, scr_dyn_new_bool(true));
+    scr_dyn_obj_set(descriptor, "configurable", 12, scr_dyn_new_bool(true));
+    ScrDyn *key = scr_dyn_new_str(name);
+    ScrDyn *defined = scr_dyn_define_property(prototype, key, descriptor);
+    scr_dyn_release(defined);
+    scr_dyn_release(key);
+    scr_dyn_release(descriptor);
+    scr_str_release(name);
+  }
+  scr_str_release(family);
+  ScrStr *iterator_name = scr_str_new("iterator", 8);
+  ScrSym *iterator = scr_sym_well_known(iterator_name);
+  ScrDyn *iterator_key = scr_dyn_new_symbol(iterator);
+  scr_dyn_install_iterator_symbol(iterator_key);
+  ScrDyn *iterator_descriptor = scr_dyn_new_obj();
+  scr_dyn_obj_set(iterator_descriptor, "value", 5, scr_dyn_obj_read(prototype, "entries", 7));
+  scr_dyn_obj_set(iterator_descriptor, "writable", 8, scr_dyn_new_bool(true));
+  scr_dyn_obj_set(iterator_descriptor, "configurable", 12, scr_dyn_new_bool(true));
+  ScrDyn *iterator_defined = scr_dyn_define_property(prototype, iterator_key, iterator_descriptor);
+  scr_dyn_release(iterator_defined);
+  scr_dyn_release(iterator_descriptor);
+  scr_dyn_release(iterator_key);
+  scr_sym_release(iterator);
+  scr_str_release(iterator_name);
+  ScrDyn *getter = scr_dyn_new_func(scr_closure_new(NULL, 0), scr_map_size_getter, 0, "native:Map", "get size");
+  ScrDyn *descriptor = scr_dyn_new_obj();
+  scr_dyn_obj_set(descriptor, "get", 3, getter);
+  scr_dyn_obj_set(descriptor, "configurable", 12, scr_dyn_new_bool(true));
+  ScrStr *size_name = scr_str_new("size", 4);
+  ScrDyn *key = scr_dyn_new_str(size_name);
+  ScrDyn *defined = scr_dyn_define_property(prototype, key, descriptor);
+  scr_dyn_release(defined);
+  scr_dyn_release(key);
+  scr_str_release(size_name);
+  scr_dyn_release(descriptor);
+  scr_dyn_release(prototype);
+}
+
+ScrDyn *scr_dyn_map_class_member(const ScrDyn *value, const char *key, size_t len) {
+  ScrDyn *storage = scr_dyn_map_class_storage(value);
+  if (!storage) return NULL;
+  scr_dyn_release(storage);
+  ScrDyn *view = scr_dyn_typed_ref_materialize(value);
+  ScrDyn *owner = view && !scr_exc_pending() ? scr_dyn_property_owner(view, key, len) : NULL;
+  bool overridden = owner && owner != scr_map_class_prototype_value;
+  scr_dyn_release(view);
+  if (overridden || scr_exc_pending() || !scr_map_class_prototype_value) return NULL;
+  return scr_dyn_obj_read_receiver(scr_map_class_prototype_value, key, len, value);
+}
+#endif
+
 bool scr_dyn_native_map_is(const ScrDyn *value) {
+#ifdef SCR_MAP_CLASS
+  if (value && value->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *storage = scr_dyn_map_class_storage(value);
+    bool result = storage != NULL;
+    scr_dyn_release(storage);
+    return result;
+  }
+#endif
   return value && value->kind == SCR_DYN_HANDLE && value->v.handle.tag == SCR_DYNH_MAP;
 }
 
 ScrMap *scr_dyn_native_map_check(const ScrDyn *value, const ScrDynPath *path) {
   if (!scr_dyn_native_map_is(value)) { scr_dyn_check_fail(path, "Map", value); return NULL; }
+#ifdef SCR_MAP_CLASS
+  if (value->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *storage = scr_dyn_map_class_storage(value);
+    ScrMap *map = storage ? scr_map_retain(storage->v.handle.ptr) : NULL;
+    scr_dyn_release(storage);
+    return map;
+  }
+#endif
   return scr_map_retain(value->v.handle.ptr);
 }
 
 bool scr_dyn_native_collection_is(const ScrDyn *value, int map, const char *type) {
   if (!(map ? scr_dyn_native_map_is(value) : scr_dyn_native_set_is(value))) return false;
+#ifdef SCR_MAP_CLASS
+  if (map && value->kind == SCR_DYN_TYPED_REF) {
+    ScrDyn *storage = scr_dyn_map_class_storage(value);
+    bool result = storage && scr_dyn_native_collection_is(storage, map, type);
+    scr_dyn_release(storage);
+    return result;
+  }
+#endif
   const ScrMap *storage = value->v.handle.ptr;
   // A generic checked view uses dyn_ops to box/unbox the same live storage.
   return !type || (storage->dyn_ops && strcmp(storage->dyn_ops->type, type) == 0);
@@ -18258,6 +19011,9 @@ ScrMap *scr_dyn_native_collection_check(const ScrDyn *value, int map, const char
     scr_dyn_check_fail(path, type ? type : map ? "Map" : "Set", value);
     return NULL;
   }
+#ifdef SCR_MAP_CLASS
+  if (map && value->kind == SCR_DYN_TYPED_REF) return scr_dyn_native_map_check(value, path);
+#endif
   return scr_map_retain(value->v.handle.ptr);
 }
 

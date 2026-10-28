@@ -61,6 +61,35 @@ describe("runtime feature snapshots", () => {
     });
   });
 
+  test("ordinary Maps keep the default runtime while subclass storage enables its bridge and symbol protocol", () => {
+    const mod = module();
+    mod.functions[0]!.body.push(call("dyn.construct"));
+    expect(moduleRuntimeFeatures(mod).mapClass).toBe(false);
+    mod.functions[0]!.body.push(call("map.classStorage"));
+    expect(moduleRuntimeFeatures(mod)).toMatchObject({ mapClass: true, symbol: true });
+  });
+
+  test("prototype reflection selects its runtime variant without changing ordinary dynamic prototype queries", () => {
+    const mod = module();
+    mod.functions[0]!.body.push(call("dyn.getPrototype"));
+    expect(moduleRuntimeFeatures(mod).functionPrototype).toBe(false);
+    mod.functions[0]!.body.push(call("dyn.functionPrototype"));
+    expect(moduleRuntimeFeatures(mod).functionPrototype).toBe(true);
+    mod.functions[0]!.body = [call("global.namespaceInstall")];
+    expect(moduleRuntimeFeatures(mod).functionPrototype).toBe(true);
+    mod.functions[0]!.body = [call("dyn.literalPrototype")];
+    expect(moduleRuntimeFeatures(mod).functionPrototype).toBe(true);
+    mod.functions[0]!.body = [call("dyn.legacyClassSuper")];
+    expect(moduleRuntimeFeatures(mod).functionPrototype).toBe(true);
+  });
+
+  test("DateTimeFormat links its optional unit only when the constructor is emitted", () => {
+    const mod = module();
+    expect(moduleRuntimeFeatures(mod).intlDateTimeFormat).toBe(false);
+    mod.functions[0]!.body.push(call("intl.dateTimeFormatNew"));
+    expect(moduleRuntimeFeatures(mod)).toMatchObject({ intlDateTimeFormat: true, dynTier: false });
+  });
+
   test("retains runtime units needed only by nested handle storage", () => {
     const mod = module();
     mod.functions[0]!.locals.push({

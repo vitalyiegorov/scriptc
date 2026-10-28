@@ -140,3 +140,115 @@ test("any rebinding or unknown creation site keeps captured reads owned", () => 
   const asyncOuter = outer([closure("reader", ["options"])], { async: true });
   expect(stable("reader", asyncOuter, reader).size).toBe(0);
 });
+
+function embedded(name: string, ...functions: IrFunction[]): Set<string> {
+  const map = new Map(functions.map((fn) => [fn.name, fn]));
+  return new LazyCaptures(map).embeddedCaptures(name);
+}
+const decl = (localId: string, init: IrExpr | null = ref("plain")): IrStmt => ({
+  kind: "varDecl",
+  localId,
+  init,
+  loc,
+});
+function withLocal(fn: IrFunction, id: string, mutable = true): IrFunction {
+  fn.locals.push({ id, name: id, type: record, mutable, boxed: true });
+  return fn;
+}
+
+test("captures nothing rebinds are embedded in the closure", () => {
+  const reader = lifted("reader", [{ kind: "return", value: ref("options"), loc }]);
+  expect(embedded("reader", outer([closure("reader", ["options"])]), reader)).toEqual(
+    new Set(["options"]),
+  );
+  // A declaration followed by closures, a nested capture of a capture.
+  const declared = withLocal(outer([decl("local"), closure("reader", ["local"])]), "local", false);
+  expect(embedded("reader", declared, reader)).toEqual(new Set(["options"]));
+  const inner = lifted("inner", [{ kind: "return", value: ref("x"), loc }], "x");
+  const middle = lifted("middle", [closure("inner", ["mid"])], "mid");
+  expect(embedded("inner", outer([closure("middle", ["options"])]), middle, inner)).toEqual(
+    new Set(["x"]),
+  );
+});
+
+test("a binding written after capture, or by the closure, stays boxed", () => {
+  const reader = lifted("reader", [{ kind: "return", value: ref("options"), loc }]);
+  expect(
+    embedded("reader", outer([closure("reader", ["options"]), assign("options")]), reader).size,
+  ).toBe(0);
+  const writer = lifted("writer", [assign("options")]);
+  expect(embedded("writer", outer([closure("writer", ["options"])]), writer).size).toBe(0);
+  const later = withLocal(
+    outer([decl("local"), closure("reader", ["local"]), assign("local")]),
+    "local",
+  );
+  expect(embedded("reader", later, reader).size).toBe(0);
+  // One site over an unboxed or mutable source is enough to keep the box.
+  const mixed = outer([closure("reader", ["options"]), closure("reader", ["plain"])]);
+  expect(embedded("reader", mixed, reader).size).toBe(0);
+});
+
+test("a closure built before its binding is initialized keeps the box", () => {
+  const reader = lifted("reader", [{ kind: "return", value: ref("local"), loc }], "local");
+  const early = withLocal(outer([closure("reader", ["local"]), decl("local")]), "local", false);
+  expect(embedded("reader", early, reader).size).toBe(0);
+  // The closure inside the declaration's own initializer sees it unset.
+  const selfRef = withLocal(
+    outer([
+      decl("local", {
+        kind: "closure",
+        fnName: "reader",
+        captures: ["local"],
+        type: funcOf([], F64),
+        loc,
+      }),
+    ]),
+    "local",
+    false,
+  );
+  expect(embedded("reader", selfRef, reader).size).toBe(0);
+  // Switch-case and loop-head declarations can be skipped on a later pass.
+  const inSwitch = withLocal(
+    outer([
+      {
+        kind: "switch",
+        disc: ref("plain"),
+        cases: [{ test: null, body: [decl("local"), closure("reader", ["local"])] }],
+        loc,
+      } as unknown as IrStmt,
+    ]),
+    "local",
+    false,
+  );
+  expect(embedded("reader", inSwitch, reader).size).toBe(0);
+});
+
+test("a var declared and assigned by the next statement embeds after the assignment", () => {
+  const reader = lifted("reader", [{ kind: "return", value: ref("local"), loc }], "local");
+  const hoisted = withLocal(
+    outer([decl("local", null), assign("local"), closure("reader", ["local"])]),
+    "local",
+  );
+  expect(embedded("reader", hoisted, reader)).toEqual(new Set(["local"]));
+  // A second write, or a closure between declaration and assignment, keeps the box.
+  const twice = withLocal(
+    outer([decl("local", null), assign("local"), closure("reader", ["local"]), assign("local")]),
+    "local",
+  );
+  expect(embedded("reader", twice, reader).size).toBe(0);
+  const between = withLocal(
+    outer([decl("local", null), closure("reader", ["local"]), assign("local")]),
+    "local",
+  );
+  expect(embedded("reader", between, reader).size).toBe(0);
+});
+
+test("async and generator bodies keep their boxes", () => {
+  const reader = lifted("reader", [{ kind: "return", value: ref("options"), loc }]);
+  expect(
+    embedded("reader", outer([closure("reader", ["options"])], { async: true }), reader).size,
+  ).toBe(0);
+  expect(
+    embedded("reader", outer([closure("reader", ["options"])]), { ...reader, async: true }).size,
+  ).toBe(0);
+});

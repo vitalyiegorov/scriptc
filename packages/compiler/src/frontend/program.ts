@@ -40,10 +40,18 @@
  *    that path (no snapshot pins it). */
 
 import { builtinModules } from "node:module";
+import {
+  genericLegacyDecoratorSignatures,
+  lowerLegacyDecorators,
+  registerLegacyDecoratorClasses,
+  registerTranspiledLegacyDecoratorClasses,
+  type LegacyDecoratorSource,
+} from "./legacy-decorators.js";
 import { dirname, isAbsolute, resolve } from "node:path";
 import * as ts from "./ts7/adapter.js";
 import type { ScrDiagnostic } from "../diagnostics/diagnostic.js";
 import {
+  assignClassFieldsDiag,
   commonJsModuleSyntaxDiag,
   invalidPackageConfigDiag,
   strictNullChecksFloorDiag,
@@ -99,7 +107,12 @@ import {
   isShimmedImport,
   npmStaticOmitsPackage,
 } from "./package-shims.js";
-import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
+import {
+  isProvenanceSourceFile,
+  provenanceEntryFor,
+  provenancePaths,
+} from "./provenance-registry.js";
+import { provenanceExternalPaths } from "./provenance-externals.js";
 import { cjsLexedExportsOfFile, cjsVisibleNames } from "./cjs-syntax.js";
 import {
   ambientDtsPath,
@@ -319,6 +332,11 @@ function adoptProjectConfig7(
     diags.push(strictNullChecksFloorDiag(configFile));
     adopted["strictNullChecks"] = true;
   }
+  if (
+    adopted["experimentalDecorators"] === true &&
+    parsed.options["useDefineForClassFields"] === false
+  )
+    diags.push(assignClassFieldsDiag(configFile));
   // The project's own library selection, kept only to explain errors: the
   // checker always uses scriptc's fixed library set (FORCED_OPTIONS).
   const rawLib = parsed.options["lib"];
@@ -395,6 +413,8 @@ export interface LoadResult {
    * The program holds their rewritten text; positions in diagnostics refer
    * to it. */
   jsxSources?: ReadonlyMap<string, LoweredJsx>;
+  legacyDecoratorClasses?: ReadonlySet<ts.Node>;
+  legacyDecoratorSources?: ReadonlyMap<string, LegacyDecoratorSource>;
   /** With JSX sources: the program over the original text, whose TypeScript
    * errors are the program's, and its project world when it has errors. */
   tscWorld?: {
@@ -697,7 +717,9 @@ function entryPackageProgramRoots7(
   for (const sf of program.getImplementationSourceFiles()) {
     if (
       sf.isDeclarationFile ||
-      (!belongsToEntry(sf.fileName) && npmStaticPackageOfPath(sf.fileName) === null)
+      (!belongsToEntry(sf.fileName) &&
+        npmStaticPackageOfPath(sf.fileName) === null &&
+        !isProvenanceSourceFile(sf.fileName))
     )
       continue;
     for (const specifier of sf.imports) {
@@ -724,7 +746,7 @@ function entryPackageProgramRoots7(
       if (
         target === null &&
         rootNpmStaticEdges &&
-        npmStaticPackageOfPath(sf.fileName) !== null &&
+        (npmStaticPackageOfPath(sf.fileName) !== null || isProvenanceSourceFile(sf.fileName)) &&
         !isRelativeSpecifier(specifier.text)
       ) {
         const spec = specifier.text;
@@ -847,6 +869,7 @@ function loadProgram7(
   /** The declaration-typed boundary's projection (decl-projection.ts):
    * answers rewritten user files for the lowering world, or null. */
   projector?: (program: ts.Program) => DeclProjection | null,
+  globalDeclarationRoots: readonly string[] = [],
 ): LoadResult & { disposeAll: () => void } {
   const config = adoptProjectConfig7(host, entryPath);
   const configuredPaths = config.options["paths"];
@@ -881,14 +904,29 @@ function loadProgram7(
       ...(configuredPaths as Record<string, string[]> | undefined),
       // Keep an index-signature source for native lowering when provenance is absent.
       // oxlint-disable-next-line unicorn/no-useless-fallback-in-spread
-      ...(provenance ?? {}),
+      ...(provenance === null
+        ? {}
+        : {
+            // Exact mappings for the externals the source trees import;
+            // the registry's wildcard stays as the fallback.
+            ...provenanceExternalPaths(
+              (from, spec) => resolveBareModule(from, spec)?.typesFile ?? null,
+              (spec) => canonicalBuiltinModule(spec) !== null,
+            ),
+            ...provenance,
+          }),
     };
     for (const [specifier, declarationPath] of externalTypes) {
       paths[specifier] = [declarationPath];
     }
     options = { ...options, paths };
   }
-  const coreRoots = [entryPath, ambientDtsPath(), nodeTypes ?? fallbackDtsPath()];
+  const coreRoots = [
+    entryPath,
+    ambientDtsPath(),
+    nodeTypes ?? fallbackDtsPath(),
+    ...globalDeclarationRoots,
+  ];
   const programRoots = [...coreRoots];
   let program = host.createProgram([...programRoots, overridesDtsPath()], options);
   try {
@@ -988,6 +1026,43 @@ function loadProgram7(
         }
       }
     }
+    const legacyDecoratorClasses = new Set<ts.Node>();
+    const legacyDecoratorSources = new Map<string, LegacyDecoratorSource>();
+    if (options.experimentalDecorators === true) {
+      const checker = program.getTypeChecker();
+      const genericSignatures = genericLegacyDecoratorSignatures(
+        program.getImplementationSourceFiles(),
+        checker,
+      );
+      const sources = legacyDecoratorSources;
+      for (const source of program.getImplementationSourceFiles()) {
+        const lowered = lowerLegacyDecorators(source, checker, { ...options, genericSignatures });
+        if (lowered !== null) sources.set(source.fileName, lowered);
+      }
+      if (sources.size > 0) {
+        const original = program;
+        if (tscWorld === undefined) {
+          const diagnostics = ts.getPreEmitDiagnostics(original);
+          tscWorld = {
+            program: original,
+            diagnostics,
+            projectWorld: diagnostics.some((d) => d.category === ts.DiagnosticCategory.Error)
+              ? host.createProgram(programRoots, options)
+              : null,
+          };
+        }
+        for (const [file, lowered] of sources) host.addVirtualFile(file, lowered.text);
+        program = host.createProgram([...programRoots, overridesDtsPath()], options);
+        for (const [file, lowered] of sources)
+          registerLegacyDecoratorClasses(
+            program.getSourceFile(file)!,
+            lowered,
+            legacyDecoratorClasses,
+          );
+        if (original !== tscWorld.program) original.dispose();
+      }
+    }
+    registerTranspiledLegacyDecoratorClasses(program, legacyDecoratorClasses);
     const entry = program.getSourceFile(entryPath);
     if (!entry) throw new Error(`could not load ${entryPath}`);
     const externalTypeSpecifiersByFile = externalTypeFileClosure7(program, externalTypes);
@@ -996,6 +1071,8 @@ function loadProgram7(
       program,
       entry,
       moduleOrder: [],
+      legacyDecoratorClasses,
+      legacyDecoratorSources,
       configDiags: config.diags,
       ...(declBoundaryNotes.length > 0 ? { declBoundaryNotes } : {}),
       typeWorld: {
@@ -1250,6 +1327,7 @@ export function loadProgram(
       externalTypes,
       npmStaticPackages.length > 0,
       projector,
+      typeExports.globalRoots,
     );
     // Shape inference, stage S1: a report only (SCRIPTC_DEBUG_SHAPES).
     const shapes = process.env["SCRIPTC_DEBUG_SHAPES"];
@@ -5344,8 +5422,14 @@ function preflight7(load: LoadResult): {
     return sf !== undefined && names.has(sf.text.slice(d.pos, d.end));
   };
 
+  // A provenance-mapped package's TypeScript is checked against the
+  // package's own type world (rxjs names DOM globals and Node's Timeout
+  // class), not scriptc's ES2025 + Node one: like an opted-in package's
+  // shipped JS, its diagnostics are not the program's, and the lowerer
+  // fences each reached construct it cannot compile.
   const npmStaticFileSuppressed = (d: ts.Diagnostic): boolean =>
-    d.fileName !== undefined && npmStaticPackageOfPath(d.fileName) !== null;
+    d.fileName !== undefined &&
+    (npmStaticPackageOfPath(d.fileName) !== null || isProvenanceSourceFile(d.fileName));
 
   const unselectedPackageJsFile = (file: string): boolean =>
     isJsSourceFileName(file) &&
@@ -5498,16 +5582,27 @@ function preflight7(load: LoadResult): {
           end: lowered.rewrittenPosition(diag.loc.end, true),
         };
       }
+      const legacy = load.legacyDecoratorSources?.get(diag.loc.file);
+      if (legacy !== undefined)
+        diag.loc = {
+          ...diag.loc,
+          start: legacy.rewrittenPosition(diag.loc.start, false),
+          end: legacy.rewrittenPosition(diag.loc.end, true),
+        };
       diags.push(diag);
     }
-  } else if (load.jsxSources !== undefined) {
-    for (const file of load.jsxSources.keys()) {
+  } else if (load.jsxSources !== undefined || load.legacyDecoratorSources !== undefined) {
+    const rewrittenFiles = new Set([
+      ...(load.jsxSources?.keys() ?? []),
+      ...(load.legacyDecoratorSources?.keys() ?? []),
+    ]);
+    for (const file of rewrittenFiles) {
       const sf = program.getSourceFile(file);
       if (sf === undefined) continue;
       const own = [...program.getSyntacticDiagnostics(sf), ...program.getSemanticDiagnostics(sf)];
       for (const d of keptErrors(program, own)) {
         const diag = toPassthrough(d);
-        diag.message = `${diag.message} (in the call this JSX lowers to)`;
+        diag.message = `${diag.message} ${load.legacyDecoratorSources?.has(file) ? "(in the legacy decorator lowering)" : "(in the call this JSX lowers to)"}`;
         diags.push(diag);
       }
     }
@@ -5529,7 +5624,8 @@ function preflight7(load: LoadResult): {
         !sf.fileName.endsWith(".json") &&
         (!isNodeModulesPath(sf.fileName) ||
           entryPackageFile(sf.fileName) ||
-          npmStaticPackageOfPath(sf.fileName) !== null) &&
+          npmStaticPackageOfPath(sf.fileName) !== null ||
+          isProvenanceSourceFile(sf.fileName)) &&
         !unselectedPackageJsFile(sf.fileName),
     );
   // Files reached only through `import type` / `export type … from` are
@@ -6776,6 +6872,103 @@ function hasNodeTsDefaultInterfacePlaceholder7(sf: ts.SourceFile): boolean {
   return sf.fileName.endsWith(".ts") && nearestPackageType(sf.fileName) === null;
 }
 
+/** Runtime exports remain distinct from supplemental JSDoc type aliases. */
+export function runtimeExportSymbol7(
+  program: ts.Program,
+  dep: ts.SourceFile,
+  name: string,
+  seenModules: ReadonlySet<ts.SourceFile> = new Set(),
+): ts.Symbol | undefined {
+  const checker = program.getTypeChecker();
+  if (seenModules.has(dep)) return undefined;
+  const nextSeen = new Set(seenModules);
+  nextSeen.add(dep);
+  const module = checker.getSymbolAtLocation(dep);
+  const exported = module?.getExports().get(ts.escapedSymbolName(name));
+  if (exported !== undefined) {
+    let resolved = exported;
+    const seenSymbols = new Set<ts.Symbol>();
+    while ((resolved.flags & ts.SymbolFlags.Alias) !== 0 && !seenSymbols.has(resolved)) {
+      seenSymbols.add(resolved);
+      resolved = checker.getAliasedSymbol(resolved);
+    }
+    if (resolved.flags & ts.SymbolFlags.Value) return resolved;
+    // Node's strip-only TypeScript loader materializes a direct `export
+    // default interface X {}` as an empty default export in an ambiguous
+    // `.ts` file. The checker correctly classifies the declaration as
+    // type-only, but the native ESM linker sees the runtime placeholder.
+    if (
+      name === "default" &&
+      hasNodeTsDefaultInterfacePlaceholder7(dep) &&
+      resolved.declarations.some(
+        (declaration) =>
+          ts.isInterfaceDeclaration(declaration) &&
+          ts
+            .getModifiers(declaration)
+            ?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword) === true &&
+          ts
+            .getModifiers(declaration)
+            ?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) === true,
+      )
+    ) {
+      return resolved;
+    }
+    // Type-only declarations disappear at runtime and cannot shadow a
+    // value exported through a star. This includes the JSDoc aliases
+    // appended to statically compiled npm entry points for enum types.
+  }
+
+  for (const statement of dep.statements.nodes) {
+    if (
+      !ts.isExportDeclaration(statement) ||
+      statement.isTypeOnly ||
+      !statement.exportClause ||
+      !ts.isNamedExports(statement.exportClause) ||
+      !statement.moduleSpecifier ||
+      !ts.isStringLiteral(statement.moduleSpecifier)
+    )
+      continue;
+    const exported = statement.exportClause.elements.nodes.find(
+      (element) => !element.isTypeOnly && element.name.text === name,
+    );
+    if (!exported) continue;
+    const target =
+      resolveImport7(program, dep, statement.moduleSpecifier.text) ??
+      npmStaticDepSf7(program, dep, statement.moduleSpecifier.text);
+    return target
+      ? runtimeExportSymbol7(
+          program,
+          target,
+          (exported.propertyName ?? exported.name).text,
+          nextSeen,
+        )
+      : undefined;
+  }
+
+  // TypeScript 7's client-side module symbol exposes the module's own
+  // export table but not names contributed by `export *`. Follow those
+  // source edges explicitly, applying the ESM ambiguity rule: the same
+  // resolved symbol may arrive through multiple stars, while distinct
+  // symbols make the name unavailable. `default` never star-reexports.
+  if (name === "default") return undefined;
+  let starExport: ts.Symbol | undefined;
+  for (const stmt of dep.statements.nodes) {
+    if (!ts.isExportDeclaration(stmt) || stmt.isTypeOnly || stmt.exportClause !== undefined)
+      continue;
+    if (stmt.moduleSpecifier === undefined || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    const target =
+      resolveImport7(program, dep, stmt.moduleSpecifier.text) ??
+      npmStaticDepSf7(program, dep, stmt.moduleSpecifier.text);
+    if (target === null || target.fileName.endsWith(".json") || !isNodeEsmFile7(target, program))
+      continue;
+    const candidate = runtimeExportSymbol7(program, target, name, nextSeen);
+    if (candidate === undefined) continue;
+    if (starExport !== undefined && starExport !== candidate) return undefined;
+    starExport = candidate;
+  }
+  return starExport;
+}
+
 /** Finds the first native-ESM link failure in the static module graph rooted
  * at `entry`. This is used both for startup linking of the entry graph and
  * for dynamic imports: a dynamically loaded graph rejects its import promise
@@ -6784,77 +6977,20 @@ function analyzeEsmNamedImportLinks(
   program: ts.Program,
   entry: ts.SourceFile,
 ): EsmNamedImportLinkAnalysis {
-  const checker = program.getTypeChecker();
   const resolveEdge = (from: ts.SourceFile, spec: string): ts.SourceFile | null => {
     const project = resolveImport7(program, from, spec);
     if (project !== null) return project;
     return npmStaticDepSf7(program, from, spec);
   };
 
-  const runtimeExport = (
-    dep: ts.SourceFile,
-    name: string,
-    seenModules: ReadonlySet<ts.SourceFile> = new Set(),
-  ): ts.Symbol | undefined => {
-    if (seenModules.has(dep)) return undefined;
-    const nextSeen = new Set(seenModules);
-    nextSeen.add(dep);
-    const module = checker.getSymbolAtLocation(dep);
-    const exported = module?.getExports().get(ts.escapedSymbolName(name));
-    if (exported !== undefined) {
-      let resolved = exported;
-      const seenSymbols = new Set<ts.Symbol>();
-      while ((resolved.flags & ts.SymbolFlags.Alias) !== 0 && !seenSymbols.has(resolved)) {
-        seenSymbols.add(resolved);
-        resolved = checker.getAliasedSymbol(resolved);
-      }
-      if (resolved.flags & ts.SymbolFlags.Value) return resolved;
-      // Node's strip-only TypeScript loader materializes a direct `export
-      // default interface X {}` as an empty default export in an ambiguous
-      // `.ts` file. The checker correctly classifies the declaration as
-      // type-only, but the native ESM linker sees the runtime placeholder.
-      if (
-        name === "default" &&
-        hasNodeTsDefaultInterfacePlaceholder7(dep) &&
-        resolved.declarations.some(
-          (declaration) =>
-            ts.isInterfaceDeclaration(declaration) &&
-            ts
-              .getModifiers(declaration)
-              ?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword) === true &&
-            ts
-              .getModifiers(declaration)
-              ?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) === true,
-        )
-      ) {
-        return resolved;
-      }
-      return undefined;
-    }
-
-    // TypeScript 7's client-side module symbol exposes the module's own
-    // export table but not names contributed by `export *`. Follow those
-    // source edges explicitly, applying the ESM ambiguity rule: the same
-    // resolved symbol may arrive through multiple stars, while distinct
-    // symbols make the name unavailable. `default` never star-reexports.
-    if (name === "default") return undefined;
-    let starExport: ts.Symbol | undefined;
-    for (const stmt of dep.statements.nodes) {
-      if (!ts.isExportDeclaration(stmt) || stmt.isTypeOnly || stmt.exportClause !== undefined)
-        continue;
-      if (stmt.moduleSpecifier === undefined || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
-      const target = resolveEdge(dep, stmt.moduleSpecifier.text);
-      if (target === null || target.fileName.endsWith(".json") || !isNodeEsmFile7(target, program))
-        continue;
-      const candidate = runtimeExport(target, name, nextSeen);
-      if (candidate === undefined) continue;
-      if (starExport !== undefined && starExport !== candidate) return undefined;
-      starExport = candidate;
-    }
-    return starExport;
-  };
+  const runtimeExport = (dep: ts.SourceFile, name: string): ts.Symbol | undefined =>
+    runtimeExportSymbol7(program, dep, name);
 
   const firstMissingOf = (sf: ts.SourceFile): BadEsmImport | null => {
+    // A provenance-mapped package's TypeScript stands for its published
+    // build, where tsc erased the type-only imports and exports Node's
+    // linker would otherwise report missing.
+    if (isProvenanceSourceFile(sf.fileName)) return null;
     const imports: {
       local: string;
       exportName: string;
@@ -7122,6 +7258,15 @@ export {
  * declare fields by constructor assignment. */
 export function isJsSourceFile(sf: ts.SourceFile): boolean {
   return isJsSourceFileName(sf.fileName);
+}
+
+/** True for files whose unsupported code compiles to a runtime throw instead
+ * of failing the build: JavaScript sources and the TypeScript sources of
+ * provenance-mapped packages (the "unsupported code inside a package"
+ * policy). Gate for the deferral catch sites only; typing relaxations for
+ * JS stay on isJsSourceFile. */
+export function defersToRuntime(sf: ts.SourceFile): boolean {
+  return isJsSourceFileName(sf.fileName) || isProvenanceSourceFile(sf.fileName);
 }
 
 /** True for a JavaScript file of the program that TypeScript type-checks:

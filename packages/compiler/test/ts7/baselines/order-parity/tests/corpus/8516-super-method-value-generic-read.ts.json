@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8516-super-method-value-generic-read.ts"
+ ],
+ "diags": []
+}

@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8533-nullish-empty-object-destructuring.ts"
+ ],
+ "diags": []
+}

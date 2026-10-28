@@ -28,3 +28,9 @@ const make = (s: symbol) => () => s;
 const get = make(a);
 console.log(get() === a);
 console.log(get() === b);
+
+// A declaration augmentation does not install a proposed runtime symbol.
+declare global { interface SymbolConstructor { readonly observable: symbol; } }
+const observableKey = (typeof Symbol === "function" && Symbol.observable) || "@@observable";
+console.log(observableKey, typeof Symbol.observable);
+export {};

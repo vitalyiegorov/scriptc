@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -118,3 +118,101 @@ test("profile options are refused where they cannot apply", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 }, 120_000);
+
+const DYNAMIC = `function dyn(v) { return v; }
+function read(o) { return o.x; }
+function write(o, v) { o.x = v; }
+function twice(f, v) { return f(f(v)); }
+const shapes = [dyn({ x: 1 }), dyn({ x: 2, y: 0 }), dyn({ y: 0, x: 3 })];
+let sum = 0;
+for (let i = 0; i < 300; i++) {
+  const o = shapes[i % 3];
+  write(o, read(o) + 1);
+  sum += twice(function (a) { return a + 1; }, read(o));
+}
+console.log("sum " + sum);
+if (process.argv[2] === "exit") process.exit(0);
+`;
+
+test.skipIf(process.platform !== "linux")(
+  "an instrumented dynamic program records type feedback that its profile-use build consumes",
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scriptc-feedback-"));
+    const env = { ...process.env, SCRIPTC_CACHE_DIR: join(dir, "cache") };
+    const entry = join(dir, "main.js");
+    const raw = join(dir, "raw");
+    try {
+      await writeFile(entry, DYNAMIC);
+      const plain = join(dir, "plain");
+      await scriptc(["build", entry, "--optimization=speed", "-o", plain], env);
+      const expected = (await execFileAsync(plain)).stdout;
+      const instrumented = join(dir, "instrumented");
+      await scriptc(
+        [
+          "build",
+          entry,
+          "--optimization=speed",
+          "--profile-generate",
+          join(raw, "%p.profraw"),
+          "-o",
+          instrumented,
+        ],
+        env,
+      );
+      expect((await execFileAsync(instrumented)).stdout).toBe(expected);
+      // process.exit leaves through _Exit; the feedback is written there too.
+      expect((await execFileAsync(instrumented, ["exit"])).stdout).toBe(expected);
+      const files = await readdir(raw);
+      const feedback = files.filter((name) => name.endsWith(".jsfb"));
+      expect(feedback).toHaveLength(2);
+      const doc = JSON.parse(await readFile(join(raw, feedback[0]!), "utf8"));
+      const read = doc.sites.find((s: { id: string }) => s.id.includes("|get:x|"));
+      expect(read).toMatchObject({ count: 600, other: 0 });
+      expect(read.obs).toHaveLength(3); // { x }, { x, y } and { y, x }
+      const call = doc.sites.find((s: { id: string }) => s.id.endsWith("#c"));
+      expect(call).toBeDefined();
+
+      const merged = join(dir, "app.profdata");
+      await scriptc(
+        [
+          "merge-profiles",
+          "-o",
+          merged,
+          ...files.filter((n) => n.endsWith(".profraw")).map((n) => join(raw, n)),
+        ],
+        env,
+      );
+      const sidecar = JSON.parse(await readFile(`${merged}.jsfb`, "utf8"));
+      expect(sidecar.sites.find((s: { id: string }) => s.id === read.id).count).toBe(1200);
+
+      const optimized = join(dir, "optimized");
+      await scriptc(
+        ["build", entry, "--optimization=speed", "--profile-use", merged, "-o", optimized],
+        env,
+      );
+      expect((await execFileAsync(optimized)).stdout).toBe(expected);
+
+      // A damaged sidecar, and a profile of another version of the program,
+      // leave the build correct.
+      await writeFile(`${merged}.jsfb`, "{damaged");
+      await scriptc(
+        ["build", entry, "--optimization=speed", "--profile-use", merged, "-o", optimized],
+        env,
+      );
+      expect((await execFileAsync(optimized)).stdout).toBe(expected);
+      await writeFile(`${merged}.jsfb`, JSON.stringify(sidecar));
+      await writeFile(
+        entry,
+        DYNAMIC.replace("o.x", "o.y").replace("function write", "var unused = 1;\nfunction write"),
+      );
+      await scriptc(
+        ["build", entry, "--optimization=speed", "--profile-use", merged, "-o", optimized],
+        env,
+      );
+      expect((await execFileAsync(optimized)).stdout).toMatch(/^sum /);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+  600_000,
+);

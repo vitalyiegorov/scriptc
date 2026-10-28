@@ -96,6 +96,14 @@ export class StackCaptures {
     }
   }
 
+  /** Charges one frame box lent to a stack environment (stackCaptureBox);
+   * false once the function's entry-block budget is spent. */
+  charge(): boolean {
+    if (this.remaining < 48) return false;
+    this.remaining -= 48;
+    return true;
+  }
+
   emit(
     host: LlvmEmitterContext,
     id: string,

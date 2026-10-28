@@ -308,17 +308,15 @@ export function classAsyncGeneratorIterator(
   const retT = open.sig.ret;
   const source = lowerer.lowerExpr(expression);
   if (source.type.kind !== "object") return null;
-  return {
-    ...lowerer.accessorCall(
-      sourceType.className,
-      "sym:asyncIterator",
-      source,
-      [],
-      retT,
-      locOf(expression),
-    ),
-    type: retT,
-  };
+  // accessorCall already gives the expression the requested return type.
+  return lowerer.accessorCall(
+    sourceType.className,
+    "sym:asyncIterator",
+    source,
+    [],
+    retT,
+    locOf(expression),
+  ) as IrExpr & { type: GenType };
 }
 
 export function checkForAwaitBinding(

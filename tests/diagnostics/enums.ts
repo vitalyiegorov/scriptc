@@ -21,11 +21,6 @@ enum E {
 const grabbed = E;
 console.log(grabbed.A);
 
-// Reverse lookups through a runtime index.
-let i = 0;
-i += 1;
-console.log(E[i]);
-
 // A constant reverse index no member carries: Node answers undefined,
 // which the reverse mapping's `string` type cannot carry.
 console.log(E[42]);

@@ -1,3 +1,4 @@
+import { mapConstructorValue } from "./builtins/map-classes.js";
 import { dynUndefinedExpr, varRef } from "../../ir/build.js";
 import * as ts from "../ts7/adapter.js";
 import { BOOL, DYN, STRING, type IrExpr, type IrLocal, type IrStmt } from "../../ir/ir.js";
@@ -42,10 +43,13 @@ export function initializeRuntimeStatics(
   const local = lowerer.declareHiddenLocal("%staticClass", value.type);
   const receiver = varRef(local.id, value.type, loc);
   const boxed = lowerer.coerceToExpected(receiver, DYN);
-  const base =
-    !info.localClass && info.base && !info.def.baseValueGlobal
-      ? lowerer.coerceToExpected(classValueRef(lowerer, info.base, info.decl!), DYN)
-      : dynUndefinedExpr(loc);
+  const base = info.extendsMap
+    ? mapConstructorValue(loc)
+    : info.callableBase && !info.localClass
+      ? varRef(info.callableBase.constructorId, DYN, loc)
+      : !info.localClass && info.base && !info.def.baseValueGlobal
+        ? lowerer.coerceToExpected(classValueRef(lowerer, info.base, info.decl!), DYN)
+        : dynUndefinedExpr(loc);
   const statements: IrStmt[] = [
     { kind: "varDecl", localId: local.id, init: value, loc },
     ...(binding
@@ -65,8 +69,27 @@ export function initializeRuntimeStatics(
     },
   ];
   const previousThis = lowerer.ctx.thisLocal;
+  const previousClass = lowerer.currentClass;
+  if (info.decl && lowerer.legacyDecoratorClasses.has(info.decl)) lowerer.currentClass = info;
   try {
-    const members = [...(info.runtimeStatics ?? []), ...(info.runtimePrototypeMembers ?? [])];
+    const keyOnly =
+      info.decl && lowerer.legacyDecoratorClasses.has(info.decl)
+        ? info.decl.members.nodes.filter(
+            (member) =>
+              ts.isPropertyDeclaration(member) &&
+              ts.isComputedPropertyName(member.name) &&
+              !ts
+                .getModifiers(member)
+                ?.some((modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword),
+          )
+        : [];
+    const members = [
+      ...(info.runtimeStatics ?? []),
+      ...(info.runtimePrototypeMembers ?? []),
+      ...keyOnly,
+    ];
+    if (info.decl && lowerer.legacyDecoratorClasses.has(info.decl))
+      members.sort((a, b) => ts.tokenStartOfNode(a) - ts.tokenStartOfNode(b));
     const computedKeys = new Map<ts.ClassElement, IrExpr>();
     for (const member of members) {
       if (!member.name || !ts.isComputedPropertyName(member.name)) continue;
@@ -86,12 +109,49 @@ export function initializeRuntimeStatics(
       computedKeys.set(member, varRef(key.id, DYN, locOf(member.name)));
     }
     lowerer.ctx.thisLocal = local;
+    if (info.decl && lowerer.legacyDecoratorClasses.has(info.decl)) {
+      const prototype = classPrototypeData(lowerer, info, loc, receiver);
+      if (prototype)
+        statements.push({
+          kind: "exprStmt",
+          expr: {
+            kind: "libCall",
+            fn: "dyn.defineProperty",
+            args: [
+              prototype,
+              lowerer.coerceToExpected(
+                { kind: "strLit", value: "constructor", type: STRING, loc },
+                DYN,
+              ),
+              {
+                kind: "dynObjLit",
+                fields: [
+                  { key: { kind: "strLit", value: "value", type: STRING, loc }, value: boxed },
+                  ...["writable", "configurable"].map((name) => ({
+                    key: { kind: "strLit" as const, value: name, type: STRING, loc },
+                    value: lowerer.coerceToExpected(
+                      { kind: "boolLit", value: true, type: BOOL, loc },
+                      DYN,
+                    ),
+                  })),
+                ],
+                type: DYN,
+                loc,
+              },
+            ],
+            type: DYN,
+            loc,
+          },
+          loc,
+        });
+    }
     // Methods and accessors exist before any static initializer executes.
     const definitions = members.filter(
       (member) => ts.isMethodDeclaration(member) || ts.isAccessor(member),
     );
     const initializers = members.filter(
-      (member) => !ts.isMethodDeclaration(member) && !ts.isAccessor(member),
+      (member) =>
+        !ts.isMethodDeclaration(member) && !ts.isAccessor(member) && !keyOnly.includes(member),
     );
     for (const member of [...definitions, ...initializers]) {
       if (ts.isClassStaticBlockDeclaration(member)) {
@@ -99,6 +159,8 @@ export function initializeRuntimeStatics(
         continue;
       }
       if (!member.name) continue;
+      // Overload signatures define nothing: the implementation does.
+      if (ts.isMethodDeclaration(member) && member.body === undefined) continue;
       const memberLoc = locOf(member);
       const key: IrExpr = ts.isComputedPropertyName(member.name)
         ? computedKeys.get(member)!
@@ -137,7 +199,14 @@ export function initializeRuntimeStatics(
       if (ts.isGetAccessorDeclaration(member) || ts.isSetAccessorDeclaration(member)) {
         fields.push({
           key: ts.isGetAccessorDeclaration(member) ? "get" : "set",
-          value: lowerer.coerceToExpected(lowerer.lowerLambda(member), DYN),
+          value: lowerer.coerceToExpected(
+            lowerer.lowerLambda(
+              member,
+              !!info.legacyPrototypeData ||
+                !!(info.decl && lowerer.legacyDecoratorClasses.has(info.decl)),
+            ),
+            DYN,
+          ),
         });
       } else if (ts.isMethodDeclaration(member) || ts.isPropertyDeclaration(member)) {
         fields.push({
@@ -150,7 +219,14 @@ export function initializeRuntimeStatics(
         fields.push({
           key: "value",
           value: ts.isMethodDeclaration(member)
-            ? lowerer.coerceToExpected(lowerer.lowerLambda(member), DYN)
+            ? lowerer.coerceToExpected(
+                lowerer.lowerLambda(
+                  member,
+                  !!info.legacyPrototypeData ||
+                    !!(info.decl && lowerer.legacyDecoratorClasses.has(info.decl)),
+                ),
+                DYN,
+              )
             : member.initializer
               ? lowerer.lowerExprExpecting(member.initializer, DYN)
               : dynUndefinedExpr(memberLoc),
@@ -185,6 +261,7 @@ export function initializeRuntimeStatics(
     }
   } finally {
     lowerer.ctx.thisLocal = previousThis;
+    lowerer.currentClass = previousClass;
   }
   return { kind: "seqExpr", stmts: statements, result: receiver, type: receiver.type, loc };
 }

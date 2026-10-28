@@ -1,2 +1,4 @@
 - **Static field updates:** Numeric static fields support `++` and `--` through the declaring class or an immutable alias.
   Updates through a subclass name are unsupported because JavaScript creates a separate property on the subclass.
+  Static accessors (`static get x()` and `static set x(v)`) are read and assigned through the class name, an alias, or `this` in a static member of a class nothing extends.
+  An accessor that reads `this` specializes for the exact class the access names, so assigning an inherited static through it from a subclass stays unsupported.

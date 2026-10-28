@@ -448,7 +448,9 @@ export function lowerIncDec(
     const privateName =
       ts.isPropertyAccessExpression(access) && ts.isPrivateIdentifier(access.name);
     if (
-      (isJsSourceFile(ts.getSourceFileOfNode(expr)) || checkedNumber) &&
+      (isJsSourceFile(ts.getSourceFileOfNode(expr)) ||
+        checkedNumber ||
+        (lowerer.typeOf(access).flags & ts.TypeFlags.Any) !== 0) &&
       raw.type.kind === "dyn" &&
       !privateName
     ) {

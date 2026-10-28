@@ -45,6 +45,8 @@ import { contentDigest, NATIVE_STRING_BYTES, type NativeCache } from "./cache.js
 import { batchTextParts, joinedParts, textSlices } from "./text-file.js";
 import type { NativeToolchain } from "./toolchain.js";
 import { nativeFileIdentity } from "./file-identity.js";
+import { jsFeedbackPattern } from "../backend/native-profile.js";
+import { feedbackWaysFor } from "../backend/js-feedback-profile.js";
 
 export interface NativeExecutableInput {
   ok: true;
@@ -420,6 +422,15 @@ export function prepareNativeExecutable(
           forkPrimitives: emitForkPrimitives(),
           ...inlineRcOption(options.optimization, options.sanitize === true),
           ...(options.detachedExit === true && outputKind === "exe" ? { detachedExit: true } : {}),
+          ...(() => {
+            const feedbackWays = feedbackWaysFor(
+              options.profileUse === undefined ? undefined : resolve(options.profileUse),
+            );
+            return feedbackWays === undefined || outputKind !== "exe" ? {} : { feedbackWays };
+          })(),
+          ...(options.profileGenerate !== undefined && outputKind === "exe"
+            ? { feedbackPath: jsFeedbackPattern(options.profileGenerate) }
+            : {}),
           ...targetCpuField(options.targetCpu),
           ...(options.optimization === "dev" && !options.strip
             ? { debugSources: prepared.sourceTexts }

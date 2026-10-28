@@ -1246,6 +1246,54 @@ export function boxNewCall(host: ShapeHost, t: IrType): string {
   throw new LlvmUnsupportedError(`box:${t.kind}`);
 }
 
+/** The header fields boxNewCall's box gets for `t` (kind tag, RC entry points
+ * and trace as LLVM operands), or null when no box holds `t`. An embedded box
+ * (scr_closure_new_embed) is initialized with these instead of a call. */
+export function boxHeaderFields(
+  host: ShapeHost,
+  t: IrType,
+): { kind: number; retain: string; release: string; trace: string } | null {
+  const plain: Partial<Record<IrType["kind"], number>> = {
+    f64: 0,
+    procStream: 0,
+    bool: 1,
+    string: 2,
+    func: 4,
+  };
+  const kind = plain[t.kind];
+  if (kind !== undefined) return { kind, retain: "null", release: "null", trace: "null" };
+  if (t.kind === "array" && traceAdapter(host, t) === null)
+    return { kind: 3, retain: "null", release: "null", trace: "null" };
+  if (isRefCounted(t)) {
+    const v = vAdapters(host, t);
+    return { kind: 5, retain: v.retain, release: v.release, trace: traceArg(host, t) };
+  }
+  return null;
+}
+
+/** boxNewCall followed by the box's first write of a reference (boxSet's ref
+ * form): one runtime call builds the box around `value`, whose reference it
+ * takes. Null for the scalar kinds, whose write is a store. */
+export function boxNewSetCall(host: ShapeHost, t: IrType, value: string): string | null {
+  const plain: Partial<Record<IrType["kind"], number>> = { string: 2, func: 4 };
+  const kind = plain[t.kind];
+  if (kind !== undefined) {
+    host.declare(`declare ptr @scr_box_new_set(i32, ptr)`);
+    return `call ptr @scr_box_new_set(i32 ${kind}, ptr ${value})`;
+  }
+  if (t.kind === "array" && traceAdapter(host, t) === null) {
+    host.declare(`declare ptr @scr_box_new_set(i32, ptr)`);
+    return `call ptr @scr_box_new_set(i32 3, ptr ${value})`; // SCR_BOX_ARR
+  }
+  if (t.kind === "f64" || t.kind === "procStream" || t.kind === "bool") return null;
+  if (isRefCounted(t)) {
+    const v = vAdapters(host, t);
+    host.declare(`declare ptr @scr_box_new_obj_set(ptr, ptr, ptr, ptr)`);
+    return `call ptr @scr_box_new_obj_set(ptr ${v.retain}, ptr ${v.release}, ptr ${traceArg(host, t)}, ptr ${value})`;
+  }
+  return null;
+}
+
 /** Box accessor suffix (boxAccess): scalars unboxed, ref kinds pointers. */
 export function boxAccess(t: IrType): "f64" | "bool" | "ref" {
   return t.kind === "f64" || t.kind === "procStream" ? "f64" : t.kind === "bool" ? "bool" : "ref";

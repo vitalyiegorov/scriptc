@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { builtinModules } from "node:module";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { sourceImportsOfFile } from "./module-syntax.js";
 import type { SourceFile } from "./ts7/ast-types.js";
@@ -135,7 +135,9 @@ function findInstalled(fromDir: string, name: string): InstalledPackage | null {
 
 interface Attested {
   repo: string;
+  /** A commit sha, or (declared sources without a gitHead) a version tag. */
   commit: string;
+  tagFallback?: string;
 }
 
 /** GET the npm attestation set and extract the SLSA provenance
@@ -170,6 +172,66 @@ async function fetchAttestation(name: string, version: string): Promise<Attested
   throw new Error("attestation set carries no SLSA provenance predicate");
 }
 
+/** The published package.json's own claim of its source: `repository` plus
+ * `gitHead` (written by npm/lerna at publish), for packages that ship no
+ * TypeScript and no attestation. Throws a one-line reason when absent. */
+function declaredSource(pkgJson: Record<string, unknown>): Attested {
+  const repository = pkgJson["repository"];
+  const url =
+    typeof repository === "string"
+      ? repository
+      : repository !== null && typeof repository === "object"
+        ? (repository as { url?: unknown }).url
+        : undefined;
+  if (typeof url !== "string") throw new Error("package.json declares no repository");
+  const repo = url.replace(/^github:/, "https://github.com/");
+  const gitHead = pkgJson["gitHead"];
+  if (typeof gitHead === "string" && /^[0-9a-f]{40}$/.test(gitHead)) {
+    return { repo, commit: gitHead };
+  }
+  // No gitHead: the release tag named after the version ("v1.2.3", "1.2.3").
+  const version = pkgJson["version"];
+  if (typeof version !== "string") throw new Error("package.json declares no gitHead or version");
+  return { repo, commit: `v${version}`, tagFallback: version };
+}
+
+function repositoryDirectory(pkgJson: Record<string, unknown>): string | undefined {
+  const repository = pkgJson["repository"];
+  const directory =
+    repository !== null && typeof repository === "object"
+      ? (repository as { directory?: unknown }).directory
+      : undefined;
+  return typeof directory === "string" && directory !== "" ? directory : undefined;
+}
+
+/** Published files with a TypeScript twin in the source tree: a source tree
+ * that does not cover the published build is not that build's source. */
+function publishedCoverage(installedDir: string, srcDir: string): { found: number; total: number } {
+  let found = 0;
+  let total = 0;
+  const walk = (rel: string): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(join(installedDir, rel));
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e === "node_modules") continue;
+      const next = rel === "" ? e : `${rel}/${e}`;
+      if (isDirectory(join(installedDir, next))) walk(next);
+      else if (e.endsWith(".js") && !e.endsWith(".d.js")) {
+        total++;
+        const stem = next.slice(0, -3);
+        if (isFile(join(srcDir, `${stem}.ts`)) || isFile(join(srcDir, "src", `${stem}.ts`)))
+          found++;
+      }
+    }
+  };
+  walk("");
+  return { found, total };
+}
+
 /* ── source fetch (content-addressed by the attested commit) ──────────── */
 
 function cacheRoot(): string {
@@ -180,17 +242,32 @@ function cacheRoot(): string {
 
 /** The cached source tree for an attested commit, fetching it once from
  * codeload (github repos only in the prototype). Returns the tree root. */
-async function fetchSourceTree(repo: string, commit: string): Promise<string> {
-  const dest = join(cacheRoot(), commit);
-  if (isDirectory(dest)) return dest;
+async function fetchSourceTree(
+  repo: string,
+  commit: string,
+  tagFallback?: string,
+): Promise<string> {
   const m = /github\.com\/([^/]+)\/([^/@#]+)/.exec(repo);
   if (m === null) throw new Error(`source repository is not a github URL (${repo})`);
-  const url = `https://codeload.github.com/${m[1]}/${m[2]}/tar.gz/${commit}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
-  if (!res.ok) throw new Error(`source fetch failed (HTTP ${res.status} for ${url})`);
+  const name = m[2]!.replace(/\.git$/, "");
+  // A sha names its tree alone; a tag is only unique within its repository.
+  const dest = join(cacheRoot(), tagFallback === undefined ? commit : `${m[1]}-${name}-${commit}`);
+  // An empty directory is an interrupted extraction, not a cached tree.
+  if (isDirectory(dest) && readdirSync(dest).length > 0) return dest;
+  rmSync(dest, { recursive: true, force: true });
+  const refs = tagFallback === undefined ? [commit] : [commit, tagFallback];
+  let res: Response | undefined;
+  let url = "";
+  for (const ref of refs) {
+    url = `https://codeload.github.com/${m[1]}/${name}/tar.gz/${ref}`;
+    res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
+    if (res.ok) break;
+  }
+  if (res === undefined || !res.ok)
+    throw new Error(`source fetch failed (HTTP ${res?.status} for ${url})`);
   const bytes = Buffer.from(await res.arrayBuffer());
   mkdirSync(cacheRoot(), { recursive: true });
-  const tmp = mkdtempSync(join(tmpdir(), "scriptc-provenance-"));
+  const tmp = mkdtempSync(join(cacheRoot(), ".tmp-"));
   try {
     const tarball = join(tmp, "src.tgz");
     writeFileSync(tarball, bytes);
@@ -213,7 +290,14 @@ async function fetchSourceTree(repo: string, commit: string): Promise<string> {
 
 /** The directory inside `tree` whose package.json names `name`: the root,
  * then the conventional monorepo layouts, then a bounded scan. */
-function locatePackageDir(tree: string, name: string): string | null {
+function locatePackageDir(tree: string, name: string, directory?: string): string | null {
+  // The published package.json's repository.directory names the package's
+  // folder exactly (a monorepo package whose own package.json is generated
+  // at publish time has none in the tree to match by name).
+  if (directory !== undefined && !directory.includes("..") && !isAbsolute(directory)) {
+    const declared = join(tree, directory);
+    if (isDirectory(declared)) return declared;
+  }
   const nameOf = (dir: string): string | null => {
     const pkg = readJson(join(dir, "package.json"));
     return pkg !== null && typeof pkg["name"] === "string" ? pkg["name"] : null;
@@ -303,6 +387,40 @@ function mapEntryToSource(pkgDir: string, target: string, subpath: string): stri
   return null;
 }
 
+/** Every literal (non-pattern) subpath its "exports" map lists, as bare
+ * specifiers ("rxjs/operators"). */
+function exportedSubpathSpecifiers(installed: InstalledPackage): string[] {
+  const exp = installed.pkgJson["exports"];
+  if (exp === null || typeof exp !== "object" || Array.isArray(exp)) return [];
+  const out: string[] = [];
+  for (const key of Object.keys(exp)) {
+    if (key.startsWith("./") && !key.includes("*") && !key.endsWith(".json")) {
+      out.push(`${installed.name}${key.slice(1)}`);
+    }
+  }
+  return out;
+}
+
+/** True when the installed package carries TypeScript sources that map
+ * from its published entry (the root entry must map; subpaths that do
+ * not fall back individually). */
+function shipsTypeScriptSources(
+  installed: InstalledPackage,
+  specifiers: ReadonlySet<string> | undefined,
+): boolean {
+  if (!isDirectory(join(installed.dir, "src"))) return false;
+  const rootTarget = publishedTargetOf(installed.pkgJson, ".");
+  if (rootTarget === null) return false;
+  for (const spec of specifiers ?? []) {
+    const parts = spec.split("/");
+    const nameLen = spec.startsWith("@") ? 2 : 1;
+    const subpath = parts.length === nameLen ? "." : `./${parts.slice(nameLen).join("/")}`;
+    const target = publishedTargetOf(installed.pkgJson, subpath);
+    if (target !== null && mapEntryToSource(installed.dir, target, subpath) !== null) return true;
+  }
+  return false;
+}
+
 /* ── the pipeline ─────────────────────────────────────────────────────── */
 
 interface ManifestEntry {
@@ -386,19 +504,62 @@ export async function resolveProvenanceSourcesWithParser(
         repo = seeded.repo ?? "(manifest)";
         commit = seeded.commit ?? "(manifest)";
         if (!isDirectory(dir)) throw new Error(`manifest dir does not exist (${dir})`);
+      } else if (shipsTypeScriptSources(installed, specifiersByPackage.get(name))) {
+        // The package publishes its own TypeScript next to the build
+        // (rxjs ships src/**/*.ts): that tree IS the installed version's
+        // source, so no attestation or download is needed.
+        dir = installed.dir;
+        repo = "(installed package)";
+        commit = installed.version;
       } else {
-        const attested = await fetchAttestation(installed.name, installed.version);
+        let attested: Attested;
+        let declared = false;
+        try {
+          attested = await fetchAttestation(installed.name, installed.version);
+        } catch (attestationError) {
+          // No attestation: fall back to the commit the published
+          // package.json itself declares (repository + gitHead).
+          if (process.env["SCRIPTC_PROVENANCE_DECLARED"] !== "1") throw attestationError;
+          try {
+            attested = declaredSource(installed.pkgJson);
+            declared = true;
+          } catch {
+            throw attestationError;
+          }
+        }
         repo = attested.repo;
         commit = attested.commit;
-        const tree = await fetchSourceTree(repo, commit);
-        const located = locatePackageDir(tree, installed.name);
+        const tree = await fetchSourceTree(repo, commit, attested.tagFallback);
+        const located = locatePackageDir(
+          tree,
+          installed.name,
+          repositoryDirectory(installed.pkgJson),
+        );
         if (located === null) {
           throw new Error(`package directory not found inside the attested source tree (${tree})`);
         }
         dir = located;
+        if (declared) {
+          const { found, total } = publishedCoverage(installed.dir, dir);
+          if (total === 0 || found / total < 0.95) {
+            throw new Error(
+              `declared source ${commit.slice(0, 10)} covers ${found}/${total} published files; not trusted`,
+            );
+          }
+          notes.push(
+            `${name}: source from the package.json-declared ${commit.length === 40 ? "gitHead" : "tag"} ${commit.slice(0, 10)} (no attestation); ${found}/${total} published files have a TypeScript twin`,
+          );
+        }
       }
       const entries: Record<string, string> = {};
-      for (const spec of specifiersByPackage.get(name) ?? new Set<string>()) {
+      const wanted = new Set<string>(specifiersByPackage.get(name) ?? []);
+      if (dir === installed.dir) {
+        // Published TypeScript: unscanned packages (the driver's untransformed
+        // dependencies) import any exported subpath too, and all of them must
+        // land on the one source copy.
+        for (const spec of exportedSubpathSpecifiers(installed)) wanted.add(spec);
+      }
+      for (const spec of wanted) {
         const parts = spec.split("/");
         const nameLen = spec.startsWith("@") ? 2 : 1;
         const subpath = parts.length === nameLen ? "." : `./${parts.slice(nameLen).join("/")}`;
@@ -424,6 +585,7 @@ export async function resolveProvenanceSourcesWithParser(
         repo,
         commit,
         dir,
+        installedDir: installed.dir,
         entries,
       };
       if (pkg.sourceVersion !== undefined) {

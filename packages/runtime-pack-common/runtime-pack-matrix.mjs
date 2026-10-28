@@ -154,6 +154,7 @@ export const OPTIONAL_RUNTIME_SOURCES = [
   ["scr_dgram_dyn.c", all("dgram", "dgramDyn")],
   // TextEncoder and TextDecoder records boxed as untyped values.
   ["scr_text_codec_dyn.c", "textCodecDyn"],
+  ["scr_intl_datetime.c", "intlDateTimeFormat"],
   ["scr_watch.c", "watch"],
   ["scr_ffi_queue.c", "foreignFfi"],
   ["scr_test.c", "nodeTest"],
@@ -183,6 +184,25 @@ export function variantsFor(source) {
   // ordinary object, byte for byte.
   if (source === "scr_json.c") {
     variants.push({ id: "dyn-tier", when: { dynTier: true }, defines: ["SCR_JS_TIER"] });
+    variants.push({ id: "map-class", when: { mapClass: true }, defines: ["SCR_MAP_CLASS"] });
+    variants.push({
+      id: "dyn-tier-map-class",
+      when: { dynTier: true, mapClass: true },
+      defines: ["SCR_JS_TIER", "SCR_MAP_CLASS"],
+    });
+  }
+  // Function.prototype identity and traversal are linked only by programs
+  // that observe it. Preserve the ordinary JSON runtime object byte for byte.
+  if (source === "scr_json.c") {
+    for (const variant of [...variants])
+      variants.push({
+        id: variant.id === "default" ? "function-prototype" : `${variant.id}-function-prototype`,
+        when: { ...variant.when, functionPrototype: true },
+        defines: [...variant.defines, "SCR_FUNCTION_PROTOTYPE"],
+      });
+  }
+  if (source === "scr_dyn_invoke.c") {
+    variants.push({ id: "map-class", when: { mapClass: true }, defines: ["SCR_MAP_CLASS"] });
   }
   if (source === "scr_bytes.c") {
     variants.push({

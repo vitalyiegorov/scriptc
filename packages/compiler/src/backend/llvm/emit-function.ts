@@ -1,4 +1,5 @@
 /* LlEmitter's function emission: function bodies, generator and async scaffolding, async awaits, WASI fulfillment and trampolines. */
+import { expressionWrittenLocals } from "./expression-writes.js";
 import {
   type LlArgPackAndTrampolinePrologue,
   type LlEmitter,
@@ -52,7 +53,7 @@ import {
 } from "../mangle.js";
 import { InternalCompilerError } from "../../errors.js";
 import { classEnvironmentIndex } from "./classes.js";
-import { FN_ATTRS, boxNewCall, releaseSym, traceArg, vAdapters } from "./shapes.js";
+import { FN_ATTRS, boxNewCall, boxNewSetCall, releaseSym, traceArg, vAdapters } from "./shapes.js";
 import type { LlValue } from "./expr-context.js";
 import { INT32_ABI_SUFFIX, SCALAR_UNION_RESULT } from "./int32-abi.js";
 import { f64Lit } from "./common.js";
@@ -93,6 +94,16 @@ export function emitFunction(emitter: LlEmitter, fn: IrFunction): string {
     emitter.currentLocals.set(id, plain);
     emitter.lazyCaptureBoxes.set(id, "");
   }
+  // A local whose every closure copies its value needs no box either.
+  emitter.embeddedLocals.clear();
+  if (emitter.debug === null)
+    for (const id of emitter.lazyCaptures.embeddedLocals(fn, (name) =>
+      emitter.embeddedMask(name),
+    )) {
+      const { boxed: _boxed, ...plain } = emitter.currentLocals.get(id)!;
+      emitter.currentLocals.set(id, plain);
+      emitter.embeddedLocals.add(id);
+    }
   emitter.runningExtrema = emitter.debug === null ? runningExtremumUpdates(fn) : new Set();
   emitter.currentConstantCallbacks =
     emitter.debug === null ? (emitter.constantCallbacks.get(fn.name) ?? new Map()) : new Map();
@@ -121,6 +132,7 @@ export function emitFunction(emitter: LlEmitter, fn: IrFunction): string {
     for (const index of projectedParameterIndexes)
       emitter.projectedParameters.add(fn.params[index]!.localId);
   emitter.stableCallBindings = emitter.callLifetimes.bindings.get(fn.name) ?? new Set();
+  emitter.exprWrittenLocals = expressionWrittenLocals(fn);
   const borrowedParameterIndexes = emitter.callLifetimes.borrowed.get(fn.name);
   if (borrowedParameterIndexes) {
     // Rebound walk parameters borrow too, but only unchanged ones may
@@ -141,6 +153,11 @@ export function emitFunction(emitter: LlEmitter, fn: IrFunction): string {
   );
   emitter.stableCaptureIds =
     fn.captures !== undefined ? emitter.lazyCaptures.stableCaptures(fn.name) : new Set();
+  emitter.embeddedCaptureIds = new Set(
+    (fn.captures ?? [])
+      .filter((_, index) => (emitter.embeddedMask(fn.name) >>> index) & 1)
+      .map((c) => c.localId),
+  );
   emitter.integerLoopBindings.clear();
   emitter.integerTemps.clear();
   emitter.integerTempsEnabled = emitter.debug === null && !fn.async && !fn.generator;
@@ -484,8 +501,13 @@ export function emitFunction(emitter: LlEmitter, fn: IrFunction): string {
     const slot = `%${mangleLocal(p.localId)}`;
     if (local.boxed) {
       const box = B.tmp();
-      B.line(`${box} = ${boxNewCall(emitter.shapeHost, p.type)} ; ${p.name} (boxed param)`);
-      emitter.boxSet(box, p.type, `%p_${mangleLocal(p.localId)}`);
+      const fused = boxNewSetCall(emitter.shapeHost, p.type, `%p_${mangleLocal(p.localId)}`);
+      if (fused !== null) {
+        B.line(`${box} = ${fused} ; ${p.name} (boxed param)`);
+      } else {
+        B.line(`${box} = ${boxNewCall(emitter.shapeHost, p.type)} ; ${p.name} (boxed param)`);
+        emitter.boxSet(box, p.type, `%p_${mangleLocal(p.localId)}`);
+      }
       B.line(`store ptr ${box}, ptr ${slot}`);
       fnScope.push({ slot, type: p.type, boxed: true });
       continue;

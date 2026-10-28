@@ -15,7 +15,7 @@ import { isJsSourceFile, locOf } from "../program.js";
 import { PoisonError, type Lowerer } from "./lowerer.js";
 import { unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { findMethodOn, type ClassInfo } from "./lower-classes.js";
-import { classPropertiesHelper } from "./class-dynamic-dispatch.js";
+import { classOwnPropertiesHelper, classPropertiesHelper } from "./class-dynamic-dispatch.js";
 import { observedPrototypeMethod } from "./class-prototypes.js";
 import { checkedIterableSpread } from "./checked-iterable-spread.js";
 import { tryLowerExpression } from "./expressions/try-lower-expression.js";
@@ -64,12 +64,15 @@ function callbackBag(
   loc: SrcLoc,
   name: string,
   readOnly = false,
+  own = false,
 ): IrExpr {
   // Builds the prototype data that an observed read falls back to.
   observedSlot(lowerer, receiver, name, loc);
   return {
     kind: "call",
-    callee: classPropertiesHelper(lowerer, loc, readOnly).name,
+    callee: own
+      ? classOwnPropertiesHelper(lowerer, loc).name
+      : classPropertiesHelper(lowerer, loc, readOnly).name,
     args: [lowerer.coerceToExpected(receiver, DYN)],
     type: DYN,
     loc,
@@ -289,7 +292,19 @@ export function classCallbackCall(
       {
         kind: "varDecl",
         localId: bag.id,
-        init: callbackBag(lowerer, receiver, loc, name, true),
+        // A name no prototype access in the program mentions only asks whether
+        // the instance has its own property, so an absent bag stays absent: no
+        // object standing for the prototype is built for the call. (`observed`
+        // is false for function-local classes, whose replaced prototype
+        // methods the full bag still sees.)
+        init: callbackBag(
+          lowerer,
+          receiver,
+          loc,
+          name,
+          true,
+          !lowerer.prototypeMethodAccesses.has(name),
+        ),
         loc,
       },
       {

@@ -65,6 +65,11 @@ _Static_assert(offsetof(ScrBox, kind) == 4 && offsetof(ScrBox, obj_trace) == 16,
 ScrBox *scr_box_new(ScrBoxKind kind); /* returns +1, slot zeroed */
 ScrBox *scr_box_new_obj(void *(*retain)(void *), void (*release)(void *),
                          ScrTraceFn trace);
+/* The two above followed by scr_box_set_ref on the fresh box: the box takes
+ * the reference `v` (a ref-kind payload; scalar boxes set their slot). */
+ScrBox *scr_box_new_set(ScrBoxKind kind, void *v);
+ScrBox *scr_box_new_obj_set(void *(*retain)(void *), void (*release)(void *), ScrTraceFn trace,
+                            void *v);
 
 static inline ScrBox *scr_box_retain(ScrBox *b) {
   if (b->rc != SIZE_MAX) {
@@ -114,10 +119,24 @@ typedef struct ScrClosure {
    * NULL. Same signature as `fn`; only callers that hold their arguments
    * for the whole call may enter through it. */
   void *fn_borrowed;
+  /* Bit i set: caps[i] points at a box embedded in this closure's own
+   * allocation (right after caps[]), holding the value of a binding that
+   * never changes after the closure is created. The embedded box is
+   * immortal (rc == SIZE_MAX) and owned by the closure: nobody retains or
+   * releases it, the closure releases its payload when it dies and traces
+   * the payload (not the box) for the cycle collector. */
+  uint32_t embedded;
   ScrBox *caps[];
 } ScrClosure;
 
 ScrClosure *scr_closure_new(void *fn, size_t ncaps); /* +1; caller fills caps with +1 box refs */
+/* Like scr_closure_new, with room for an embedded box for every set bit of
+ * `embedded` (bit i is caps[i]; at most 32 captures; `nembedded` is the bit
+ * count). The caller points each
+ * such caps[i] at its box, the k-th ScrBox after caps[ncaps], and fills it:
+ * rc SIZE_MAX, the kind and the payload slot (plus the RC entry points and
+ * the trace of an SCR_BOX_OBJ). The closure owns that payload from then on. */
+ScrClosure *scr_closure_new_embed(void *fn, size_t ncaps, uint32_t embedded, size_t nembedded);
 
 static inline ScrClosure *scr_closure_retain(ScrClosure *c) {
   if (c->rc != SIZE_MAX) {

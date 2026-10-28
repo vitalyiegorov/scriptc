@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/npm-in-primitive-receiver/main.ts"
+ ],
+ "diags": []
+}

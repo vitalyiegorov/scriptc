@@ -1,3 +1,5 @@
+import { isProtocolRecord, proxyFlowOf } from "./proxy-flow.js";
+import { isProvenanceSourceFile } from "../provenance-registry.js";
 import { iterableGeneratorArm } from "./iterable-values.js";
 import { mapAsyncGeneratorAnnotation } from "../type-mapper.js";
 import { dynUndefinedExpr } from "../../ir/build.js";
@@ -193,6 +195,40 @@ export function declaredReturnType(
       nextT: DYN,
     };
   let mappedReturn = lowerer.mapTypeOf(retTsType);
+  if (lowerer.isProxyStandIn(decl, retTsType, mappedReturn)) return DYN;
+  // A package getter returning `untyped as Protocol`: the protocol's members
+  // are probed on whatever the value is, so the result stays checked-dynamic.
+  if (
+    mappedReturn !== null &&
+    isProvenanceSourceFile(ts.getSourceFileOfNode(decl).fileName) &&
+    isProtocolRecord(lowerer, mappedReturn) &&
+    (ts.isGetAccessorDeclaration(decl) ||
+      ts.isMethodDeclaration(decl) ||
+      ts.isFunctionDeclaration(decl)) &&
+    decl.body !== undefined &&
+    ts.isBlock(decl.body) &&
+    returnsUntypedAssertion(lowerer, decl.body)
+  )
+    return DYN;
+  if (mappedReturn !== null && mappedReturn.kind !== "dyn" && proxyFlowOf(lowerer).isProducer(decl))
+    return mappedReturn.kind === "promise" ? { kind: "promise", inner: DYN } : DYN;
+  // A package getter whose setter takes the property as a runtime-optional
+  // class (paramShape): the pair shares one property type.
+  if (
+    mappedReturn?.kind === "object" &&
+    ts.isGetAccessorDeclaration(decl) &&
+    isProvenanceSourceFile(ts.getSourceFileOfNode(decl).fileName) &&
+    decl.parent !== undefined &&
+    (ts.isClassDeclaration(decl.parent) || ts.isClassExpression(decl.parent)) &&
+    decl.parent.members.nodes.some(
+      (member) =>
+        ts.isSetAccessorDeclaration(member) &&
+        member.name.getText() === decl.name.getText() &&
+        ts.getModifiers(member)?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword) ===
+          ts.getModifiers(decl)?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword),
+    )
+  )
+    mappedReturn = lowerer.runtimeOptionalType(mappedReturn);
   // A generator declared to return Iterable<T> returns a generator over T.
   if (mappedReturn && decl.asteriskToken)
     mappedReturn = iterableGeneratorArm(lowerer, mappedReturn);
@@ -555,4 +591,30 @@ export function blockBodyOf(decl: ts.FunctionLikeDeclaration): ts.Block | null {
   if (body === undefined) return null;
   if (ts.isBlock(body)) return body;
   return ts.forEachChild(decl, (c) => (ts.isBlock(c) ? c : undefined)) ?? null;
+}
+
+/** Whether a returned expression is an assertion over an untyped value. */
+function returnsUntypedAssertion(lowerer: Lowerer, body: ts.Block): boolean {
+  let found = false;
+  ts.walkPreorder(body, (node) => {
+    if (found) return "stop";
+    if (
+      node !== body &&
+      (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node))
+    )
+      return "skip";
+    if (ts.isReturnStatement(node) && node.expression !== undefined) {
+      let e: ts.Expression = node.expression;
+      while (ts.isParenthesizedExpression(e)) e = e.expression;
+      if (ts.isAsExpression(e) || ts.isTypeAssertion(e)) {
+        const flags = lowerer.typeOf(e.expression).flags;
+        if ((flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) found = true;
+        // A cast to a protocol from a type that lacks its members (an
+        // empty marker interface) is as unchecked as one from untyped.
+        else if (isProtocolRecord(lowerer, lowerer.mapTypeOf(lowerer.typeOf(e)))) found = true;
+      }
+    }
+    return undefined;
+  });
+  return found;
 }

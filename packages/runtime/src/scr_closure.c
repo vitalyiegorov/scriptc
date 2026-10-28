@@ -66,7 +66,7 @@ static void scr_box_gcfree(void *o) {
 #ifdef SCR_RC_AUDIT
   scr_live_boxes--;
 #endif
-  scr_cyc_free_inline(b);
+  scr_cyc_free_unkeyed_inline(b);
 }
 
 ScrBox *scr_box_new(ScrBoxKind kind) {
@@ -86,6 +86,21 @@ ScrBox *scr_box_new_obj(void *(*retain)(void *), void (*release)(void *),
   b->obj_retain = retain;
   b->obj_release = release;
   b->obj_trace = trace;
+  return b;
+}
+
+/* scr_box_new + scr_box_set_ref for a box that has no payload to release
+ * yet: the box takes the reference `v`. */
+ScrBox *scr_box_new_set(ScrBoxKind kind, void *v) {
+  ScrBox *b = scr_box_new(kind);
+  memcpy(&b->slot, &v, sizeof v);
+  return b;
+}
+
+ScrBox *scr_box_new_obj_set(void *(*retain)(void *), void (*release)(void *), ScrTraceFn trace,
+                            void *v) {
+  ScrBox *b = scr_box_new_obj(retain, release, trace);
+  memcpy(&b->slot, &v, sizeof v);
   return b;
 }
 
@@ -119,7 +134,7 @@ static void scr_box_destroy(void *object) {
 #ifdef SCR_RC_AUDIT
   scr_live_boxes--;
 #endif
-  scr_cyc_free_inline(b);
+  scr_cyc_free_unkeyed_inline(b);
 }
 
 void scr_box_release(ScrBox *b) {
@@ -173,21 +188,72 @@ void scr_box_set_ref(ScrBox *b, void *v) {
 
 static void scr_closure_trace(void *o, ScrTraceVisit visit, void *ctx) {
   ScrClosure *c = (ScrClosure *)o;
-  for (size_t i = 0; i < c->ncaps; i++) visit(c->caps[i], ctx);
+  if (c->embedded == 0) {
+    for (size_t i = 0; i < c->ncaps; i++) visit(c->caps[i], ctx);
+  } else {
+    for (size_t i = 0; i < c->ncaps; i++) {
+      if ((c->embedded >> i & 1u) == 0) {
+        visit(c->caps[i], ctx);
+      } else {
+        /* An embedded box is not a collectable object: its payload is the
+         * closure's own child (the box trace, one level up). */
+        ScrBox *b = c->caps[i];
+        void *p = scr_box_ptr(b);
+        if (p && (b->kind == SCR_BOX_FUNC || (b->kind == SCR_BOX_OBJ && b->obj_trace))) visit(p, ctx);
+      }
+    }
+  }
   visit(c->props, ctx);
 }
 
 static void scr_closure_gcfree(void *o) {
-  /* Captures and the own-property box are all traced. */
+  /* Captures and the own-property box are all traced; the payloads of the
+   * embedded boxes the trace does not visit are released here. */
+  ScrClosure *c = (ScrClosure *)o;
+  if (c->embedded != 0) {
+    for (size_t i = 0; i < c->ncaps && i < 32; i++) {
+      if ((c->embedded >> i & 1u) == 0) continue;
+      ScrBox *b = c->caps[i];
+      void *p = scr_box_ptr(b);
+      if (!p) continue;
+      switch (b->kind) {
+      case SCR_BOX_STR: scr_str_release((ScrStr *)p); break;
+      case SCR_BOX_ARR: scr_arr_release((ScrArr *)p); break;
+      case SCR_BOX_OBJ: if (!b->obj_trace) b->obj_release(p); break;
+      default: break;
+      }
+    }
+  }
 #ifdef SCR_RC_AUDIT
   scr_live_closures--;
 #endif
   scr_cyc_free_inline(o);
 }
 
-ScrClosure *scr_closure_new(void *fn, size_t ncaps) {
+static inline __attribute__((always_inline)) ScrClosure *scr_closure_alloc(void *fn, size_t ncaps, size_t nembedded) {
   static ScrCycType cyc_type = { &scr_closure_trace, &scr_closure_gcfree, SCR_CYC_KIND_CLOSURE };
-  ScrClosure *c = scr_cyc_alloc_inline(sizeof(ScrClosure) + ncaps * sizeof(ScrBox *), &cyc_type);
+  /* Like scr_cyc_alloc_inline, but only the header and the capture slots are
+   * zeroed (every other field is stored below): the block's size varies
+   * with ncaps, so a zeroing allocation calls memset. */
+  if (ncaps > (SIZE_MAX - sizeof(ScrCycHdr) - sizeof(ScrClosure)) / (sizeof(ScrBox *) + sizeof(ScrBox)))
+    scr_trap("scriptc: out of memory\n");
+  ScrCycHdr *h = (ScrCycHdr *)scr_mem_alloc(sizeof(ScrCycHdr) + sizeof(ScrClosure) + ncaps * sizeof(ScrBox *) +
+                                            nembedded * sizeof(ScrBox));
+  if (!h) scr_trap("scriptc: out of memory\n");
+  memset(h, 0, sizeof *h);
+  h->id = (uint16_t)scr_cyc_type_id(&cyc_type);
+  scr_cyc_live++;
+  ScrClosure *c = (ScrClosure *)(h + 1);
+  /* Unrolled for the common sizes: a loop would become a memset call. */
+  switch (ncaps) {
+  case 4: c->caps[3] = NULL; /* fall through */
+  case 3: c->caps[2] = NULL; /* fall through */
+  case 2: c->caps[1] = NULL; /* fall through */
+  case 1: c->caps[0] = NULL; /* fall through */
+  case 0: break;
+  default:
+    for (size_t i = 0; i < ncaps; i++) c->caps[i] = NULL;
+  }
   c->rc = 1;
   c->fn = fn;
   c->ncaps = ncaps;
@@ -196,9 +262,18 @@ ScrClosure *scr_closure_new(void *fn, size_t ncaps) {
   c->identity_length = 0;
   c->identity = NULL;
   c->fn_borrowed = NULL;
+  c->embedded = 0;
 #ifdef SCR_RC_AUDIT
   scr_live_closures++;
 #endif
+  return c;
+}
+
+ScrClosure *scr_closure_new(void *fn, size_t ncaps) { return scr_closure_alloc(fn, ncaps, 0); }
+
+ScrClosure *scr_closure_new_embed(void *fn, size_t ncaps, uint32_t embedded, size_t nembedded) {
+  ScrClosure *c = scr_closure_alloc(fn, ncaps, nembedded);
+  c->embedded = embedded;
   return c;
 }
 
@@ -214,7 +289,17 @@ void scr_closure_adopt_identity(ScrClosure *adapter, ScrClosure *original, uint3
 
 static void scr_closure_destroy(void *object) {
   ScrClosure *c = object;
-  for (size_t i = 0; i < c->ncaps; i++) scr_box_release(c->caps[i]);
+  if (c->embedded == 0) {
+    for (size_t i = 0; i < c->ncaps; i++) scr_box_release(c->caps[i]);
+  } else {
+    for (size_t i = 0; i < c->ncaps; i++) {
+      if ((c->embedded >> i & 1u) == 0) scr_box_release(c->caps[i]);
+      else {
+        ScrBox *b = c->caps[i];
+        if (b->kind >= SCR_BOX_STR) scr_box_release_payload(b, scr_box_ptr(b)); /* scalars own nothing */
+      }
+    }
+  }
   scr_box_release(c->props); /* NULL-tolerant */
 #ifdef SCR_RC_AUDIT
   scr_live_closures--;

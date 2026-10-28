@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8529-static-accessors.ts"
+ ],
+ "diags": []
+}

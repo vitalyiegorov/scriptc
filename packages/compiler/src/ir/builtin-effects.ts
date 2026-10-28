@@ -507,6 +507,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "dyn.classBasePrototype",
   "dyn.classInherit",
   "dyn.classSuper",
+  "dyn.legacyClassSuper",
   "dyn.hasKey",
   "dyn.in",
   "child.kill",
@@ -656,7 +657,9 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "dyn.objCreateWithProperties",
   "dyn.getPrototype",
   "dyn.getPrototypeForIdentity",
+  "intl.dateTimeFormatNew",
   "dyn.setPrototype",
+  "dyn.literalPrototype",
   // Error.captureStackTrace: Node's TypeError for a primitive target, and
   // the error string conversion of name and message
   "dyn.errorCaptureStackTrace",

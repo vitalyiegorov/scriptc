@@ -539,3 +539,28 @@ test.for([
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("type-only barrel declarations do not hide runtime star exports from require", () => {
+  const dir = mkdtempSync(join(tmpdir(), "scriptc-runtime-star-export-"));
+  writeFileSync(join(dir, "package.json"), '{"type":"module"}');
+  writeFileSync(join(dir, "value.js"), "export const Status = { OK: 200 };\n");
+  // Static npm type bridges append JSDoc aliases to runtime barrels. The
+  // alias must not replace the value that Node obtains from export *.
+  writeFileSync(
+    join(dir, "barrel.js"),
+    'export * from "./value.js";\n/** @typedef {number} Status */\n',
+  );
+  writeFileSync(
+    join(dir, "consumer.js"),
+    '// @ts-nocheck\nimport { Status } from "./barrel.js"; console.log(Status.OK);\n',
+  );
+  const entry = join(dir, "main.cjs");
+  writeFileSync(entry, 'require("./consumer.js");\n');
+  const load = loadProgram(entry);
+  try {
+    expect(checkPreflight(load)).toEqual([]);
+  } finally {
+    load.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

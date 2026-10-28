@@ -29,9 +29,10 @@ import { emitStackUnion } from "./stack-unions.js";
 import { emitBorrowedArrayRead, emitLocalArrayRead } from "./local-array-reads.js";
 import { emitStackMapRead } from "./map-read-lifetimes.js";
 import { allocateLocalUnion, storeLocalUnion } from "./local-union-storage.js";
-import { boxAccess, boxNewCall, elemAccess } from "./shapes.js";
+import { boxAccess, boxNewCall, boxNewSetCall, elemAccess } from "./shapes.js";
 import { dynHoleRead } from "./loop-array-borrows.js";
 import { endsWithJump, matchStringSelfConcat } from "../../ir/analysis.js";
+import { everyExpr } from "../../ir/traverse.js";
 import { charAtUnitRead, emitBorrowedMapGet, emitDiscardedSplice } from "./expr-containers.js";
 import { InternalCompilerError } from "../../errors.js";
 import {
@@ -217,6 +218,54 @@ export function emitStmtBody(emitter: LlEmitter, s: IrStmt): void {
           }
           break;
         }
+        // An initializer no closure of which captures this binding can run
+        // before the box exists: the box is built around its value.
+        if (s.init !== null && b.local!.tdz !== true && boxAccess(b.type) === "ref") {
+          const id = s.localId;
+          const captured = !everyExpr(s.init, {
+            expr: (node) =>
+              !(
+                ((node.kind === "varRef" || node.kind === "assignExpr" || node.kind === "incDec") &&
+                  node.localId === id) ||
+                ((node.kind === "closure" || node.kind === "classRef") &&
+                  (node.captures?.includes(id) ?? false))
+              ),
+            stmt: (node) =>
+              !(
+                (node.kind === "assign" || node.kind === "varDecl" || node.kind === "forOf") &&
+                node.localId === id
+              ),
+          });
+          if (!captured) {
+            const v = emitter.emitExpr(s.init);
+            if (isRefCounted(v.type)) emitter.toHeap(v); // the box takes ownership
+            const fused = boxNewSetCall(emitter.shapeHost, b.type, v.name);
+            if (fused !== null) {
+              const box = B.tmp();
+              B.line(`${box} = ${fused} ; let ${b.local!.name} (boxed)`);
+              B.line(`store ptr ${box}, ptr ${b.slot}`);
+              emitter.scopes[emitter.scopes.length - 1]!.push({
+                slot: b.slot,
+                type: b.type,
+                boxed: true,
+              });
+              break;
+            }
+            // No fused form: build the box and write the value as usual.
+            const box = B.tmp();
+            B.line(
+              `${box} = ${boxNewCall(emitter.shapeHost, b.type)} ; let ${b.local!.name} (boxed)`,
+            );
+            B.line(`store ptr ${box}, ptr ${b.slot}`);
+            emitter.scopes[emitter.scopes.length - 1]!.push({
+              slot: b.slot,
+              type: b.type,
+              boxed: true,
+            });
+            emitter.boxSet(box, b.type, v.name);
+            break;
+          }
+        }
         // Box FIRST, then evaluate the initializer: a named function
         // expression's closure captures this box during init evaluation.
         // A SCALAR TDZ box rides an ARR-kind box: the value lives in a
@@ -285,6 +334,10 @@ export function emitStmtBody(emitter: LlEmitter, s: IrStmt): void {
         B.startBlock(done);
         break;
       }
+      // The receiver binding stays an owned copy (`dyn.this` retains). Borrowing
+      // the window's value (scr_dyn_this_peek) is unsound: scr_dyn_call_this
+      // pushes a borrowed window, and a listener that drops the emitter's last
+      // reference mid-body (corpus 6480, stream unpipe) frees the receiver.
       // A stable lexical alias cannot outlive its unchanged local owner.
       // Whole-value uses still retain their own copies, so returning or
       // storing the alias preserves the ordinary heap representation.

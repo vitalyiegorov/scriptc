@@ -2,6 +2,7 @@ import { isErrorPrototypeValue } from "./class-prototypes.js";
 import * as ts from "../ts7/adapter.js";
 import { literalValues } from "../literal-values.js";
 import { isJsSourceFile } from "../program.js";
+import { isTslibDecorateCall } from "../legacy-decorators.js";
 import type { Lowerer } from "./lowerer.js";
 
 /** Members every function value has (Function.prototype and
@@ -474,6 +475,17 @@ export function collectClassMethodMutations(
             lowerer.noteMethodAccess(node.argumentExpression.text, node);
           else markKey(node.argumentExpression, node);
         }
+      }
+      // tslib's `__decorate(decorators, C.prototype, "m", desc)` may
+      // install a replacement method through its descriptor.
+      if (
+        isTslibDecorateCall(lowerer.checker, node) &&
+        node.arguments.nodes[2] &&
+        ts.isStringLiteralLike(node.arguments.nodes[2])
+      ) {
+        const target = unwrap(node.arguments.nodes[1]!);
+        if (ts.isPropertyAccessExpression(target) && target.name.text === "prototype")
+          lowerer.noteMethodAccess(node.arguments.nodes[2].text, node);
       }
       // Extracted reflection functions and aliases of Object/Reflect can
       // mutate arbitrary names. Direct calls below retain precise keys.

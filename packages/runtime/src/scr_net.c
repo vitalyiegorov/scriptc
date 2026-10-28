@@ -360,11 +360,14 @@ static void scr_net_dyn_fire_arg(ScrClosure *cb, const ScrDyn *arg) {
   scr_dyn_release(fn);
 }
 
+static void scr_net_dynh_fire_conn(ScrClosure *cb, ScrNetSocket *sock /* +1 */);
+
 /* The JS function a listener entry stands for: the boxed function of a
  * dyn listener closure, otherwise the closure's own identity. */
 static ScrClosure *scr_net_listener_root(const ScrNetL *e) {
   ScrClosure *c = e->cb;
-  if (e->fn == (void *)&scr_net_dyn_fire_arg || c->fn == (void *)&scr_dyn_listener_fire0) {
+  if (e->fn == (void *)&scr_net_dyn_fire_arg || c->fn == (void *)&scr_dyn_listener_fire0 ||
+      c->fn == (void *)&scr_dyn_listener_fire_err || c->fn == (void *)&scr_net_dynh_fire_conn) {
     ScrDyn *boxed = scr_dyn_listener_fn(c);
     ScrClosure *inner = boxed->kind == SCR_DYN_FUNC ? boxed->v.fn.clo : NULL;
     scr_dyn_release(boxed);
@@ -894,6 +897,7 @@ static ssize_t scr_net_send(int fd, const void *buf, size_t len) {
   if (n < 0) scr_w32_seterr();
   return n;
 #elif defined(MSG_NOSIGNAL)
+  SCR_STAT(sys_write);
   return send(fd, buf, len, MSG_NOSIGNAL);
 #else
   return write(fd, buf, len);
@@ -1196,6 +1200,7 @@ void scr_net_sock_writev_native(ScrNetSocket *s, const ScrNetSlice *slices, size
   msg.msg_iov = iov;
   msg.msg_iovlen = cnt;
 #if defined(MSG_NOSIGNAL)
+  SCR_STAT(sys_sendmsg);
   ssize_t sent = sendmsg(s->fd, &msg, MSG_NOSIGNAL);
 #else
   ssize_t sent = sendmsg(s->fd, &msg, 0);
@@ -1359,6 +1364,7 @@ static void scr_net_sock_read(ScrNetSocket *s) {
       return;
     }
     char buf[65536];
+    SCR_STAT(sys_read);
     ssize_t n = s->tops ? s->tops->xread(s->tctx, buf, sizeof buf) : read(s->fd, buf, sizeof buf);
     if (n < 0) {
       if (errno == EINTR) continue;
@@ -1566,6 +1572,7 @@ static void scr_net_sock_tunnel_pump(ScrNetSocket *s) {
   }
   for (;;) {
     char buf[4096];
+    SCR_STAT(sys_read);
     ssize_t n = read(s->fd, buf, sizeof buf);
     if (n < 0) {
       if (errno == EINTR) continue;
@@ -3836,7 +3843,7 @@ static ScrDyn *scr_net_sockaddr_invoke(void *h, ScrDyn *self, const char *method
   (void)self;
   (void)args;
   (void)argc;
-  if (strcmp(method, "toJSON") == 0) return scr_net_sockaddr_detail((const ScrNetSockAddr *)h);
+  if (SCR_STREQ(method, "toJSON")) return scr_net_sockaddr_detail((const ScrNetSockAddr *)h);
   scr_net_not_a_function(what);
   return NULL;
 }
@@ -4298,20 +4305,20 @@ static ScrDyn *scr_net_blocklist_invoke(void *h, ScrDyn *self, const char *metho
   (void)self;
   ScrNetBlockList *l = h;
   const ScrDyn *first = argc > 0 ? args[0] : scr_dyn_undefined();
-  if (strcmp(method, "addAddress") == 0) scr_net_blocklist_add_address(l, args, argc, false);
-  else if (strcmp(method, "addAddresses") == 0) scr_net_blocklist_add_addresses(l, args, argc);
-  else if (strcmp(method, "addRange") == 0) scr_net_blocklist_add_range(l, args, argc, false);
-  else if (strcmp(method, "addSubnet") == 0) scr_net_blocklist_subnet(l, args, argc, false);
-  else if (strcmp(method, "addCIDR") == 0) scr_net_blocklist_cidr(l, first, false);
-  else if (strcmp(method, "addCIDRs") == 0) scr_net_blocklist_add_cidrs(l, args, argc);
-  else if (strcmp(method, "removeAddress") == 0) scr_net_blocklist_add_address(l, args, argc, true);
-  else if (strcmp(method, "removeRange") == 0) scr_net_blocklist_add_range(l, args, argc, true);
-  else if (strcmp(method, "removeSubnet") == 0) scr_net_blocklist_subnet(l, args, argc, true);
-  else if (strcmp(method, "removeCIDR") == 0) scr_net_blocklist_cidr(l, first, true);
-  else if (strcmp(method, "clear") == 0) l->n = 0;
-  else if (strcmp(method, "check") == 0) return scr_net_blocklist_check(l, args, argc);
-  else if (strcmp(method, "toJSON") == 0) return scr_net_blocklist_rules(l);
-  else if (strcmp(method, "fromJSON") == 0) scr_net_blocklist_from_json(l, args, argc);
+  if (SCR_STREQ(method, "addAddress")) scr_net_blocklist_add_address(l, args, argc, false);
+  else if (SCR_STREQ(method, "addAddresses")) scr_net_blocklist_add_addresses(l, args, argc);
+  else if (SCR_STREQ(method, "addRange")) scr_net_blocklist_add_range(l, args, argc, false);
+  else if (SCR_STREQ(method, "addSubnet")) scr_net_blocklist_subnet(l, args, argc, false);
+  else if (SCR_STREQ(method, "addCIDR")) scr_net_blocklist_cidr(l, first, false);
+  else if (SCR_STREQ(method, "addCIDRs")) scr_net_blocklist_add_cidrs(l, args, argc);
+  else if (SCR_STREQ(method, "removeAddress")) scr_net_blocklist_add_address(l, args, argc, true);
+  else if (SCR_STREQ(method, "removeRange")) scr_net_blocklist_add_range(l, args, argc, true);
+  else if (SCR_STREQ(method, "removeSubnet")) scr_net_blocklist_subnet(l, args, argc, true);
+  else if (SCR_STREQ(method, "removeCIDR")) scr_net_blocklist_cidr(l, first, true);
+  else if (SCR_STREQ(method, "clear")) l->n = 0;
+  else if (SCR_STREQ(method, "check")) return scr_net_blocklist_check(l, args, argc);
+  else if (SCR_STREQ(method, "toJSON")) return scr_net_blocklist_rules(l);
+  else if (SCR_STREQ(method, "fromJSON")) scr_net_blocklist_from_json(l, args, argc);
   else {
     scr_net_not_a_function(what);
     return NULL;
@@ -5959,8 +5966,8 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
                                         ScrDyn *const *args, size_t argc, const char *what) {
   ScrNetSocket *s = (ScrNetSocket *)h;
   bool reg = false, once = false;
-  if (strcmp(method, "on") == 0 || strcmp(method, "addListener") == 0) reg = true;
-  else if (strcmp(method, "once") == 0) { reg = true; once = true; }
+  if (SCR_STREQ(method, "on") || SCR_STREQ(method, "addListener")) reg = true;
+  else if (SCR_STREQ(method, "once")) { reg = true; once = true; }
   if (reg) {
     const ScrDyn *name = argc > 0 ? args[0] : scr_dyn_undefined();
     const ScrDyn *cb = argc > 1 ? args[1] : scr_dyn_undefined();
@@ -6002,7 +6009,7 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "write") == 0) {
+  if (SCR_STREQ(method, "write")) {
     const ScrDyn *chunk = argc > 0 ? args[0] : scr_dyn_undefined();
     if (chunk->kind != SCR_DYN_STR && chunk->kind != SCR_DYN_BYTES) {
       scr_dyn_arg_type_fail("chunk", "of type string or an instance of Buffer or Uint8Array", chunk);
@@ -6016,7 +6023,7 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_new_bool(true); /* backpressure is not modeled (SEMANTICS.md) */
   }
-  if (strcmp(method, "end") == 0) {
+  if (SCR_STREQ(method, "end")) {
     const ScrDyn *chunk = argc > 0 ? args[0] : scr_dyn_undefined();
     const ScrDyn *cb = NULL;
     if (chunk->kind == SCR_DYN_FUNC) { /* end(callback) */
@@ -6035,25 +6042,25 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "pause") == 0) {
+  if (SCR_STREQ(method, "pause")) {
     scr_net_sock_release(scr_net_sock_pause(s)); /* the chaining +1; self answers */
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "resume") == 0) {
+  if (SCR_STREQ(method, "resume")) {
     scr_net_sock_release(scr_net_sock_resume(s));
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "setNoDelay") == 0) {
+  if (SCR_STREQ(method, "setNoDelay")) {
     /* setNoDelay([enable]) — missing/undefined means true, Node */
     bool enable = argc == 0 || args[0]->kind == SCR_DYN_UNDEF || scr_dyn_truthy(args[0]);
     scr_net_sock_release(scr_net_sock_set_nodelay(s, enable));
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "destroySoon") == 0) {
+  if (SCR_STREQ(method, "destroySoon")) {
     scr_net_sock_destroy_soon(s);
     return scr_dyn_retain(scr_dyn_undefined());
   }
-  if (strcmp(method, "destroy") == 0) {
+  if (SCR_STREQ(method, "destroy")) {
     if (argc > 0 && args[0]->kind != SCR_DYN_UNDEF) {
       scr_net_dynh_unsupported("destroy", "destroy(error) carries a payload this surface does not model");
       return NULL;
@@ -6061,7 +6068,7 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
     scr_net_sock_destroy(s);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "setTimeout") == 0) {
+  if (SCR_STREQ(method, "setTimeout")) {
     const ScrDyn *ms = argc > 0 ? args[0] : scr_dyn_undefined();
     if (ms->kind != SCR_DYN_NUM) {
       scr_dyn_arg_type_fail("msecs", "of type number", ms);
@@ -6079,14 +6086,14 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "setKeepAlive") == 0) {
+  if (SCR_STREQ(method, "setKeepAlive")) {
     bool enable = argc > 0 && scr_dyn_truthy(args[0]);
     double delay = 0;
     if (argc > 1 && args[1]->kind != SCR_DYN_UNDEF) scr_dyn_number_coerce_js(args[1], &delay);
     scr_net_sock_set_keepalive(s, enable, delay);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "setEncoding") == 0) {
+  if (SCR_STREQ(method, "setEncoding")) {
     const ScrDyn *enc = argc > 0 ? args[0] : scr_dyn_undefined();
     if (enc->kind != SCR_DYN_STR) {
       scr_dyn_arg_type_fail("encoding", "of type string", enc);
@@ -6096,7 +6103,7 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
     if (scr_exc_pending()) return NULL;
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "pipe") == 0) {
+  if (SCR_STREQ(method, "pipe")) {
     const ScrDyn *dst = argc > 0 ? args[0] : scr_dyn_undefined();
     if (dst->kind == SCR_DYN_HANDLE && dst->v.handle.tag == SCR_DYNH_NET_SOCKET) {
       scr_net_sock_pipe(s, (ScrNetSocket *)dst->v.handle.ptr);
@@ -6113,18 +6120,18 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
     scr_net_dynh_unsupported("pipe", "only Socket and ServerResponse destinations are modeled");
     return NULL;
   }
-  if (strcmp(method, "toString") == 0) {
+  if (SCR_STREQ(method, "toString")) {
     ScrStr *str = scr_str_new("[object Object]", 15);
     ScrDyn *d = scr_dyn_new_str(str);
     scr_str_release(str);
     return d;
   }
-  if (strcmp(method, "ref") == 0 || strcmp(method, "unref") == 0) {
+  if (SCR_STREQ(method, "ref") || SCR_STREQ(method, "unref")) {
     scr_net_sock_set_ref(s, method[0] == 'r');
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "address") == 0) return scr_net_sock_address(s);
-  if (strcmp(method, "resetAndDestroy") == 0) {
+  if (SCR_STREQ(method, "address")) return scr_net_sock_address(s);
+  if (SCR_STREQ(method, "resetAndDestroy")) {
     scr_net_sock_release(scr_net_sock_reset_and_destroy(s));
     return scr_exc_pending() ? NULL : scr_dyn_retain(self);
   }
@@ -6155,25 +6162,25 @@ static ScrDyn *scr_net_dynh_sock_invoke(void *h, ScrDyn *self, const char *metho
 static ScrDyn *scr_net_dynh_sock_get(void *h, const char *key, size_t key_len) {
   ScrNetSocket *s = (ScrNetSocket *)h;
   (void)key_len;
-  if (strcmp(key, "destroyed") == 0) return scr_dyn_new_bool(scr_net_sock_destroyed(s));
-  if (strcmp(key, "writable") == 0) return scr_dyn_new_bool(scr_net_sock_writable(s));
-  if (strcmp(key, "remoteAddress") == 0) {
+  if (SCR_STREQ(key, "destroyed")) return scr_dyn_new_bool(scr_net_sock_destroyed(s));
+  if (SCR_STREQ(key, "writable")) return scr_dyn_new_bool(scr_net_sock_writable(s));
+  if (SCR_STREQ(key, "remoteAddress")) {
     ScrStr *a = scr_net_sock_remote_address(s);
     if (!a) return NULL; /* the undefined arm, the static lane's split */
     ScrDyn *d = scr_dyn_new_str(a);
     scr_str_release(a);
     return d;
   }
-  if (strcmp(key, "encrypted") == 0) {
+  if (SCR_STREQ(key, "encrypted")) {
     /* Node types `encrypted: true` on TLSSocket only; plain sockets read
      * undefined — the static lane's false→undefined mapping. */
     return scr_net_sock_encrypted(s) ? scr_dyn_new_bool(true) : NULL;
   }
-  if (strcmp(key, "bytesWritten") == 0) return scr_dyn_new_num(scr_net_sock_bytes_written(s));
-  if (strcmp(key, "bytesRead") == 0) return scr_dyn_new_num(scr_net_sock_bytes_read(s));
-  if (strcmp(key, "connecting") == 0) return scr_dyn_new_bool(scr_net_sock_connecting(s));
-  if (strcmp(key, "pending") == 0) return scr_dyn_new_bool(scr_net_sock_pending(s));
-  if (strcmp(key, "readyState") == 0) {
+  if (SCR_STREQ(key, "bytesWritten")) return scr_dyn_new_num(scr_net_sock_bytes_written(s));
+  if (SCR_STREQ(key, "bytesRead")) return scr_dyn_new_num(scr_net_sock_bytes_read(s));
+  if (SCR_STREQ(key, "connecting")) return scr_dyn_new_bool(scr_net_sock_connecting(s));
+  if (SCR_STREQ(key, "pending")) return scr_dyn_new_bool(scr_net_sock_pending(s));
+  if (SCR_STREQ(key, "readyState")) {
     ScrStr *state = scr_net_sock_ready_state(s);
     ScrDyn *d = scr_dyn_new_str(state);
     scr_str_release(state);
@@ -6192,8 +6199,8 @@ static ScrDyn *scr_net_dynh_sock_get(void *h, const char *key, size_t key_len) {
       return d;
     }
   }
-  if (strcmp(key, "readable") == 0) return scr_dyn_new_bool(scr_net_sock_readable(s));
-  if (strcmp(key, "writableHighWaterMark") == 0 || strcmp(key, "readableHighWaterMark") == 0) {
+  if (SCR_STREQ(key, "readable")) return scr_dyn_new_bool(scr_net_sock_readable(s));
+  if (SCR_STREQ(key, "writableHighWaterMark") || SCR_STREQ(key, "readableHighWaterMark")) {
     /* Node's default stream highWaterMark — a constant here (backpressure
      * is not modeled; SEMANTICS.md) */
     return scr_dyn_new_num(16384);
@@ -6290,8 +6297,8 @@ static ScrDyn *scr_net_dynh_srv_invoke(void *h, ScrDyn *self, const char *method
                                        ScrDyn *const *args, size_t argc, const char *what) {
   ScrNetServer *s = (ScrNetServer *)h;
   bool reg = false, once = false;
-  if (strcmp(method, "on") == 0 || strcmp(method, "addListener") == 0) reg = true;
-  else if (strcmp(method, "once") == 0) { reg = true; once = true; }
+  if (SCR_STREQ(method, "on") || SCR_STREQ(method, "addListener")) reg = true;
+  else if (SCR_STREQ(method, "once")) { reg = true; once = true; }
   if (reg) {
     const ScrDyn *name = argc > 0 ? args[0] : scr_dyn_undefined();
     const ScrDyn *cb = argc > 1 ? args[1] : scr_dyn_undefined();
@@ -6329,7 +6336,25 @@ static ScrDyn *scr_net_dynh_srv_invoke(void *h, ScrDyn *self, const char *method
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "listen") == 0) {
+  if (SCR_STREQ(method, "off") || SCR_STREQ(method, "removeListener")) {
+    /* The first listener standing for the same function leaves the
+     * event's list, as Node's removeListener does; events the http layer
+     * owns ('request', ...) stay fenced below. */
+    const ScrDyn *name = argc > 0 ? args[0] : scr_dyn_undefined();
+    const ScrDyn *cb = argc > 1 ? args[1] : scr_dyn_undefined();
+    scr_dyn_check_listener(cb, "listener");
+    if (scr_exc_pending()) return NULL;
+    ScrNetLs *l = scr_net_dynh_name_is(name, "error")        ? &s->err_ls
+                  : scr_net_dynh_name_is(name, "close")      ? &s->close_ls
+                  : scr_net_dynh_name_is(name, "listening")  ? &s->listening_cbs
+                  : scr_net_dynh_name_is(name, "connection") ? &s->conn_ls
+                                                             : NULL;
+    if (l != NULL) {
+      scr_net_ls_remove_fn(l, cb->v.fn.clo);
+      return scr_dyn_retain(self);
+    }
+  }
+  if (SCR_STREQ(method, "listen")) {
     /* listen([port][, host][, cb]) — the static lowering's shapes over
      * dyn arguments; the options-object form throws the 'not supported yet'
      * Error. */
@@ -6358,7 +6383,7 @@ static ScrDyn *scr_net_dynh_srv_invoke(void *h, ScrDyn *self, const char *method
     else scr_net_listen(s, port, clo);
     return scr_dyn_retain(self); /* Node's `return this` chaining */
   }
-  if (strcmp(method, "close") == 0) {
+  if (SCR_STREQ(method, "close")) {
     const ScrDyn *cb = argc > 0 ? args[0] : scr_dyn_undefined();
     if (cb->kind == SCR_DYN_FUNC) {
       scr_net_server_close(s, scr_dyn_listener_closure0(cb));
@@ -6370,10 +6395,10 @@ static ScrDyn *scr_net_dynh_srv_invoke(void *h, ScrDyn *self, const char *method
     }
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "address") == 0) {
+  if (SCR_STREQ(method, "address")) {
     return scr_net_dynh_srv_address(s);
   }
-  if (strcmp(method, "emit") == 0 && argc > 0 && scr_net_dynh_name_is(args[0], "connection")) {
+  if (SCR_STREQ(method, "emit") && argc > 0 && scr_net_dynh_name_is(args[0], "connection")) {
     const ScrDyn *sockd = argc > 1 ? args[1] : scr_dyn_undefined();
     if (sockd->kind == SCR_DYN_HANDLE && sockd->v.handle.tag == SCR_DYNH_NET_SOCKET) {
       scr_net_server_emit_connection(s, (ScrNetSocket *)sockd->v.handle.ptr);
@@ -6382,11 +6407,11 @@ static ScrDyn *scr_net_dynh_srv_invoke(void *h, ScrDyn *self, const char *method
     scr_dyn_arg_type_fail("socket", "an instance of Socket", sockd);
     return NULL;
   }
-  if (strcmp(method, "ref") == 0 || strcmp(method, "unref") == 0) {
+  if (SCR_STREQ(method, "ref") || SCR_STREQ(method, "unref")) {
     scr_net_server_set_ref((ScrNetServer *)h, method[0] == 'r');
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "getConnections") == 0) {
+  if (SCR_STREQ(method, "getConnections")) {
     const ScrDyn *cb = argc > 0 ? args[0] : scr_dyn_undefined();
     if (cb->kind != SCR_DYN_FUNC) {
       scr_dyn_check_listener(cb, "callback");
@@ -6395,7 +6420,7 @@ static ScrDyn *scr_net_dynh_srv_invoke(void *h, ScrDyn *self, const char *method
     scr_net_server_get_connections((ScrNetServer *)h, cb);
     return scr_dyn_retain(self);
   }
-  if (strcmp(method, "toString") == 0) {
+  if (SCR_STREQ(method, "toString")) {
     ScrStr *str = scr_str_new("[object Object]", 15);
     ScrDyn *d = scr_dyn_new_str(str);
     scr_str_release(str);
@@ -6422,18 +6447,18 @@ static ScrDyn *scr_net_dynh_srv_invoke(void *h, ScrDyn *self, const char *method
 }
 
 static int scr_net_dynh_srv_timeout_field(const char *key) {
-  if (strcmp(key, "timeout") == 0) return 0;
-  if (strcmp(key, "keepAliveTimeout") == 0) return 1;
-  if (strcmp(key, "headersTimeout") == 0) return 2;
-  if (strcmp(key, "requestTimeout") == 0) return 3;
-  if (strcmp(key, "keepAliveTimeoutBuffer") == 0) return 4;
+  if (SCR_STREQ(key, "timeout")) return 0;
+  if (SCR_STREQ(key, "keepAliveTimeout")) return 1;
+  if (SCR_STREQ(key, "headersTimeout")) return 2;
+  if (SCR_STREQ(key, "requestTimeout")) return 3;
+  if (SCR_STREQ(key, "keepAliveTimeoutBuffer")) return 4;
   return -1;
 }
 
 static ScrDyn *scr_net_dynh_srv_get(void *h, const char *key, size_t key_len) {
   ScrNetServer *s = (ScrNetServer *)h;
   (void)key_len;
-  if (strcmp(key, "listening") == 0) return scr_dyn_new_bool(s->listening);
+  if (SCR_STREQ(key, "listening")) return scr_dyn_new_bool(s->listening);
   int timeout_field = scr_net_dynh_srv_timeout_field(key);
   if (timeout_field >= 0 && s->http_timeout_surface) {
     if (s->http_timeout_dyn[timeout_field] != NULL) {
@@ -6442,8 +6467,8 @@ static ScrDyn *scr_net_dynh_srv_get(void *h, const char *key, size_t key_len) {
     return scr_dyn_new_num(scr_net_server_timeout_get(s, (double)timeout_field));
   }
   {
-    if (strcmp(key, "maxConnections") == 0) return s->max_conns_set ? scr_dyn_new_num(s->max_conns) : NULL;
-    if (strcmp(key, "dropMaxConnection") == 0)
+    if (SCR_STREQ(key, "maxConnections")) return s->max_conns_set ? scr_dyn_new_num(s->max_conns) : NULL;
+    if (SCR_STREQ(key, "dropMaxConnection"))
       return s->drop_max_connection != NULL ? scr_dyn_retain(s->drop_max_connection) : NULL;
     static const char *const known[] = { "connections", "maxHeadersCount", NULL };
     for (size_t i = 0; known[i]; i++) {
@@ -6469,11 +6494,11 @@ static bool scr_net_dynh_srv_set(void *h, const char *key, size_t key_len, const
     }
     return true;
   }
-  if (strcmp(key, "maxConnections") == 0) {
+  if (SCR_STREQ(key, "maxConnections")) {
     scr_net_server_max_connections_set(s, value);
     return true;
   }
-  if (strcmp(key, "dropMaxConnection") == 0) {
+  if (SCR_STREQ(key, "dropMaxConnection")) {
     scr_net_server_drop_max_connection_set(s, value);
     return true;
   }

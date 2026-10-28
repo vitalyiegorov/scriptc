@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8550-nested-function-default-parameter.ts"
+ ],
+ "diags": []
+}

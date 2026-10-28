@@ -72,18 +72,21 @@ void __lsan_unregister_root_region(const void *p, size_t size) __attribute__((we
 
 
 #if !defined(_WIN32) && !defined(__wasi__)
-/* Keep stacks out of malloc's size classes. Reuse a bounded number of
- * finished stacks, which avoids both heap fragmentation and per-call mmap
- * overhead. A server's loop sleeps between nearly every pair of requests,
- * so unmapping the spares at each sleep would map, fault in and unmap a
- * stack for every request that awaits. Spares therefore outlive short
- * sleeps: at most once per SCR_FIBER_TRIM_MS, a sleep unmaps the spares
- * that no fiber took since the previous trim (the pool's low-water mark),
- * and a sleep longer than twice that unmaps every spare, so an idle
- * program gives the memory back as before. The sanitizer lane unmaps
- * every finished stack immediately. */
+/* Keep stacks out of malloc's size classes. Reuse finished stacks, which
+ * avoids both heap fragmentation and per-call mmap overhead. Only finished
+ * stacks enter the pool, so it never holds more than the peak number of
+ * fibers live at once; the cap only bounds a pathological peak. A server
+ * whose loop turn keeps a few hundred requests in flight thus reuses every
+ * stack instead of mapping and unmapping one per request. Its loop sleeps
+ * between turns, often with a far deadline (an idle-connection timer), so
+ * the planned length of a sleep says nothing about idleness. At most once
+ * per SCR_FIBER_TRIM_MS, a sleep unmaps the spares that no fiber took
+ * since the previous trim (the pool's low-water mark), and a sleep longer
+ * than twice that unmaps every spare only once no fiber has started for a
+ * whole SCR_FIBER_TRIM_MS, so an idle program gives the memory back. The
+ * sanitizer lane unmaps every finished stack immediately. */
 #ifndef SCR_ASAN_FIBERS
-#define SCR_FIBER_SPARES 64
+#define SCR_FIBER_SPARES 1024
 #define SCR_FIBER_TRIM_MS 1000.0
 static SCR_TL void *scr_fiber_spares[SCR_FIBER_SPARES];
 static SCR_TL size_t scr_fiber_nspares;
@@ -92,6 +95,9 @@ static SCR_TL bool scr_fiber_cleanup_registered;
  * this index went unused for the whole window. */
 static SCR_TL size_t scr_fiber_spares_low;
 static SCR_TL double scr_fiber_trimmed_at;
+/* Stacks taken so far, the count the last sleep saw, and when it changed. */
+static SCR_TL size_t scr_fiber_takes, scr_fiber_takes_seen;
+static SCR_TL double scr_fiber_taken_at;
 #endif
 
 static void scr_fiber_stacks_clear(void) {
@@ -107,7 +113,11 @@ static void scr_fiber_stacks_clear(void) {
 /* The loop is about to sleep for `wait` ms (see above). */
 static void scr_fiber_stacks_trim(double now, double wait) {
 #ifndef SCR_ASAN_FIBERS
-  if (wait > 2 * SCR_FIBER_TRIM_MS) {
+  if (scr_fiber_takes != scr_fiber_takes_seen) {
+    scr_fiber_takes_seen = scr_fiber_takes;
+    scr_fiber_taken_at = now;
+  }
+  if (wait > 2 * SCR_FIBER_TRIM_MS && now - scr_fiber_taken_at >= SCR_FIBER_TRIM_MS) {
     scr_fiber_stacks_clear();
     scr_fiber_trimmed_at = now;
     return;
@@ -128,6 +138,7 @@ static void scr_fiber_stacks_trim(double now, double wait) {
 
 static void *scr_fiber_stack_new(void) {
 #ifndef SCR_ASAN_FIBERS
+  scr_fiber_takes++;
   if (scr_fiber_nspares > 0) {
     void *stack = scr_fiber_spares[--scr_fiber_nspares];
     scr_fiber_spares[scr_fiber_nspares] = NULL;
@@ -335,6 +346,7 @@ static void scr_promise_gcfree(void *o) {
 }
 
 ScrPromise *scr_promise_new(void) {
+  SCR_STAT(promise_new);
   static ScrCycType cyc_type = { &scr_promise_trace, &scr_promise_gcfree, SCR_CYC_KIND_PROMISE };
   ScrPromise *p = scr_cyc_alloc_inline(sizeof *p, &cyc_type); /* constant size: zeroing inlines */
   p->rc = 1;
@@ -2111,6 +2123,7 @@ static ScrPromise *scr_async_spawn_impl(void (*entry)(ScrFiber *, void *), void 
   f->prefix_slot = SCR_ALS_SLOT();
   f->region = scr_fiber_region_capture();
   scr_fibers_live++;
+  SCR_STAT(fiber_start);
 
 #ifdef _WIN32
   /* Commit one page initially; Windows commits further pages as the stack
@@ -2279,6 +2292,7 @@ static ScrFiber *scr_spawn_stackless_fiber(void (*entry)(ScrFiber *, void *), vo
    * resumes in (scr_resume_fiber), as a fiber's body does. */
   f->region = scr_fiber_region_capture();
   scr_fibers_live++;
+  SCR_STAT(fiber_start);
 #ifdef SCR_ASAN_FIBERS
   f->stackless_next = scr_stackless_fibers;
   f->stackless_previous = &scr_stackless_fibers;
@@ -2461,6 +2475,7 @@ ScrPromise *scr_async_spawn_after(ScrPromise *dependency,
   f->als = scr_als_ctx_retain(*SCR_ALS_SLOT());
   f->region = scr_fiber_region_capture();
   scr_fibers_live++;
+  SCR_STAT(fiber_start);
 
   if (dependency->state == SCR_PROM_PENDING) {
     scr_promise_add_waiter(dependency, f);
@@ -5404,6 +5419,7 @@ static ScrGen *scr_gen_new_common(void (*entry)(ScrFiber *, void *), void *argpa
    * fiber switch). */
   f->als = scr_als_ctx_retain(*SCR_ALS_SLOT());
   scr_fibers_live++;
+  SCR_STAT(fiber_start);
   f->stackless = stackless;
 #ifdef _WIN32
   if (!stackless) {

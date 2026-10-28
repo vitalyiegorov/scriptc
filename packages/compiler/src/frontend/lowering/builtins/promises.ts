@@ -3,10 +3,12 @@ import { checkedPromiseAll, thenReader } from "../checked-promise-all.js";
 import { InternalCompilerError } from "../../../errors.js";
 import * as ts from "../../ts7/adapter.js";
 import type { Lowerer } from "../lowerer.js";
+import { withoutPromiseLikeMapping } from "../../type-mapper.js";
 import { countedFor, varRef } from "../../../ir/build.js";
 import { arrayValueStore, optionalElementValue, primitiveElement } from "../array-values.js";
 import { maybePromiseResolve, maybePromiseUnionOf } from "../maybe-promise.js";
 import { isJsSourceFile, locOf } from "../../program.js";
+import { isProvenanceSourceFile } from "../../provenance-registry.js";
 import {
   BOOL,
   DYN,
@@ -408,6 +410,15 @@ export function lowerPromiseStaticCall(
     // spells `any[]`): the ENGINE's own Promise.all runs over the
     // marshaled array (an 'any' value passes through; an `any[]` value
 
+    // JavaScript passes any iterable (`Promise.all(iterate(xs).map(f))`,
+    // a Set, a generator): the checked combinator spreads it at runtime.
+    if (
+      (entries.type.kind !== "array" || entries.type.elem.kind !== "promise") &&
+      (isJsSourceFile(ts.getSourceFileOfNode(call)) ||
+        isProvenanceSourceFile(ts.getSourceFileOfNode(call).fileName)) &&
+      lowerer.dynConvertible(entries.type)
+    )
+      return checkedPromiseAll(lowerer, lowerer.coerceToExpected(entries, DYN), loc);
     if (entries.type.kind !== "array" || entries.type.elem.kind !== "promise") {
       // The heterogeneous-literal case: the checker's tuple overload
       // types the literal as a TUPLE of promises (a tuple-flagged record
@@ -433,6 +444,18 @@ export function lowerPromiseStaticCall(
       );
     }
     const inner = entries.type.elem.inner;
+    // A dependency's `Promise.all(voids)` keeps the `void[]` its declared type
+    // spells (a result that returns from a function typed so): the checked
+    // combinator builds the array of settled values.
+    if (inner.kind === "void" && isProvenanceSourceFile(ts.getSourceFileOfNode(call).fileName)) {
+      const declared = lowerer.mapTypeOf(lowerer.typeOf(call));
+      if (declared?.kind === "promise" && declared.inner.kind === "array") {
+        return lowerer.coerceToExpected(
+          checkedPromiseAll(lowerer, lowerer.coerceToExpected(entries, DYN), loc),
+          declared,
+        );
+      }
+    }
     const resultT: IrType | null =
       inner.kind === "void"
         ? { kind: "promise", inner: VOID }
@@ -459,6 +482,13 @@ export function lowerPromiseStaticCall(
       );
       if (joined) return joined;
     }
+    // `Promise<any>[]` combines into `any[]`, which rides the checked-dynamic
+    // kind: the combinator runs over the dynamic array.
+    if (
+      inner.kind === "dyn" &&
+      (resultT === null || (resultT.kind === "promise" && resultT.inner.kind === "dyn"))
+    )
+      return checkedPromiseAll(lowerer, lowerer.coerceToExpected(entries, DYN), loc);
     if (
       resultT?.kind !== "promise" ||
       (inner.kind !== "void" &&
@@ -557,7 +587,7 @@ export function lowerPromiseStaticCall(
         "pass the callback and its arguments directly: Promise.try(f, a, b)",
       );
     }
-    const f = lowerer.lowerExpr(fNode);
+    const f = withoutPromiseLikeMapping(() => lowerer.lowerExpr(fNode));
     // Arguments past the callback's parameters are evaluated and dropped;
     // only an arrow function, which has no `arguments`, can ignore them.
     if (

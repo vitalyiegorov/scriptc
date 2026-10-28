@@ -1,3 +1,7 @@
+import { isProvenanceSourceFile } from "../provenance-registry.js";
+import { reflectsMetadataTarget } from "./metadata-targets.js";
+import { isNativeProxyInitializer } from "./expressions/native-proxy.js";
+import { mapPrototypeValue } from "./builtins/map-classes.js";
 import { dynUndefinedExpr, varRef } from "../../ir/build.js";
 import { builtinClassKind, builtinClassValue } from "./builtins/builtin-class-dyn.js";
 import * as ts from "../ts7/adapter.js";
@@ -51,36 +55,38 @@ export function classPrototypeData(
             type: { kind: "classval", className: info.def.name },
             loc,
           };
-    const base: IrExpr | null = info.callableBase
-      ? {
-          kind: "libCall",
-          fn: "dyn.classBasePrototype",
-          args: [
-            {
-              kind: "libCall",
-              fn: "dyn.getPrototype",
-              args: [{ kind: "dynFrom", value, type: DYN, loc }],
-              type: DYN,
-              loc,
-            },
-          ],
-          type: DYN,
-          loc,
-        }
-      : info.base && !info.base.builtinError
-        ? classPrototypeData(lowerer, info.base, loc, {
-            kind: "dynCheck",
-            value: {
-              kind: "libCall",
-              fn: "dyn.getPrototype",
-              args: [{ kind: "dynFrom", value, type: DYN, loc }],
-              type: DYN,
-              loc,
-            },
-            type: { kind: "classval", className: info.base.def.name },
+    const base: IrExpr | null = info.extendsMap
+      ? mapPrototypeValue(loc)
+      : info.callableBase
+        ? {
+            kind: "libCall",
+            fn: "dyn.classBasePrototype",
+            args: [
+              {
+                kind: "libCall",
+                fn: "dyn.getPrototype",
+                args: [{ kind: "dynFrom", value, type: DYN, loc }],
+                type: DYN,
+                loc,
+              },
+            ],
+            type: DYN,
             loc,
-          })
-        : null;
+          }
+        : info.base && !info.base.builtinError
+          ? classPrototypeData(lowerer, info.base, loc, {
+              kind: "dynCheck",
+              value: {
+                kind: "libCall",
+                fn: "dyn.getPrototype",
+                args: [{ kind: "dynFrom", value, type: DYN, loc }],
+                type: DYN,
+                loc,
+              },
+              type: { kind: "classval", className: info.base.def.name },
+              loc,
+            })
+          : null;
     return {
       kind: "libCall",
       fn: "dyn.classPrototype",
@@ -92,7 +98,7 @@ export function classPrototypeData(
   if (
     info.mixinInstance ||
     info.generic ||
-    info.genericInstance ||
+    (info.genericInstance && !info.legacyPrototypeData) ||
     info.def.runtime ||
     info.builtinEmitter ||
     info.builtinStream ||
@@ -100,24 +106,29 @@ export function classPrototypeData(
   )
     return null;
   if (info.def.prototypeDataHelper === undefined) {
-    const base = info.callableBase
-      ? varRef(info.callableBase.prototypeId, DYN, loc)
-      : info.base && !info.base.builtinError
-        ? classPrototypeData(
-            lowerer,
-            info.base,
-            loc,
-            info.def.baseValueGlobal
-              ? varRef(
-                  info.def.baseValueGlobal,
-                  { kind: "classval", className: info.base.def.name },
-                  loc,
-                )
-              : undefined,
-            metadataOnly,
-          )
-        : null;
-    if (info.base && !info.base.builtinError && base === null) return null;
+    // The generic family is a storage parent, not a JavaScript prototype.
+    const runtimeBase =
+      info.base && info.base === info.genericInstance?.family ? info.base.base : info.base;
+    const base = info.extendsMap
+      ? mapPrototypeValue(loc)
+      : info.callableBase
+        ? varRef(info.callableBase.prototypeId, DYN, loc)
+        : runtimeBase && !runtimeBase.builtinError
+          ? classPrototypeData(
+              lowerer,
+              runtimeBase,
+              loc,
+              info.def.baseValueGlobal
+                ? varRef(
+                    info.def.baseValueGlobal,
+                    { kind: "classval", className: runtimeBase.def.name },
+                    loc,
+                  )
+                : undefined,
+              metadataOnly,
+            )
+          : null;
+    if (runtimeBase && !runtimeBase.builtinError && base === null) return null;
     const name = `%prototype.data.${info.def.name}`;
     const globalId = `%g.${name}`;
     const readyId = `${globalId}.ready`;
@@ -277,7 +288,22 @@ export function observedPrototypeMethod(
   // replaced there, so its reads check for the key (own or inherited) and
   // otherwise use the declared method.
   const data = classPrototypeData(lowerer, info, loc, receiver);
-  return data !== null && info.localClass === undefined;
+  return data !== null && info.localClass === undefined && !descendantWithoutPrototypeData(info);
+}
+
+/** Whether a subclass of `info` has no prototype data of its own (a generic
+ * family or instantiation, a mixin instance). Its instances' property bags
+ * start from no prototype, so an absent bag or key says nothing about the
+ * methods they inherit: reads through a base class's observed slot would
+ * miss them (rxjs' `OperatorSubscriber<T>` under `Subscription`). */
+function descendantWithoutPrototypeData(info: ClassInfo): boolean {
+  return info.subclasses.some(
+    (child) =>
+      !!child.mixinInstance ||
+      !!child.generic ||
+      (!!child.genericInstance && !child.legacyPrototypeData) ||
+      descendantWithoutPrototypeData(child),
+  );
 }
 
 export function hasClassPrototypeData(info: ClassInfo): boolean {
@@ -344,22 +370,32 @@ export function reflectClassPrototype(
     return { kind: "call", callee: info.prototypeReflectionRefusal, args: [], type: DYN, loc };
   // Local JavaScript factories initialize captured prototype members on
   // their constructor value, so the shared runtime view is already complete.
-  if (info.localClass && info.runtimePrototypeMembers) return prototype;
+  if (
+    (info.localClass || lowerer.legacyDecoratorClasses.has(info.decl)) &&
+    info.runtimePrototypeMembers
+  )
+    return prototype;
   // A function-local class declaring no prototype members (zod 4's
   // `class Definition extends Parent {}`) has nothing to install: its
   // shared runtime view is complete once its base's is.
   if (info.localClass && declaresPrototypeMembers(info.decl))
     return refuse("prototype reflection on a function-local class is not supported yet");
-  if (info.base && !info.base.builtinError) {
+  const runtimeBase =
+    info.base && info.base === info.genericInstance?.family ? info.base.base : info.base;
+  if (runtimeBase && !runtimeBase.builtinError) {
     reflectClassPrototype(
       lowerer,
-      info.base,
+      runtimeBase,
       loc,
       info.def.baseValueGlobal
-        ? varRef(info.def.baseValueGlobal, { kind: "classval", className: info.base.def.name }, loc)
+        ? varRef(
+            info.def.baseValueGlobal,
+            { kind: "classval", className: runtimeBase.def.name },
+            loc,
+          )
         : receiver,
     );
-    if (info.base.prototypeReflectionRefusal)
+    if (runtimeBase.prototypeReflectionRefusal)
       return refuse("prototype reflection with this base class is not supported yet");
   }
   const helper = lowerer.liftedFnNamed(info.def.prototypeDataHelper);
@@ -547,6 +583,10 @@ function prototypeViewPosition(lowerer: Lowerer, expr: ts.PropertyAccessExpressi
     parent = parent.parent;
   }
   if (!parent) return false;
+  // A Proxy over the prototype (Nest's NoopGraphInspector) reads it through
+  // the target's complete view.
+  if (ts.isNewExpression(parent) && isNativeProxyInitializer(lowerer, parent))
+    return parent.arguments?.nodes[0] === node;
   if (ts.isCallExpression(parent) && ts.isPropertyAccessExpression(parent.expression)) {
     const args = parent.arguments.nodes;
     const objectMethod = lowerer.stdlibGlobalMember(parent.expression, "Object");
@@ -575,9 +615,37 @@ function viewableClass(lowerer: Lowerer, info: ClassInfo, receiver: ts.Expressio
   return (
     info.decl !== null &&
     info.localClass === undefined &&
-    isJsSourceFile(ts.getSourceFileOfNode(info.decl)) &&
+    (isJsSourceFile(ts.getSourceFileOfNode(info.decl)) ||
+      isProvenanceSourceFile(ts.getSourceFileOfNode(info.decl).fileName) ||
+      lowerer.legacyDecoratorClasses.has(info.decl)) &&
     exactClassOfReceiver(lowerer, receiver) === info
   );
+}
+
+/** A Proxy without get or has traps reads its target's checked view, whose
+ * prototype chain must then hold the compiled methods and accessors. Give
+ * the JavaScript classes in `info`'s family complete prototype views; a
+ * subclass that becomes reachable later joins when its instances' view
+ * prototype is built (class-dynamic-dispatch.ts). */
+export function reflectProxyTargetClass(lowerer: Lowerer, info: ClassInfo, loc: SrcLoc): void {
+  lowerer.proxyTargetClasses.add(info);
+  const visit = (current: ClassInfo): void => {
+    reflectProxyTargetPrototype(lowerer, current, loc);
+    for (const child of current.subclasses) visit(child);
+  };
+  visit(info);
+}
+
+/** Whether `info` or a base of it reaches a Proxy target. */
+export function inProxyTargetFamily(lowerer: Lowerer, info: ClassInfo): boolean {
+  for (let current: ClassInfo | null = info; current; current = current.base)
+    if (lowerer.proxyTargetClasses.has(current)) return true;
+  return false;
+}
+
+export function reflectProxyTargetPrototype(lowerer: Lowerer, info: ClassInfo, loc: SrcLoc): void {
+  if (!info.decl || info.localClass || !isJsSourceFile(ts.getSourceFileOfNode(info.decl))) return;
+  reflectClassPrototype(lowerer, info, loc, classValueRef(lowerer, info, info.decl));
 }
 
 /** The complete prototype view of the class `node` names, when it is a
@@ -623,6 +691,12 @@ export function lowerClassPrototypeData(
     };
   }
   const parent = expr.parent;
+  if (
+    info.decl &&
+    (lowerer.legacyDecoratorClasses.has(info.decl) || reflectsMetadataTarget(lowerer, info.decl))
+  ) {
+    return reflectClassPrototype(lowerer, info, locOf(expr), classValueRef(lowerer, info, expr));
+  }
   const descriptorKey =
     ts.isCallExpression(parent) &&
     parent.arguments.nodes[0] === expr &&

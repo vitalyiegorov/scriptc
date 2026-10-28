@@ -845,7 +845,10 @@ static void scr_rgn_walk_box(ScrRgnWalk *w, ScrBox *b) {
 }
 
 static void scr_rgn_walk_closure(ScrRgnWalk *w, ScrClosure *c) {
-  for (size_t i = 0; i < c->ncaps; i++) scr_rgn_enter(w, c->caps[i], SCR_RGN_W_BOX, NULL);
+  for (size_t i = 0; i < c->ncaps; i++) {
+    if (i < 32 && (c->embedded >> i & 1u)) scr_rgn_walk_box(w, c->caps[i]); /* inside the closure */
+    else scr_rgn_enter(w, c->caps[i], SCR_RGN_W_BOX, NULL);
+  }
   scr_rgn_enter(w, c->props, SCR_RGN_W_BOX, NULL);
 }
 

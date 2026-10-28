@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8522-ternary-tuple-arms-destructured.ts"
+ ],
+ "diags": []
+}

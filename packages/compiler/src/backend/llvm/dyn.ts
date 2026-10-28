@@ -1147,11 +1147,33 @@ export class LlDyn {
   /** Native subclass capsules also satisfy a checked base-class slot.
    * Class layouts share their base prefix, so unboxing retains the same
    * pointer and virtual dispatch still uses the object's original vtable. */
-  private typedRefMatches(B: BlockBuilder, t: IrType): string {
-    this.host.declare(`declare zeroext i1 @scr_dyn_typed_ref_is(ptr, ptr, ${this.S})`);
+  private typedRefMatches(B: BlockBuilder, t: IrType, helperName: string): string {
     const types: IrType[] = isDynTypedRefType(t)
       ? this.host.classSubtypes(t.className).map((className) => ({ kind: "object", className }))
       : [t];
+    if (types.length > 1) {
+      // A class with many subclasses: one runtime call over a constant table
+      // of their keys. It answers a value that is no capsule at once, tries
+      // the keys by pointer first (a capsule boxed by this program carries
+      // the key constant itself) and compares bytes only for equal lengths,
+      // instead of one capsule test and byte comparison per subclass.
+      const table = `@${helperName}.keys`;
+      const entries = types.map((type) => {
+        const key = typeKey(type);
+        return `{ ptr, ${this.S} } { ptr ${this.host.cstr(key)}, ${this.S} ${Buffer.byteLength(key, "utf8")} }`;
+      });
+      this.defs.push(
+        `${table} = private unnamed_addr constant [${types.length} x { ptr, ${this.S} }] [${entries.join(", ")}]`,
+        ``,
+      );
+      this.host.declare(`declare zeroext i1 @scr_dyn_typed_ref_in(ptr, ptr, ${this.S})`);
+      const any = B.tmp();
+      B.line(
+        `${any} = call zeroext i1 @scr_dyn_typed_ref_in(ptr %d, ptr ${table}, ${this.S} ${types.length})`,
+      );
+      return any;
+    }
+    this.host.declare(`declare zeroext i1 @scr_dyn_typed_ref_is(ptr, ptr, ${this.S})`);
     let matched = "false";
     for (const type of types) {
       const key = typeKey(type);
@@ -1197,7 +1219,7 @@ export class LlDyn {
     const wrapped = recursive || this.holdsRecursiveShape(t);
     const B = new BlockBuilder();
     if (isRefCounted(t) && t.kind !== "dyn") {
-      const matched = this.typedRefMatches(B, t);
+      const matched = this.typedRefMatches(B, t, name);
       const lRef = B.newLabel("dm.tr");
       const lNext = B.newLabel("dm.nt");
       B.condBr(matched, lRef, lNext);
@@ -2075,7 +2097,7 @@ export class LlDyn {
         B.startBlock(next);
       }
       if (isDynTypedRefType(t)) this.exactClassCapsule(B, t);
-      const matched = this.typedRefMatches(B, t);
+      const matched = this.typedRefMatches(B, t, name);
       const lRef = B.newLabel("dc.tr");
       const lNext = B.newLabel("dc.nt");
       B.condBr(matched, lRef, lNext);
@@ -3321,14 +3343,16 @@ export class LlDyn {
         const rc = vAdapters(host, t);
         const r = B.tmp();
         const snapshot = `${name}_snapshot`;
-        const message =
-          "property reflection on a native generator through an untyped value is not supported yet";
-        host.declare(`declare void @scr_throw_error_msg_code(i32, ptr, ${host.sizeType}, ptr)`);
+        // A generator has no own properties (`next`/`return`/`throw` and
+        // the iterator symbol come from its prototype, which the frontend
+        // dispatches by the capsule key), so reflecting on it reads an empty
+        // object: every other key is undefined, as in JavaScript.
+        host.declare(`declare ptr @scr_dyn_new_obj()`);
         this.defs.push(
           `define internal ptr @${snapshot}(ptr %v) ${FN_ATTRS} {`,
           `entry:`,
-          `  call void @scr_throw_error_msg_code(i32 0, ptr ${host.cstr(message)}, ${host.sizeType} ${Buffer.byteLength(message, "utf8")}, ptr ${host.cstr("SC1071")})`,
-          `  ret ptr null`,
+          `  %o = call ptr @scr_dyn_new_obj()`,
+          `  ret ptr %o`,
           `}`,
           ``,
         );

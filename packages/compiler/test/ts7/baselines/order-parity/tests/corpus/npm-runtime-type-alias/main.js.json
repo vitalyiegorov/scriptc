@@ -1,0 +1,38 @@
+{
+ "order": [
+  "<repo>/tests/corpus/npm-runtime-type-alias/value.js",
+  "<repo>/tests/corpus/npm-runtime-type-alias/nested.js",
+  "<repo>/tests/corpus/npm-runtime-type-alias/barrel.js",
+  "<repo>/tests/corpus/npm-runtime-type-alias/star.js",
+  "<repo>/tests/corpus/npm-runtime-type-alias/main.js"
+ ],
+ "diags": [
+  {
+   "code": "SC0001",
+   "message": "'Mode' is a type and cannot be imported in JavaScript files. Use 'import(\"./star.js\").Mode' in a JSDoc type annotation.",
+   "loc": {
+    "file": "<repo>/tests/corpus/npm-runtime-type-alias/main.js",
+    "start": 90,
+    "end": 94
+   }
+  },
+  {
+   "code": "SC0001",
+   "message": "'Star' only refers to a type, but is being used as a value here.",
+   "loc": {
+    "file": "<repo>/tests/corpus/npm-runtime-type-alias/main.js",
+    "start": 197,
+    "end": 201
+   }
+  },
+  {
+   "code": "SC0001",
+   "message": "'Star' only refers to a type, but is being used as a value here.",
+   "loc": {
+    "file": "<repo>/tests/corpus/npm-runtime-type-alias/main.js",
+    "start": 214,
+    "end": 218
+   }
+  }
+ ]
+}

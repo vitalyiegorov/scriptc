@@ -143,7 +143,15 @@ A JavaScript package can contain operations scriptc can't compile, often in func
 
 ## Provenance sources (experimental)
 
-`--provenance-sources` compiles a package from the source at the commit its npm provenance attestation names, instead of from its published JavaScript. This lets packages written in TypeScript compile from their original TypeScript. Packages without a usable attestation compile from their installed files as usual.
+`--provenance-sources` compiles a package from the source at the commit its npm provenance attestation names, instead of from its published JavaScript. This lets packages written in TypeScript compile from their original TypeScript. A package that already ships its own TypeScript source next to its build (rxjs ships `src/**/*.ts`) compiles from that installed source with no attestation or download, and every subpath its `exports` map lists resolves to the same source copy. Packages with neither compile from their installed files as usual.
+
+A package that ships no TypeScript and has no attestation can still name its source in its own `package.json`. With `SCRIPTC_PROVENANCE_DECLARED=1`, scriptc fetches the commit in its `gitHead` field (or, without one, the `v<version>` or `<version>` tag) from the repository in its `repository` field, using the same download cache, and finds the package inside it through `repository.directory` (a monorepo such as `nestjs/nest` keeps `packages/core` and `packages/common` there). The fetched tree is used only if at least 95% of the package's published `.js` files have a TypeScript twin in it, so a wrong or unrelated commit is refused with a note. The repository's own `tsconfig.json` is not read: the project's TypeScript options apply, and the source tree's bare imports resolve from the installed package's `node_modules`.
+
+A local checkout works the same way for any package: `SCRIPTC_PROVENANCE_MANIFEST` names a JSON file `{"packages": {"<name>": {"dir": "<path to the package's source>"}}}`, and that directory is used instead of any download.
+
+Compiling Nest's own packages this way is incomplete: `@nestjs/core` and `@nestjs/common` compile and run through the start of `NestFactory.createApplicationContext`, but the program stops before the application starts (a local class returned as a `Type<T>` is the current blocker), so `SCRIPTC_PROVENANCE_DECLARED` is off by default. `SCRIPTC_DEBUG_RUNTIME_FENCES=1` lists, during the compile, every construct of a provenance package that was deferred to a run-time error.
+
+TypeScript compiled from a provenance source follows the rules for unsupported code in a package: a type with no native layout is held as an untyped value, code that cannot compile throws when it runs, and a binding that is reached before its declaration (an import cycle) is read without the check that throws a ReferenceError in Node.
 
 ## Upgrading from scriptc 0.2
 

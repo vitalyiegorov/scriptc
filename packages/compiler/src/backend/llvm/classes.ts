@@ -293,6 +293,8 @@ export function vtEntriesFor(meta: LlClassMeta): { slot: LlVtSlot; impl: LlClass
       }
     }
     if (meta.def.abstract === true || !meta.constructorRetained) return { slot, impl: null };
+    // An optional member no class of the chain implements leaves the slot empty.
+    if (slot.declarer.def.optionalMethods?.includes(slot.method)) return { slot, impl: null };
     throw new InternalCompilerError(
       `llvm emitter bug: no implementation of ${slot.method} for ${meta.def.name}`,
     );
@@ -988,11 +990,17 @@ export function emitClassShapes(
     );
   const candidates: [string, DirectDestroy][] = [];
   const fieldTypes: IrType[] = [];
+  // An erased generic family is a supertype of its instantiations even where
+  // they do not extend it in the class graph (an instance inherits through
+  // its own instantiated base): a reference of the family's type may hold
+  // any of them, so the family is never an exact class.
+  const erasedFamilies = new Set(emitted.flatMap((cls) => (cls.genericOf ? [cls.genericOf] : [])));
   for (const cls of emitted) {
     const meta = metaMap.get(cls.name)!;
     const types = ownedFields(cls).map(({ field }) => storedFieldType(cls, field));
     for (const t of types) fieldTypes.push(t);
     if (programLifetimeClass(host, meta)) continue;
+    if (erasedFamilies.has(cls.name)) continue;
     if (meta.hierarchy && (meta.children.length !== 0 || meta.root.def.runtime === true)) continue;
     if (!types.some((t) => isRefCounted(t) && needsBoundedRelease(t))) continue;
     const release = mangleClassRelease(cls.name);

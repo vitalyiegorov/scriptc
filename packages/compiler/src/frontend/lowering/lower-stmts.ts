@@ -1,3 +1,5 @@
+import { isProtocolRecord, proxyFlowOf } from "./proxy-flow.js";
+import { mapRootOf } from "./builtins/map-classes.js";
 import { lowerTupleAliasDecl, stripTypeWrappers } from "./typed-arguments.js";
 import {
   allBytesArms,
@@ -6,7 +8,7 @@ import {
   lowerIndexedUnionNumberRead,
   lowerIndexedUnionRead,
 } from "./indexed-unions.js";
-import { declaredMemberOf, isPromisePrototypeRead } from "./expressions/property-access.js";
+import { declaredMemberOf, isDynPrototypeValueRead } from "./expressions/property-access.js";
 import { hostsAll } from "./expressions/hosted-narrowing.js";
 import { requestGeneralStreamSurface } from "./general-streams.js";
 import { lowerForAwaitDynStream, nodeStreamInterfaceSide } from "./dyn-streams.js";
@@ -115,6 +117,7 @@ import {
   isCjsJsFile,
   isEsModuleStamp,
   isJsSourceFile,
+  defersToRuntime,
   locOf,
   requireEarlyReference,
   requireSpecOf,
@@ -135,6 +138,10 @@ import {
   stdlibGlobalNameOf,
 } from "./surfaces.js";
 import { isNativeBuiltinValueInitializer } from "./lower-builtin-values.js";
+import {
+  builtinStaticDestructureBindings,
+  lowerBuiltinStaticDestructure,
+} from "./builtin-static-destructure.js";
 import { isProvenanceSourceFile } from "../provenance-registry.js";
 import {
   ambientUndefVarRootOf,
@@ -157,6 +164,7 @@ import { strCharsCall } from "./containers/array-construction.js";
 import {
   bindingContextualGenericFnNodeOf,
   bindingGenericFnAliasInfoOf,
+  bindingGenericFnCapturesFrame,
   bindingGenericFnInfoOf,
   bindingGenericFnNodeOf,
   genericBindingPresenceStore,
@@ -187,6 +195,7 @@ import {
   genericIfaceBindingKeepsClass,
   lowerClassStaticRead,
   staticReceiverClass,
+  staticAccessorCall,
   superConditionLead,
 } from "./lower-classes.js";
 import {
@@ -690,7 +699,13 @@ export function provenanceElidedConstDecl(lowerer: Lowerer, decl: ts.VariableDec
   let mapped = false;
   try {
     for (const nameNode of boundIdentifiersOf(decl.name)) {
-      if (lowerer.mapTypeOf(lowerer.typeOf(nameNode)) !== null) {
+      const declared = lowerer.typeOf(nameNode);
+      // A constructable's checked-dynamic mapping does not count: the dead
+      // const elides as it did before constructor types mapped there.
+      const viaConstructable =
+        lowerer.checker.getConstructSignatures(declared).length > 0 &&
+        lowerer.checker.getCallSignatures(declared).length === 0;
+      if (lowerer.mapTypeOf(declared) !== null && !viaConstructable) {
         mapped = true;
         break;
       }
@@ -726,7 +741,7 @@ export function lowerStmts(lowerer: Lowerer, stmts: readonly ts.Statement[]): Ir
   // position — instead of failing the whole build). TypeScript keeps
   // compile fences. ICEs (SC9001) always stay compile errors.
   const sf = stmts.length === 0 ? undefined : ts.getSourceFileOfNode(stmts[0]!);
-  const deferFences = sf !== undefined && isJsSourceFile(sf);
+  const deferFences = sf !== undefined && defersToRuntime(sf);
   // Register this list as open for the forward-capture machinery: a
   // nested function lowering mid-list may pre-declare a LATER const of
   // this list as a TDZ box (predeclareForwardCapture), pushing the
@@ -1339,7 +1354,7 @@ function varBindingType(lowerer: Lowerer, nameNode: ts.Identifier): IrType | nul
   if (
     ts.isVariableDeclaration(nameNode.parent) &&
     !nameNode.parent.type &&
-    isPromisePrototypeRead(lowerer, nameNode.parent.initializer)
+    isDynPrototypeValueRead(lowerer, nameNode.parent.initializer)
   )
     return DYN;
   let type = lowerer.mapTypeOf(lowerer.typeOf(nameNode));
@@ -2343,6 +2358,13 @@ export function lowerDestructuringDecl(
     // tsc already rejects this (TS1182); defensive.
     lowerer.unsupported("SC1031", decl);
   }
+  // `const { isArray } = Array`: covered statics of a builtin constructor
+  // bind as the same values `Array.isArray` reads as.
+  {
+    const staticBound = builtinStaticDestructureBindings(lowerer, decl);
+    if (staticBound !== null)
+      return lowerBuiltinStaticDestructure(lowerer, decl, staticBound, isLet);
+  }
   // A STDLIB-GLOBAL source in a JavaScript file (`const { subtle } =
   // globalThis.crypto`, `const { Console } = console` — the suite's
   // webcrypto/console prologues): each element binds a member IDENTITY
@@ -2367,6 +2389,16 @@ export function lowerDestructuringDecl(
   // JavaScript file's pattern does, with the same per-site runtime fences
   // (null/undefined sources throw Node's TypeError). Primitive and unit
   // sources keep their own fences below; other carriers keep this one.
+  // An `any` read the checker could not type (`metadata[key]` over a
+  // `Record<number, T>` indexed by a string) lowers to the record's
+  // optional value: it destructures as the checked-dynamic value, which
+  // throws Node's TypeError when the entry is absent.
+  if (
+    init.type.kind === "union" &&
+    lowerer.anyOrigin(decl.initializer) &&
+    !isJsSourceFile(ts.getSourceFileOfNode(decl))
+  )
+    init = lowerer.coerceToExpected(init, DYN);
   if (
     lowerer.anyOrigin(decl.initializer) &&
     !isJsSourceFile(ts.getSourceFileOfNode(decl)) &&
@@ -2897,7 +2929,7 @@ export function lowerBindingPattern(
           // its value converting into the checked-dynamic tree like any dyn-slot value.
           const rl = lowerer.declareHiddenLocal("%delem", DYN);
           out.push({ kind: "varDecl", localId: rl.id, init: value, loc: elLoc });
-          const dflt = lowerer.coerceInto(el.initializer, lowerer.lowerExpr(el.initializer), DYN);
+          const dflt = lowerer.coerceInto(el.initializer, dynDefaultValue(lowerer, el), DYN);
           if (dflt.type.kind !== "dyn") {
             lowerer.unsupported(
               "SC1031",
@@ -3202,7 +3234,7 @@ export function lowerBindingPattern(
         value = {
           kind: "ternary",
           cond: { kind: "dynTest", test: "undefined", value: readRef, type: BOOL, loc },
-          then: lowerer.coerceInto(el.initializer, lowerer.lowerExpr(el.initializer), DYN),
+          then: lowerer.coerceInto(el.initializer, dynDefaultValue(lowerer, el), DYN),
           else_: readRef,
           type: DYN,
           loc,
@@ -3683,6 +3715,22 @@ function patternSourceValue(
 /** The type a pattern element binds at — the checker's type of the bound
  * identifier, or of the nested pattern itself (its implied type). Null
  * when the type has no static mapping or checked JS fallback. */
+/** The default of a dynamic-source binding element, lowered against the
+ * binding's own declared type: an empty `[]` or `{}` default takes the
+ * element type the annotation names instead of the checker's `never[]`
+ * (values pushed through the dynamic tree later must fit). */
+function dynDefaultValue(lowerer: Lowerer, el: ts.BindingElement): IrExpr {
+  const init = el.initializer!;
+  const declared = patternBindingType(lowerer, el.name!);
+  if (declared !== null && declared.kind !== "dyn")
+    return lowerer.lowerExprExpecting(init, declared);
+  // An empty array literal bound to a dynamic slot is a dynamic array: the
+  // checker's `never[]` would fix an element type no later push fits.
+  if (ts.isArrayLiteralExpression(init) && init.elements.nodes.length === 0)
+    return { kind: "dynArrLit", elems: [], type: DYN, loc: locOf(init) };
+  return lowerer.lowerExpr(init);
+}
+
 function patternBindingType(lowerer: Lowerer, name: ts.BindingName): IrType | null {
   const type = lowerer.typeOf(name);
   return (
@@ -5110,10 +5158,12 @@ export function bindPatternTarget(
     // the elements written before it.
     const dynStays =
       value.type.kind === "dyn" &&
-      ((() => {
-        const mapped = lowerer.mapTypeOf(lowerer.typeOf(name));
-        return mapped === null || jsBindingKeepsCheckedObject(lowerer, name, mapped);
-      })() ||
+      ((isProvenanceSourceFile(ts.getSourceFileOfNode(name).fileName) &&
+        isProtocolRecord(lowerer, lowerer.mapTypeOf(lowerer.typeOf(name)))) ||
+        (() => {
+          const mapped = lowerer.mapTypeOf(lowerer.typeOf(name));
+          return mapped === null || jsBindingKeepsCheckedObject(lowerer, name, mapped);
+        })() ||
         readsHeldEvolvingArray(lowerer, name));
     let type = dynStays
       ? DYN
@@ -5689,7 +5739,7 @@ export function lowerVarDecl(
   // by name inside; a collection-time report dedupes.
   {
     const gfnNode = bindingGenericFnNodeOf(decl) ?? bindingContextualGenericFnNodeOf(lowerer, decl);
-    if (gfnNode) {
+    if (gfnNode && !bindingGenericFnCapturesFrame(lowerer, decl, gfnNode)) {
       const info = bindingGenericFnInfoOf(lowerer, decl, gfnNode);
       // A nested function that lowered before this declaration read the
       // binding as an ordinary TDZ box (predeclareForwardCapture); the
@@ -5980,7 +6030,11 @@ export function lowerVarDecl(
   )
     type = init.type;
   // Promise.prototype is an ordinary object the checker types Promise<any>.
-  if (!decl.type && !hasJsTypeAnnotation(decl) && isPromisePrototypeRead(lowerer, decl.initializer))
+  if (
+    !decl.type &&
+    !hasJsTypeAnnotation(decl) &&
+    isDynPrototypeValueRead(lowerer, decl.initializer)
+  )
     type = DYN;
   // A typed-arguments function expression (typed-arguments.ts): the
   // checker types the binding variadic, but its value has the fixed
@@ -6250,7 +6304,16 @@ export function lowerVarDecl(
     if (js) type = js;
   }
   if (!type) lowerer.badType(decl.name, lowerer.typeOf(decl.name));
-  let settledType: IrType = type;
+  // A binding of a possible Proxy holds the checked-dynamic value (proxy-flow.ts).
+  let settledType: IrType = proxyFlowOf(lowerer).isBinding(decl) ? DYN : type;
+  // A package binding of a protocol (a methods-only interface) to an untyped
+  // value keeps the value: its members are probed, not checked.
+  if (
+    init.type.kind === "dyn" &&
+    isProvenanceSourceFile(ts.getSourceFileOfNode(decl).fileName) &&
+    isProtocolRecord(lowerer, settledType)
+  )
+    settledType = DYN;
   if (
     !isLet &&
     isJsSourceFile(ts.getSourceFileOfNode(decl)) &&
@@ -8234,6 +8297,26 @@ export function lowerExprStatement(lowerer: Lowerer, expr: ts.Expression): IrStm
                 loc,
               };
             }
+            // A static setter: `C.x = v` calls it with the class as receiver.
+            const setter = lowerer.findStaticOn(classInfo, `set:${expr.left.name.text}`);
+            if (setter) {
+              const value = lowerer.lowerExprExpecting(
+                expr.right,
+                setter.method?.params[0]?.type ?? DYN,
+              );
+              return {
+                kind: "exprStmt",
+                expr: staticAccessorCall(
+                  lowerer,
+                  classInfo,
+                  setter,
+                  `set:${expr.left.name.text}`,
+                  expr.left,
+                  [value],
+                ),
+                loc: locOf(expr),
+              };
+            }
             const found = lowerer.findStaticOn(classInfo, expr.left.name.text);
             if (found?.field !== undefined) {
               if (found.declarer !== classInfo) {
@@ -9661,6 +9744,31 @@ function lowerAssignTargetInto(
       );
       return;
     }
+    // Checked-dynamic namespace export targets retain ordinary assignment
+    // order, including defaults that read an earlier published export.
+    if ((lowerer.typeOf(t.expression).flags & ts.TypeFlags.Any) !== 0) {
+      const value = lowerer.lowerExpr(t.expression);
+      if (value.type.kind === "dyn") {
+        const receiver = lowerer.declareHiddenLocal("%dtRecv", DYN);
+        out.push({ kind: "varDecl", localId: receiver.id, init: value, loc });
+        out.push({
+          kind: "exprStmt",
+          expr: {
+            kind: "libCall",
+            fn: "dyn.keySet",
+            args: [
+              varRef(receiver.id, DYN, loc),
+              { kind: "strLit", value: t.name.text, type: STRING, loc },
+              lowerer.coerceInto(blame, valueOf(DYN), DYN),
+            ],
+            type: VOID,
+            loc,
+          },
+          loc,
+        });
+        return;
+      }
+    }
   }
   if (ts.isElementAccessExpression(t) && !t.questionDotToken) {
     const recvT = lowerer.mapTypeOf(lowerer.typeOf(t.expression));
@@ -10452,6 +10560,13 @@ export function lowerForOf(lowerer: Lowerer, stmt: ts.ForOfStatement): IrStmt {
         labels,
       );
     }
+    if (iterable.type.kind === "object" && mapRootOf(lowerer.classes.get(iterable.type.className)))
+      return lowerForOfDyn(
+        lowerer,
+        stmt,
+        lowerer.coerceInto(stmt.expression, iterable, DYN),
+        labels,
+      );
     if (iterable.type.kind === "object") {
       // A [Symbol.iterator] generator method: the loop drives the
       // generator it returns.

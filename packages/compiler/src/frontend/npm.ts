@@ -1,4 +1,5 @@
 /** Node package resolution shared by preflight and native module introspection. */
+import { resolutionDirOf } from "./provenance-registry.js";
 import { dirname, join, resolve } from "node:path";
 import { packageNameOfSpecifier as packageNameOf } from "./workspace-registry.js";
 import {
@@ -123,7 +124,7 @@ export function probeNodeImportRefusal(
     if (parent === dir) break;
     dir = parent;
   }
-  for (let dir = dirname(importer); ;) {
+  for (let dir = resolutionDirOf(importer); ;) {
     const linkDir = join(dir, "node_modules", name);
     if (host.isDirectory(linkDir)) {
       const pkgDir = host.realpath(linkDir);
@@ -165,7 +166,7 @@ export function probeNodeRequireRefusal(
   if (isUnloadedPackage(specifier)) {
     return { message: `Cannot find module '${specifier}'\nRequire stack:\n- ${importer}` };
   }
-  for (let dir = dirname(importer); ;) {
+  for (let dir = resolutionDirOf(importer); ;) {
     // A self-scope whose "name" matches: Node's require honors package
     // self-reference — conservative null (resolvable or its own story).
     const pkgText = host.readFile(join(dir, "package.json"));
@@ -198,7 +199,7 @@ export class NodePackageResolver {
     mode: "import" | "require",
   ): string | null {
     const before = this.errors.length;
-    const key = this.resolvePackage(dirname(resolve(fromFile)), specifier, mode, {
+    const key = this.resolvePackage(resolutionDirOf(resolve(fromFile)), specifier, mode, {
       importer: resolve(fromFile),
       chain: [],
       preferModuleField: false,

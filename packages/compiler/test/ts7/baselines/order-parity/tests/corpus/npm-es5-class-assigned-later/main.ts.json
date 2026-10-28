@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/npm-es5-class-assigned-later/main.ts"
+ ],
+ "diags": []
+}

@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/js-async-method-override.js"
+ ],
+ "diags": []
+}

@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/union-structural-arm-observer-guards.ts"
+ ],
+ "diags": []
+}

@@ -82,9 +82,12 @@ console.log(local("a"), nested("b")());
   expect(local).toContain("alloca %ScrBox");
   expect(local).not.toContain("@scr_box_new");
   expect(local).toContain("@scr_str_release");
+  // The never-rebound binding is lent to the invocation-only callback through
+  // a frame box; the escaping closure embeds its own copy instead of a heap box.
   const nested = body(llvm, "sc_bf_nested");
-  expect(nested).toContain("@scr_box_new");
-  expect(nested).not.toContain("alloca %ScrBox");
+  expect(nested).toContain("alloca %ScrBox");
+  expect(nested).not.toContain("@scr_box_new");
+  expect(llvm).toContain("@scr_closure_new_embed");
 });
 
 test("escaping callbacks and dependency cycles with an escape retain heap environments", async () => {
@@ -342,7 +345,7 @@ console.log(alias(new Item()).value, snapshot(new Item()).value);
   expect(snapshot).toMatch(/(%t\d+) = load ptr, ptr %sc_l_saved_0\n[^]*ret ptr \1\n/);
 });
 
-test("unchanged captured parameters are boxed when a closure first needs them", async () => {
+test("unchanged captured parameters are embedded in the closure that first needs them", async () => {
   const mod = await lower(`
 function invoke(fn: (value: number) => number, value: number): number { return fn(value); }
 function framed(seed: number, label: string): number {
@@ -372,8 +375,8 @@ console.log(framed(1, "ab"), deferred({ limit: 4 }, false)(), deferred({ limit: 
   expect(framed).not.toContain("@scr_box_new");
   expect(framed).not.toContain("@scr_closure_new");
   const deferred = body(llvm, "sc_bf_deferred");
-  expect(deferred).toContain("lazy.box");
   expect(entry(deferred)).not.toContain("@scr_box_new");
-  expect(deferred).toContain("@scr_box_new");
+  expect(deferred).not.toContain("@scr_box_new");
+  expect(deferred).toContain("@scr_closure_new_embed");
   expect(entry(body(llvm, "sc_f_rebound"))).toContain("@scr_box_new");
 });

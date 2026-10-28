@@ -351,6 +351,12 @@ export const DYNAMIC_TIER_PREFIXES = [
   "scr_dyn_own_",
   "scr_dyn_get_own_",
   "scr_dyn_prototype",
+  "scr_dyn_function_prototype",
+  "scr_dyn_legacy_class_super",
+  "scr_function_prototype_",
+  "scr_dyn_instanceof_",
+  "scr_global_namespace_install",
+  "scr_intl_date_time_format_",
   "scr_dyn_proxy_",
   // Dynamic calls and the dynamic receiver read.
   "scr_dyn_call",

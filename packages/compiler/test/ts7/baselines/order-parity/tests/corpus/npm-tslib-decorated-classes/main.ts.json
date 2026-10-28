@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/npm-tslib-decorated-classes/main.ts"
+ ],
+ "diags": []
+}

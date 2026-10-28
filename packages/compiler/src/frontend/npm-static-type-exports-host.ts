@@ -20,6 +20,9 @@ import {
 export interface NpmStaticTypeExportPlan {
   /** Copies of the declaration files, by copy path. */
   copies: Map<string, string>;
+  /** Declaration copies with global augmentations, rooted independently of
+   * exported data shapes so side-effect-only polyfills keep their types. */
+  globalRoots: string[];
   /** The typedef block to append, by runtime entry (forward slashes). */
   typedefs: Map<string, string>;
 }
@@ -73,6 +76,7 @@ export function npmStaticTypeExportPlan(
   packages: readonly string[],
 ): NpmStaticTypeExportPlan {
   const copies = new Map<string, string>();
+  const globalRoots: string[] = [];
   const typedefs = new Map<string, string>();
   const parsed = new Map<string, ts.SourceFile | null>();
   const parse = (file: string): ts.SourceFile | null => {
@@ -214,6 +218,32 @@ export function npmStaticTypeExportPlan(
     if (runtime === null || !isJsSourceFileName(runtime.typesFile)) continue;
     const runtimeText = trackedReadFile(runtime.typesFile);
     if (runtimeText === null) continue;
+    const hasGlobalAugmentation = (file: string, seen: Set<string>): boolean => {
+      if (seen.has(file)) return false;
+      seen.add(file);
+      const declaration = parse(file);
+      if (!declaration) return false;
+      if (
+        declaration.statements.nodes.some(
+          (statement) =>
+            ts.isModuleDeclaration(statement) &&
+            ts.isIdentifier(statement.name) &&
+            statement.name.text === "global" &&
+            statement.modifiers?.nodes.some(
+              (modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword,
+            ),
+        )
+      )
+        return true;
+      return npmStaticDeclarationSpecifiers(declaration).some((specifier) => {
+        const target = declarationTargetOf(file, specifier);
+        return target !== null && hasGlobalAugmentation(target, seen);
+      });
+    };
+    if (hasGlobalAugmentation(declared.typesFile, new Set())) {
+      copy(declared.typesFile);
+      globalRoots.push(copyPathOf(declared.typesFile));
+    }
     const { types, values } = typesOf(declared.typesFile, new Set());
     const declaredByRuntime = runtimeTypeNames(services, runtime.typesFile, runtimeText);
     // Only data shapes: a type with methods describes the package's
@@ -234,5 +264,5 @@ export function npmStaticTypeExportPlan(
       npmStaticTypedefBlock(exported, specifier),
     );
   }
-  return { copies, typedefs };
+  return { copies, typedefs, globalRoots };
 }

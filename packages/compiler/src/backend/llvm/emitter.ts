@@ -1,4 +1,5 @@
 import type { TargetCpu } from "../target-cpu.js";
+import { emitCapsuleLadder } from "./capsule-ladder.js";
 import { relieveHeapPressure } from "../../heap-pressure.js";
 import { wasmBoundsChecks } from "./wasm-modules.js";
 import { jsTruthy } from "./jsval.js";
@@ -58,7 +59,11 @@ import {
   classJsName,
   classValueAbiEquals,
 } from "../../ir/ir.js";
-import { moduleRuntimeFeatures, type RuntimeFeatures } from "../../ir/runtime-features.js";
+import {
+  moduleRuntimeFeatures,
+  moduleUsesDynTier,
+  type RuntimeFeatures,
+} from "../../ir/runtime-features.js";
 import { captureFreeFunctions, observesStacks } from "../stack-observations.js";
 import { findInitializedByteLoopBindings } from "./byte-windows.js";
 import { matchBytesLoopVersion } from "./bytes-loop-versions.js";
@@ -80,6 +85,7 @@ import {
   renameChunk,
   replayJournal,
 } from "./emit-journal.js";
+import { FeedbackSiteIds } from "./js-feedback.js";
 import { specializeNumericCalls } from "../../ir/numeric-call-specialization.js";
 import { versionLoopBoundParameters } from "../../ir/parameter-versions.js";
 import { inlineExpressionFunctions } from "../../ir/expression-inlining.js";
@@ -345,7 +351,9 @@ import {
   arrNewCall,
   boxAccess,
   elemAccess,
+  boxHeaderFields,
   boxNewCall,
+  boxNewSetCall,
   boxReleaseSym,
   computeTraced,
   emitInlineRcHelpers,
@@ -516,6 +524,15 @@ export interface LlvmTargetOptions {
    * teardown after `process.exit` to a helper process (`--detached-exit`).
    * Executables only; the runtime's weak default keeps it off. */
   detachedExit?: boolean;
+  /** Record JS-level type feedback (`--profile-generate`): dynamic-tier
+   * property sites and dyn calls report their receivers and callees to the
+   * runtime, which writes this path (`%p` is the process id) at exit
+   * (js-feedback.ts). */
+  feedbackPath?: string;
+  /** Cache entries to test inline per site, from a training run's type
+   * feedback (`--profile-use`; js-feedback-profile.ts siteWays). A site
+   * without an entry tests the default number. */
+  feedbackWays?: Readonly<Record<string, number>>;
   /** Translated WebAssembly memories check bounds explicitly instead of
    * relying on guard pages (wasm-modules.ts wasmBoundsChecks). */
   wasmBoundsChecks?: boolean;
@@ -1269,6 +1286,8 @@ export class LlEmitter {
   readonly emitLibraryIdentity: boolean;
   readonly runtimeAbiMarker: boolean;
   readonly detachedExit: boolean;
+  readonly feedbackPath: string | undefined;
+  private readonly feedbackWays: Readonly<Record<string, number>> | undefined;
   readonly targetCpu: TargetCpu | undefined;
   readonly wasmBoundsChecks: boolean;
   /** Interned string literals: UTF-8 text → { symbol, byte length } —
@@ -1394,9 +1413,19 @@ export class LlEmitter {
   /** Captures of the current closure body that its environment holds
    * unchanged for the closure's whole life (LazyCaptures.stableCaptures). */
   stableCaptureIds: ReadonlySet<string> = new Set<string>();
+  /** The current closure body's captures stored in its own allocation
+   * (LazyCaptures.embeddedCaptures): their "boxes" live inside the
+   * environment and must never be shared with another environment. */
+  embeddedCaptureIds: ReadonlySet<string> = new Set<string>();
+  /** Locals every closure of which copies their value (LazyCaptures.
+   * embeddedLocals): plain slots, never boxed. */
+  readonly embeddedLocals = new Set<string>();
   /** Parameters proven projection-only: callers may pass stack boxes. */
   projectedParameters = new Set<string>();
   stableCallBindings: ReadonlySet<string> = new Set();
+  /** Locals some expression of the current function can rebind
+   * (expression-writes.ts). */
+  exprWrittenLocals: ReadonlySet<string> = new Set();
   /** Locals and rebound parameters holding borrowed pointers for their
    * whole lifetime (walk-borrows.ts), per function and for the current one. */
   readonly walkBorrowsByFunction = new Map<string, ReadonlySet<string>>();
@@ -1963,6 +1992,8 @@ export class LlEmitter {
     this.emitLibraryIdentity = options.emitLibraryIdentity !== false;
     this.runtimeAbiMarker = options.runtimeAbiMarker === true;
     this.detachedExit = options.detachedExit === true;
+    this.feedbackPath = options.feedbackPath;
+    this.feedbackWays = options.feedbackWays;
     this.targetCpu = options.targetCpu;
     this.wasmBoundsChecks =
       options.wasmBoundsChecks === true ||
@@ -2543,7 +2574,7 @@ export class LlEmitter {
         ret === "void" ? `  ${call}` : `  %r = ${call}`,
         ret === "void" ? `  ret void` : `  ret ${ret} %r`,
         `}`,
-        `@${mangleFnClosure(name)} = internal ${this.mod.workers === true || this.mod.lib?.threadInstances === true ? "thread_local " : ""}global %ScrClosure { ${this.sizeType} -1, ptr @${mangleWrapper(name)}, ${this.sizeType} 0, ptr null, i32 ${(fn.generator ? 1 : 0) + (fn.async ? 2 : 0) + (fn.ownsPrototype ? 4 : 0)}, i32 0, ptr null, ptr ${lending ? `@${mangleBorrowingWrapper(name)}` : "null"} }`,
+        `@${mangleFnClosure(name)} = internal ${this.mod.workers === true || this.mod.lib?.threadInstances === true ? "thread_local " : ""}global %ScrClosure { ${this.sizeType} -1, ptr @${mangleWrapper(name)}, ${this.sizeType} 0, ptr null, i32 ${(fn.generator ? 1 : 0) + (fn.async ? 2 : 0) + (fn.ownsPrototype ? 4 : 0)}, i32 0, ptr null, ptr ${lending ? `@${mangleBorrowingWrapper(name)}` : "null"}, i32 0 }`,
         ``,
       );
       if (lending)
@@ -3397,6 +3428,13 @@ export class LlEmitter {
    * exception cell, or any other runtime structure. A frame reference is
    * one that a local, a parameter, a return value, a stack object or a
    * temporary holds. Both forms of each operation emit the same code. */
+
+  /** Whether `v` is a refcounted temp that the current statement frames
+   * own, so its reference can move to a consumer (toHeap/toFrame). */
+  ownsFrameTemp(v: LlValue): boolean {
+    if (!isRefCounted(v.type) || this.isImmortal(v.name)) return false;
+    return this.frames.some((frame) => frame.some((e) => e.name === v.name && e.slot !== true));
+  }
 
   /** Ends a temp's frame ownership: its reference moves into heap memory. */
   toHeap(v: LlValue): void {
@@ -4918,14 +4956,103 @@ export class LlEmitter {
     B.startBlock(create);
     const stack = this.lazyStackBoxes.get(localId);
     const box = stack ?? B.tmp();
-    if (!stack) B.line(`${box} = ${boxNewCall(this.shapeHost, type)}`);
     const value = B.tmp();
     B.line(`${value} = load ${this.llType(type)}, ptr %${mangleLocal(localId)}`);
-    this.boxSet(box, type, isRefCounted(type) ? this.retainHeap(value, type) : value);
+    const held = isRefCounted(type) ? this.retainHeap(value, type) : value;
+    const fused = stack ? null : boxNewSetCall(this.shapeHost, type, held);
+    if (fused !== null) {
+      B.line(`${box} = ${fused}`);
+    } else {
+      if (!stack) B.line(`${box} = ${boxNewCall(this.shapeHost, type)}`);
+      this.boxSet(box, type, held);
+    }
     B.line(`store ptr ${box}, ptr ${cache}`);
     B.br(join);
     B.startBlock(join);
     return this.loadBox(cache);
+  }
+
+  /** Bit i set: capture i of closure body `fnName` is embedded in the
+   * closure allocation (zero when the target is unknown or has no such
+   * capture). A capture whose type no box can hold stays boxed. */
+  embeddedMask(fnName: string): number {
+    const target = this.fnByName.get(fnName);
+    if (target?.captures === undefined || this.debug !== null) return 0;
+    const ids = this.lazyCaptures.embeddedCaptures(fnName);
+    let mask = 0;
+    target.captures.forEach((capture, index) => {
+      if (ids.has(capture.localId) && boxHeaderFields(this.shapeHost, capture.type) !== null)
+        mask |= 1 << index;
+    });
+    return mask >>> 0;
+  }
+
+  /** The current value of capturable binding `localId` (an unchanged
+   * parameter, a once-declared local or a stable capture), owned (+1) when
+   * reference counted. */
+  captureValue(localId: string): string {
+    const B = this.B;
+    const type = this.currentLocals.get(localId)!.type;
+    if (this.lazyCaptureBoxes.has(localId) || this.embeddedLocals.has(localId)) {
+      const value = B.tmp();
+      B.line(`${value} = load ${this.llType(type)}, ptr %${mangleLocal(localId)}`);
+      return isRefCounted(type) ? this.retainHeap(value, type) : value;
+    }
+    return this.boxGet(this.loadBox(`%${mangleLocal(localId)}`), type);
+  }
+
+  /** The box a stack closure captures for `localId` (owned: +1, released
+   * with the closure's slot). A local that lives in a plain slot is lent
+   * through an immortal frame box holding its current value, which the
+   * local keeps owning. */
+  stackCaptureBox(localId: string): string {
+    if (!this.embeddedLocals.has(localId)) return this.retainBox(this.captureBox(localId));
+    const B = this.B;
+    const type = this.currentLocals.get(localId)!.type;
+    if (!this.stackCaptures.charge()) {
+      // The entry block's box budget is spent: the environment owns a heap
+      // box holding a copy of the (never rebound) value.
+      const copied = this.captureValue(localId);
+      const fused = boxNewSetCall(this.shapeHost, type, copied);
+      const heap = B.tmp();
+      if (fused !== null) {
+        B.line(`${heap} = ${fused}`);
+      } else {
+        B.line(`${heap} = ${boxNewCall(this.shapeHost, type)}`);
+        this.boxSet(heap, type, copied);
+      }
+      return heap;
+    }
+    const fields = boxHeaderFields(this.shapeHost, type)!;
+    const box = B.slot();
+    B.entryAllocas.push(`${box} = alloca %ScrBox`);
+    B.line(
+      `store %ScrBox { ${this.sizeType} -1, i32 ${fields.kind}, ptr ${fields.retain}, ptr ${fields.release}, ptr ${fields.trace}, i64 0 }, ptr ${box}`,
+    );
+    const value = B.tmp();
+    B.line(`${value} = load ${this.llType(type)}, ptr %${mangleLocal(localId)}`);
+    if (boxAccess(type) === "ref") B.line(`store ptr ${value}, ptr ${this.boxSlot(box)}`);
+    else this.boxSet(box, type, value);
+    return box;
+  }
+
+  /** A box for another environment to own (+1). A capture embedded in the
+   * current environment dies with it, so a binding it holds is copied into
+   * a box of its own. */
+  ownedCaptureBox(localId: string): string {
+    if (!this.embeddedCaptureIds.has(localId)) return this.retainBox(this.captureBox(localId));
+    const B = this.B;
+    const type = this.currentLocals.get(localId)!.type;
+    const value = this.captureValue(localId);
+    const fused = boxNewSetCall(this.shapeHost, type, value);
+    const box = B.tmp();
+    if (fused !== null) {
+      B.line(`${box} = ${fused}`);
+    } else {
+      B.line(`${box} = ${boxNewCall(this.shapeHost, type)}`);
+      this.boxSet(box, type, value);
+    }
+    return box;
   }
 
   retainBox(box: string): string {
@@ -5674,6 +5801,26 @@ export class LlEmitter {
     return canBorrowCallArgument(this, value);
   }
 
+  /** A dynamic-value or closure local that only statements rebind: a
+   * runtime operation that borrows its input may read the slot in place for
+   * the duration of one expression (expression-writes.ts). Unlike
+   * canBorrowCallArgument it proves nothing about later statements, so it
+   * does not make the local a stable owner for aliases that outlive the
+   * expression. */
+  canBorrowExpressionLocal(value: IrExpr): boolean {
+    if (value.kind !== "varRef" || (value.type.kind !== "dyn" && value.type.kind !== "func"))
+      return false;
+    const binding = this.binding(value.localId);
+    return (
+      binding.kind === "local" &&
+      binding.local !== undefined &&
+      binding.type.kind === value.type.kind &&
+      !binding.local.boxed &&
+      !binding.local.tdz &&
+      !this.exprWrittenLocals.has(value.localId)
+    );
+  }
+
   /** A plain-pointer read of a construction-only field outside any
    * constructor (ImmutableFields). */
   immutableRead(e: ExprOf<"fieldGet" | "recordGet">): boolean {
@@ -6049,6 +6196,11 @@ export class LlEmitter {
         if (this.B.isTerminated()) return;
         if (cursor) cursor.index = i;
         this.stmtCursor = cursor;
+        const afterLadder = emitCapsuleLadder(this, stmts, i);
+        if (afterLadder !== null) {
+          i = afterLadder - 1;
+          continue;
+        }
         const reserve = reservedArrayLength(stmts, i);
         if (reserve !== null) this.reservedArrayLengths.set(reserve.literal, reserve.hint);
         const deferred = this.deferredPromiseAllLocal(stmts, i);
@@ -7279,6 +7431,32 @@ export class LlEmitter {
   /** The helper classification of this module's inline-cache sites. */
   get jsIcSites(): JsIcSites {
     return (this.jsIcSitesMemo ??= new JsIcSites(this.mod));
+  }
+
+  private feedbackIdsMemo: FeedbackSiteIds | undefined;
+  private feedbackRecordingMemo: boolean | undefined;
+
+  /** Whether this build records type feedback: the recorder is part of the
+   * dynamic tier's runtime unit, which only programs that use the tier link. */
+  get feedbackRecording(): boolean {
+    return (this.feedbackRecordingMemo ??=
+      this.feedbackPath !== undefined && moduleUsesDynTier(this.mod));
+  }
+
+  /** The feedback site id of `e` in the current function, or null when
+   * the build records no feedback or `e` is not a site. */
+  feedbackSiteId(e: IrExpr): string | null {
+    if (!this.feedbackRecording && this.feedbackWays === undefined) return null;
+    this.feedbackIdsMemo ??= new FeedbackSiteIds(this.mod, this.jsIcSites);
+    return this.feedbackIdsMemo.idOf(this.currentFunctionName, e);
+  }
+
+  /** How many cache entries the property site `e` tests inline: the
+   * training run's choice for it when there is one, else `fallback`. */
+  inlineWays(e: IrExpr, fallback: number): number {
+    if (this.feedbackWays === undefined) return fallback;
+    const id = this.feedbackSiteId(e);
+    return id === null ? fallback : (this.feedbackWays[id] ?? fallback);
   }
 
   jsIcSite(): string {

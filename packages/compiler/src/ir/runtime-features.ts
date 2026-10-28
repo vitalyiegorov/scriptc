@@ -1121,7 +1121,7 @@ const RUNTIME_FEATURE_RULES = {
    * (scr_dyn_dirent_finish, defined in scr_symbol.c). */
   symbol: rule({
     initial: (mod) => (mod.records ?? []).some(isDirentShape),
-    fns: [...SYMBOL_LIB_FNS],
+    fns: [...SYMBOL_LIB_FNS, "map.classStorage"],
     prefixes: ["sym.", "disposable."],
     types: ["symbol"],
   }),
@@ -1136,6 +1136,21 @@ const RUNTIME_FEATURE_RULES = {
   /** Module namespace objects as checked-dynamic values
    * (scr_module_namespace.c). */
   moduleNamespace: rule({ fns: ["module.namespaceValue"] }),
+  /** Map subclasses select the optional native internal-slot bridge. */
+  intlDateTimeFormat: rule({ fns: ["intl.dateTimeFormatNew"] }),
+  mapClass: rule({ fns: ["map.classStorage"] }),
+  functionPrototype: rule({
+    fns: [
+      "dyn.functionPrototype",
+      "dyn.literalPrototype",
+      "dyn.legacyClassSuper",
+      "global.namespaceInstall",
+    ],
+    libCall: (node) =>
+      node.fn === "dyn.globalConstructor" &&
+      node.args[0]?.kind === "strLit" &&
+      node.args[0].value === "Function",
+  }),
   /** The WebAssembly API (scr_wasm.c). */
   wasm: rule({ prefixes: ["wasm."] }),
   /** crypto.subtle importKey/sign/verify/digest and CryptoKey:
@@ -1230,6 +1245,9 @@ function noRuntimeFeatures(): RuntimeFeatures {
     urlIdna: false,
     stdioExtended: false,
     moduleNamespace: false,
+    mapClass: false,
+    functionPrototype: false,
+    intlDateTimeFormat: false,
     stream: false,
     streamDyn: false,
     handleProps: false,

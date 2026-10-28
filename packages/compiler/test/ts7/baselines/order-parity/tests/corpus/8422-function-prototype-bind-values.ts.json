@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8422-function-prototype-bind-values.ts"
+ ],
+ "diags": []
+}

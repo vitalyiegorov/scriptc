@@ -1,0 +1,6 @@
+{
+ "order": [
+  "<repo>/tests/corpus/8568-enum-runtime-reverse-lookup.ts"
+ ],
+ "diags": []
+}

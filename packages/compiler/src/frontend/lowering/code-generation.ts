@@ -10,7 +10,15 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile, locOf } from "../program.js";
-import { DYN, F64, type IrExpr, type IrStmt, type IrType, STRING } from "../../ir/ir.js";
+import {
+  DYN,
+  F64,
+  type IrExpr,
+  type IrStmt,
+  type IrType,
+  STRING,
+  isUnitType,
+} from "../../ir/ir.js";
 import { nodeThrowExpr } from "../../ir/build.js";
 import { ambientUndefReadType, contextualUndefReadType } from "./lower-namespaces.js";
 import { stdlibGlobalNameOf } from "./surfaces.js";
@@ -77,7 +85,18 @@ export function lowerCodeGenerationCall(
   const loc = locOf(expr);
   const stmts: IrStmt[] = [];
   for (const operand of indirectEvalPrefix(expr.expression)) {
-    stmts.push({ kind: "exprStmt", expr: lowerer.lowerExpr(operand), loc: locOf(operand) });
+    let discarded = operand;
+    while (ts.isParenthesizedExpression(discarded)) discarded = discarded.expression;
+    if (ts.isVoidExpression(discarded)) {
+      stmts.push(lowerer.lowerExprStatement(discarded.expression));
+    } else {
+      const value = lowerer.lowerExpr(operand);
+      stmts.push({
+        kind: "exprStmt",
+        expr: isUnitType(value.type) ? lowerer.coerceToExpected(value, DYN) : value,
+        loc: locOf(operand),
+      });
+    }
   }
   for (const arg of expr.arguments?.nodes ?? []) {
     if (ts.isSpreadElement(arg)) {
@@ -102,7 +121,11 @@ export function lowerCodeGenerationCall(
         loc: argLoc,
       });
     } else {
-      stmts.push({ kind: "exprStmt", expr: value, loc: argLoc });
+      stmts.push({
+        kind: "exprStmt",
+        expr: isUnitType(value.type) ? lowerer.coerceToExpected(value, DYN) : value,
+        loc: argLoc,
+      });
     }
   }
   const type = useSiteType(lowerer, expr);

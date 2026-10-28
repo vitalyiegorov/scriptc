@@ -5,7 +5,9 @@ import { InternalCompilerError } from "../../../errors.js";
 import type { IrExpr, IrParam, IrStmt, IrType, SrcLoc } from "../../../ir/ir.js";
 import {
   canAdaptDynFuncTo,
+  canBoxFuncIntoDyn,
   canDynCheckTo,
+  BOOL,
   DYN,
   F64,
   isUnitType,
@@ -123,10 +125,24 @@ export function cleanFuncAdaptable(
   dst: IrType & { kind: "func" },
 ): boolean {
   if (restPackingAdapterFits(lowerer, src, dst)) return true;
+  if (restFoldAdapterFits(lowerer, src, dst)) return true;
+  if (dynRestAdapterFits(lowerer, src, dst)) return true;
   if (src.rest === true || dst.rest === true) return false;
   if (src.params.length > dst.params.length) return false;
   for (let i = 0; i < src.params.length; i++) {
-    if (!lowerer.coercibleValue(dst.params[i]!, src.params[i]!)) return false;
+    if (lowerer.coercibleValue(dst.params[i]!, src.params[i]!)) continue;
+    // A checked-dynamic slot parameter into the function's typed one: the
+    // call checks the value into the parameter type (funcCoerceAdapter).
+    if (
+      dst.params[i]!.kind === "dyn" &&
+      canDynCheckTo(
+        src.params[i]!,
+        (id) => lowerer.shapes.get(id),
+        (id) => lowerer.unions.get(id),
+      )
+    )
+      continue;
+    return false;
   }
   if (dst.ret.kind === "void") return true;
   if (lowerer.coercibleValue(src.ret, dst.ret)) return true;
@@ -144,12 +160,30 @@ export function restPackingAdapterFits(
   if (fromT.rest !== true || fromT.restAbi !== "typed" || toT.rest === true) return false;
   const fixed = fromT.params.length - 1;
   const restT = fromT.params[fixed];
-  if (restT?.kind !== "array" || toT.params.length < fixed) return false;
+  if (restT?.kind !== "array") return false;
+  // Fixed positions the slot does not spell must be optional ones.
+  for (let i = toT.params.length; i < fixed; i++) {
+    if (optionalAbsentValue(lowerer, fromT.params[i]!, restT.elem) === null) return false;
+  }
   for (let i = 0; i < toT.params.length; i++) {
     if (!lowerer.coercibleValue(toT.params[i]!, i < fixed ? fromT.params[i]! : restT.elem))
       return false;
   }
   return toT.ret.kind === "void" || lowerer.coercibleValue(fromT.ret, toT.ret);
+}
+
+/** The value a parameter takes when its caller omits it: undefined, for a
+ * parameter whose type holds undefined. Null for any other type. */
+function optionalAbsentValue(
+  lowerer: Lowerer,
+  type: IrType,
+  _restElem: IrType,
+  loc: SrcLoc = { file: "", start: 0, end: 0 },
+): IrExpr | null {
+  if (type.kind === "dyn") return dynUndefinedExpr(loc);
+  if (type.kind === "union" && lowerer.armTag(type.unionId, UNDEFINED_T) >= 0)
+    return lowerer.wrappedUndefined(type, loc);
+  return null;
 }
 
 /** The adapter for restPackingAdapterFits: forwards the fixed arguments and
@@ -180,10 +214,117 @@ function restPackingAdapter(
       want,
     );
   const args: IrExpr[] = [];
-  for (let i = 0; i < fixed; i++) args.push(arg(i, fromT.params[i]!));
+  for (let i = 0; i < fixed; i++)
+    args.push(
+      i < toT.params.length
+        ? arg(i, fromT.params[i]!)
+        : optionalAbsentValue(lowerer, fromT.params[i]!, restT.elem, loc)!,
+    );
   const packed: IrExpr[] = [];
   for (let i = fixed; i < toT.params.length; i++) packed.push(arg(i, restT.elem));
   args.push({ kind: "arrayLit", elems: packed, type: restT, loc });
+  const call: IrExpr = {
+    kind: "callValue",
+    callee: { kind: "varRef", localId: "f.0", type: fromT, loc },
+    receiver: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc },
+    args,
+    type: fromT.ret,
+    loc,
+  };
+  const body: IrStmt[] =
+    toT.ret.kind === "void"
+      ? [
+          { kind: "exprStmt", expr: call, loc },
+          { kind: "return", value: null, loc },
+        ]
+      : [{ kind: "return", value: lowerer.coerceToExpected(call, toT.ret), loc }];
+  lowerer.liftedFns.push(...buildFunctionAdapter(name, fromT, toT, params, [], body, loc));
+  return name;
+}
+
+/** Whether a function with leading optional parameters before its typed
+ * rest (`(data?: unknown, ...pipes: T[]) => R`) can serve a slot that is
+ * only a typed rest of the same element (`(...args: T[]) => R`): the
+ * slot's packed arguments feed the leading parameters first, then the
+ * rest. */
+export function restFoldAdapterFits(
+  lowerer: Lowerer,
+  fromT: IrType & { kind: "func" },
+  toT: IrType & { kind: "func" },
+): boolean {
+  if (fromT.rest !== true || fromT.restAbi !== "typed") return false;
+  if (toT.rest !== true || toT.restAbi !== "typed" || toT.params.length !== 1) return false;
+  const fixed = fromT.params.length - 1;
+  if (fixed < 1) return false;
+  const fromRest = fromT.params[fixed];
+  const toRest = toT.params[0];
+  if (fromRest?.kind !== "array" || toRest?.kind !== "array") return false;
+  if (!typeEquals(fromRest.elem, toRest.elem)) return false;
+  for (let i = 0; i < fixed; i++) {
+    if (optionalAbsentValue(lowerer, fromT.params[i]!, toRest.elem) === null) return false;
+    if (!lowerer.coercibleValue(toRest.elem, fromT.params[i]!)) return false;
+  }
+  return toT.ret.kind === "void" || lowerer.coercibleValue(fromT.ret, toT.ret);
+}
+
+/** The adapter for restFoldAdapterFits: the packed arguments' first
+ * elements feed the leading parameters (undefined where absent), and the
+ * remainder is the rest array. */
+function restFoldAdapter(
+  lowerer: Lowerer,
+  fromT: IrType & { kind: "func" },
+  toT: IrType & { kind: "func" },
+  loc: SrcLoc,
+): string {
+  const key = `fnrestfold:${typeKey(fromT)}:${typeKey(toT)}`;
+  const existing = lowerer.coercions.retags.get(key);
+  if (existing) return existing;
+  const name = keyedHelperName(lowerer, "%fn.adapt", key);
+  lowerer.coercions.retags.set(key, name);
+  lowerer.freshClosureAdapters.add(name);
+  const fixed = fromT.params.length - 1;
+  const restT = fromT.params[fixed] as IrType & { kind: "array" };
+  const packedT = toT.params[0] as IrType & { kind: "array" };
+  const params: IrParam[] = [{ localId: "a.0", name: "a0", type: packedT }];
+  const packed = (): IrExpr => ({ kind: "varRef", localId: "a.0", type: packedT, loc });
+  const num = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
+  const args: IrExpr[] = [];
+  for (let i = 0; i < fixed; i++) {
+    const present = lowerer.coerceToExpected(
+      { kind: "arrayGet", arr: packed(), index: num(i), type: packedT.elem, loc },
+      fromT.params[i]!,
+    );
+    args.push({
+      kind: "ternary",
+      cond: {
+        kind: "bin",
+        op: ">",
+        left: {
+          kind: "arrIntrinsic",
+          method: "length",
+          receiver: packed(),
+          args: [],
+          type: F64,
+          loc,
+        },
+        right: num(i),
+        type: BOOL,
+        loc,
+      },
+      then: present,
+      else_: optionalAbsentValue(lowerer, fromT.params[i]!, packedT.elem, loc)!,
+      type: fromT.params[i]!,
+      loc,
+    });
+  }
+  args.push({
+    kind: "arrIntrinsic",
+    method: "slice",
+    receiver: packed(),
+    args: [num(fixed)],
+    type: restT,
+    loc,
+  });
   const call: IrExpr = {
     kind: "callValue",
     callee: { kind: "varRef", localId: "f.0", type: fromT, loc },
@@ -210,14 +351,46 @@ function restPackingAdapter(
  * fewer arguments, as JS does. Null unless every parameter is
  * checked-dynamic, which holds a missing argument as undefined, and the
  * result is discarded or converts. */
+export function dynRestAdapterFits(
+  lowerer: Lowerer,
+  fromT: IrType & { kind: "func" },
+  toT: IrType & { kind: "func" },
+): boolean {
+  if (!(toT.rest === true && toT.restAbi === undefined && toT.params.length === 0)) return false;
+  // A typed rest after the fixed parameters takes the hidden array's tail
+  // (`(data?: unknown, ...pipes: unknown[]) => R` into `(...args: any[])`).
+  // A checked-dynamic rest after the fixed parameters takes it the same way.
+  const typedRest = fromT.rest === true && fromT.restAbi === "typed";
+  const dynRest = fromT.rest === true && fromT.restAbi === undefined;
+  const fixedCount = typedRest ? fromT.params.length - 1 : fromT.params.length;
+  if (typedRest && fromT.params[fixedCount]?.kind !== "array") return false;
+  if (dynRest && fromT.argumentsAll === true) return false;
+  if (dynRest) {
+    if (
+      !canBoxFuncIntoDyn(
+        fromT,
+        (id) => lowerer.shapes.get(id),
+        (id) => lowerer.unions.get(id),
+      )
+    )
+      return false;
+    return toT.ret.kind === "void" || lowerer.coercibleValue(DYN, toT.ret);
+  }
+  if (fromT.params.slice(0, fixedCount).some((p) => p.kind !== "dyn")) return false;
+  return toT.ret.kind === "void" || lowerer.coercibleValue(fromT.ret, toT.ret);
+}
+
 function funcIntoDynRestAdapter(
   lowerer: Lowerer,
   fromT: IrType & { kind: "func" },
   toT: IrType & { kind: "func" },
   loc: SrcLoc,
 ): string | null {
-  if (fromT.rest === true || fromT.params.some((p) => p.kind !== "dyn")) return null;
-  if (toT.ret.kind !== "void" && !lowerer.coercibleValue(fromT.ret, toT.ret)) return null;
+  if (!dynRestAdapterFits(lowerer, fromT, toT)) return null;
+  const typedRest = fromT.rest === true && fromT.restAbi === "typed";
+  const dynRest = fromT.rest === true && fromT.restAbi === undefined;
+  const fixedCount = typedRest ? fromT.params.length - 1 : fromT.params.length;
+  const restParam = typedRest ? fromT.params[fixedCount] : dynRest ? DYN : undefined;
   const key = `fnadapt:${typeKey(fromT)}:${typeKey(toT)}`;
   const existing = lowerer.coercions.retags.get(key);
   if (existing) return existing;
@@ -225,20 +398,58 @@ function funcIntoDynRestAdapter(
   lowerer.coercions.retags.set(key, name);
   lowerer.freshClosureAdapters.add(name);
   const params: IrParam[] = [{ localId: "rest.0", name: "args", type: DYN }];
-  const call: IrExpr = {
-    kind: "callValue",
-    callee: { kind: "varRef", localId: "f.0", type: fromT, loc },
-    receiver: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc },
-    args: fromT.params.map((_, i): IrExpr => ({
-      kind: "dynKeyGet",
-      value: { kind: "varRef", localId: "rest.0", type: DYN, loc },
-      key: { kind: "strLit", value: String(i), type: STRING, loc },
-      type: DYN,
-      loc,
-    })),
-    type: fromT.ret,
+  const sliced: IrExpr = {
+    kind: "dynInvoke",
+    recv: { kind: "varRef", localId: "rest.0", type: DYN, loc },
+    method: "slice",
+    calleeName: "arguments.slice",
+    args: [
+      {
+        kind: "dynFrom",
+        value: { kind: "numLit", value: fixedCount, type: F64, loc },
+        type: DYN,
+        loc,
+      },
+    ],
+    type: DYN,
     loc,
   };
+  const restTail =
+    restParam?.kind === "array" ? lowerer.coerceToExpected(sliced, restParam) : sliced;
+  // A checked-dynamic rest function applies through its boxed form, which
+  // delivers JS arity: `from(...args)`.
+  const call: IrExpr = dynRest
+    ? {
+        kind: "dynCall",
+        callee: {
+          kind: "dynFrom",
+          value: { kind: "varRef", localId: "f.0", type: fromT, loc },
+          type: DYN,
+          loc,
+        },
+        calleeName: "value",
+        args: [{ kind: "varRef", localId: "rest.0", type: DYN, loc }],
+        spreads: [{ arg: 0, what: "args" }],
+        type: DYN,
+        loc,
+      }
+    : {
+        kind: "callValue",
+        callee: { kind: "varRef", localId: "f.0", type: fromT, loc },
+        receiver: { kind: "libCall", fn: "dyn.this", args: [], type: DYN, loc },
+        args: [
+          ...fromT.params.slice(0, fixedCount).map((_, i): IrExpr => ({
+            kind: "dynKeyGet",
+            value: { kind: "varRef", localId: "rest.0", type: DYN, loc },
+            key: { kind: "strLit", value: String(i), type: STRING, loc },
+            type: DYN,
+            loc,
+          })),
+          ...(restParam === undefined ? [] : [restTail]),
+        ],
+        type: fromT.ret,
+        loc,
+      };
   let body: IrStmt[];
   if (toT.ret.kind === "void") {
     body = [
@@ -270,10 +481,21 @@ export function funcCoerceAdapter(
 ): string | null {
   if (restPackingAdapterFits(lowerer, fromT, toT))
     return restPackingAdapter(lowerer, fromT, toT, loc);
+  if (restFoldAdapterFits(lowerer, fromT, toT)) return restFoldAdapter(lowerer, fromT, toT, loc);
   if (toT.rest === true && toT.restAbi === undefined && toT.params.length === 0)
     return funcIntoDynRestAdapter(lowerer, fromT, toT, loc);
   if (fromT.rest === true || toT.rest === true) return null;
-  if (fromT.params.length > toT.params.length) return null;
+  // A function with MORE parameters fits a shorter signature when the extra
+  // ones are optional: the call passes undefined for them (`(data?: T) => R`
+  // held by a `() => R` slot).
+  const extraParams = fromT.params.slice(toT.params.length);
+  const extraUndefined = (type: IrType, at: SrcLoc): IrExpr | null =>
+    type.kind === "dyn"
+      ? dynUndefinedExpr(at)
+      : type.kind === "union" && lowerer.armTag(type.unionId, UNDEFINED_T) >= 0
+        ? lowerer.wrappedUndefined(type, at)
+        : null;
+  if (extraParams.some((type) => extraUndefined(type, loc) === null)) return null;
   // Piece dispositions beyond coercibleValue, all CHECKER-APPROVED
   // function compatibilities (bivariant method params under the suite's
   // non-strict settings, `() => never` throwers displayed as void by
@@ -290,7 +512,7 @@ export function funcCoerceAdapter(
   let strandParams = false;
   const narrowedParams = new Map<number, ReadonlySet<number>>();
   const partialDynParams = new Map<number, IrType>();
-  for (let i = 0; i < fromT.params.length; i++) {
+  for (let i = 0; i < Math.min(fromT.params.length, toT.params.length); i++) {
     const actual = toT.params[i]!;
     const expected = fromT.params[i]!;
     if (lowerer.coercibleValue(actual, expected)) continue;
@@ -332,6 +554,20 @@ export function funcCoerceAdapter(
         continue;
       }
     }
+    // A checked-dynamic slot parameter (`unknown`) into the function's typed
+    // one (`(state?: unknown) => void` holding `(state?: number) => void`, a
+    // generic class erased to its unknown instantiation): the call checks the
+    // value into the parameter type, as the dynamic extraction does anywhere
+    // else, and throws where the value does not fit.
+    if (
+      actual.kind === "dyn" &&
+      canDynCheckTo(
+        expected,
+        (id) => lowerer.shapes.get(id),
+        (id) => lowerer.unions.get(id),
+      )
+    )
+      continue;
     strandParams = true;
   }
   let voidRet: "dyn" | "strand" | null = null;
@@ -412,6 +648,7 @@ export function funcCoerceAdapter(
       ];
     } else {
       const args = fromT.params.map((pt, i) => {
+        if (i >= toT.params.length) return extraUndefined(pt, loc)!;
         const aRef: IrExpr = { kind: "varRef", localId: `a.${i}`, type: toT.params[i]!, loc };
         const partial = partialDynParams.get(i);
         if (partial && aRef.type.kind === "union") {
