@@ -23,7 +23,7 @@
 // at the end, also on failure.
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { arch, cpus, homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -218,6 +218,7 @@ async function callgrind(label, cmd, args, { warmup, requests, cwd, valgrindArgs
     const f1 = await dump();
     await c.drive(requests);
     const f2 = await dump();
+    if (process.env.MEASURE_CG_COPY) copyFileSync(f2, `${process.env.MEASURE_CG_COPY}.${label}.out`);
     const num = (f, key) => { const m = new RegExp(`^${key}: (\\d+)`, 'm').exec(readFileSync(f, 'utf8')); if (!m) throw new Error(`no ${key} in ${f}`); return Number(m[1]); };
     // Each dump file is one part: its summary is the cost since the previous dump (totals: equals summary per part).
     const total = num(f2, 'summary');
