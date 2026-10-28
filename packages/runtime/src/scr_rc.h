@@ -131,7 +131,9 @@ typedef void (*ScrCycFreeFn)(void *obj);
  * identifies the gathered dead set during re-buffering and weak observer
  * teardown. WHITE candidates may still become black when a later outside
  * root restores them; only the settled white set becomes DOOMED. */
-enum { SCR_CYC_BLACK = 0, SCR_CYC_GRAY = 1, SCR_CYC_WHITE = 2, SCR_CYC_DOOMED = 3 };
+enum { SCR_CYC_BLACK = 0, SCR_CYC_GRAY = 1, SCR_CYC_WHITE = 2, SCR_CYC_DOOMED = 3,
+       /* Set by scr_tenure on a mutable immortal object; the collector never colors one. */
+       SCR_CYC_TENURED = 4 };
 
 /* Generations. A candidate sits in the buffer named by its own `gen`, and a
  * pass walks only objects at or below the generation it collects; a pass at
@@ -621,6 +623,18 @@ size_t scr_cyc_collect_set(const ScrCycSet *set, unsigned gen);
 uint32_t scr_cyc_pub_take(void *obj);
 void scr_cyc_pub_restore(void *obj, uint32_t index);
 void scr_cyc_pub_fill(void);
+/* Tenure (scr_publish.c): see scr_cycle.c. Whether `obj`, a headered object
+ * whose count is immortal, was tenured rather than published (writable, and
+ * its shape and iteration state are the thread's own). Only meaningful for
+ * headered kinds, and false until scr_tenure has run. */
+extern bool scr_tenure_done;
+static inline bool scr_rc_tenured(void *obj) {
+  return scr_tenure_done && scr_cyc_color(scr_cyc_hdr(obj)) == SCR_CYC_TENURED;
+}
+void scr_cyc_each_candidate(void (*fn)(void *obj, void *ctx), void *ctx);
+size_t scr_cyc_drop_immortal(void);
+/* Marks the long-lived heap as tenured (immortal); false when it declined. */
+bool scr_tenure(void);
 
 /* The candidate buffers, one per generation (scr_cycle.c), and the window
  * through which a release buffers a nursery candidate on its fast path. A

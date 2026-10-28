@@ -1224,6 +1224,48 @@ void scr_cyc_pub_fill(void) {
   scr_cyc_window_update();
 }
 
+/* Tenure (scr_publish.c scr_tenure): the walk hands `fn` every buffered
+ * candidate of every generation (the survivors of a full pass), and
+ * scr_cyc_drop_immortal then removes the candidates the walk made immortal
+ * from their buffers, as scr_cyc_pub_fill does for published ones. Nothing
+ * buffers or collects in between. */
+#if !defined(SCR_WORKERS) && !defined(SCR_YIN)
+void scr_cyc_each_candidate(void (*fn)(void *obj, void *ctx), void *ctx) {
+  for (unsigned gen = 0; gen < SCR_CYC_NGENS; gen++) {
+    ScrVec *b = &scr_roots[gen];
+    for (size_t i = 0; i < b->n; i++)
+      if (b->v[i]) fn(b->v[i], ctx);
+  }
+}
+
+size_t scr_cyc_drop_immortal(void) {
+  size_t dropped = 0;
+  bool older = false;
+  for (unsigned gen = 0; gen < SCR_CYC_NGENS; gen++) {
+    ScrVec *b = &scr_roots[gen];
+    size_t j = 0;
+    for (size_t i = 0; i < b->n; i++) {
+      void *obj = b->v[i];
+      if (SCR_RC(obj) == SCR_RC_IMMORTAL) {
+        scr_cyc_clear_buffered(scr_cyc_hdr(obj));
+        continue;
+      }
+      b->v[j] = obj;
+      scr_cyc_set_buffered(scr_cyc_hdr(obj), (uint32_t)j);
+      j++;
+    }
+    size_t closed = b->n - j;
+    b->n = j;
+    dropped += closed;
+    scr_cyc_trigger -= closed;
+    if (closed && gen != SCR_CYC_NURSERY) older = true;
+  }
+  if (older && !scr_cyc_older_backlog()) scr_cyc_scheduled_mature_age = 0;
+  scr_cyc_window_update();
+  return dropped;
+}
+#endif
+
 /* Every release that leaves an unbuffered object alive lands here (the
  * emitted and inline release paths test `buffered` first) unless the window
  * let it append a nursery candidate on its own fast path (scr_rc.h), so it

@@ -213,7 +213,8 @@ static void scr_js_verify(const ScrDyn *object, const ScrJsShape *shape) {
 #endif
 
 static const ScrJsShape *scr_js_shape_of(ScrDyn *object) {
-  if (object->kind != SCR_DYN_OBJ || object->rc == SIZE_MAX) return NULL;
+  if (object->kind != SCR_DYN_OBJ) return NULL;
+  if (object->rc == SIZE_MAX && !scr_rc_tenured((void *)object)) return NULL;
   const ScrJsShape *shape = object->v.obj.shape;
   if (shape == &scr_js_unshaped) return NULL;
 #ifdef SCR_JS_VERIFY

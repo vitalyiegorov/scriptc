@@ -4710,6 +4710,16 @@ static bool scr_loop_run_pass(ScrPromise *top_level, bool first_checkpoint) {
 #ifdef SCR_WORKERS
     if (scr_workers_ready_fn && scr_workers_ready_fn()) due = now;
 #endif
+    /* The first idle moment: the main module and its microtasks are done and
+     * the loop is about to wait for I/O or a timer, so what the program built
+     * and still holds is its long-lived heap (scr_tenure). */
+    if (due > now) {
+      static bool tenure_tried;
+      if (!tenure_tried) {
+        tenure_tried = true;
+        if (scr_tenure()) now = scr_now_ms();
+      }
+    }
     /* An idle moment: a full pass the death rule deferred runs now. */
     if (due > now && scr_cyc_collect_idle()) now = scr_now_ms();
 #if !defined(_WIN32) && !defined(__wasi__)

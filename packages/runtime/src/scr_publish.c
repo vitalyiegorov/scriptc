@@ -403,7 +403,10 @@ static bool scr_pub_keep_ok(size_t bytes) {
   return true;
 }
 
+bool scr_published_any;
+
 void scr_publish(void *root, ScrPubFn fn) {
+  scr_published_any = true;
   if (!root || SCR_RC_PUBLISHED(root)) return;
   ScrPub ctx;
   if (scr_pub_keep.stack) {
@@ -538,3 +541,113 @@ bool scr_throw_published_array_range(int op, const ScrArr *a, double x, double y
 void scr_throw_published_collection(bool set) {
   scr_pub_throw("Cannot modify a published %s%s", set ? "Set" : "Map", "");
 }
+
+/* ── tenure: immortal, still-mutable long-lived objects ───────────────────
+ * After startup the objects the program built to keep (modules, the DI
+ * container, routers, handlers, metadata, prototypes) are retained and
+ * released on every request without ever dying. scr_tenure makes them
+ * immortal in the sense of the retain and release paths (count SIZE_MAX:
+ * both skip it) and takes them out of the collector's candidate buffers and
+ * walks, but, unlike publication, leaves them writable: nothing else reads
+ * the immortal count as "frozen" in a program that never publishes.
+ *
+ * Soundness. A tenured object is never freed, so every child it holds stays
+ * alive however its own count moves; the count the child carries for that
+ * edge is a real one, and the setter that replaces the edge releases it as
+ * usual. An edge INTO a tenured object is skipped by retain and release.
+ * The collector treats a tenured object like any other immortal: it is not
+ * walked, so the edges it holds are never trial-deleted and its young
+ * children read as externally referenced. What tenure gives up is the
+ * memory of the tenured objects, and of anything they keep reachable.
+ *
+ * Roots. After a full collection every long-lived object that was ever
+ * released while shared is a candidate in the buffers; tenure walks the
+ * collector's trace functions from them. Only kinds whose death has no
+ * observable effect are tenured (closures, capture boxes, plain dyn
+ * objects, arrays and function values, emitted records and classes);
+ * promises, errors, emitters, streams, maps (iteration depth), handles and
+ * capsules are left counted, and the walk does not pass through them. */
+bool scr_tenure_done;
+#if !defined(SCR_WORKERS) && !defined(SCR_YIN) && !defined(SCR_RC_AUDIT)
+typedef struct {
+  void **v;
+  size_t n, cap;
+  size_t tenured;
+} ScrTenureWalk;
+static size_t scr_tenure_rejected[64];
+
+static bool scr_tenure_eligible(void *obj) {
+  if (SCR_RC_COUNT(obj) == SCR_RC_IMMORTAL || SCR_RC_COUNT(obj) == 0) return false;
+  const ScrCycHdr *h = scr_cyc_hdr(obj);
+  if (h->id == 0) return false;
+  const ScrCycType *t = scr_cyc_type(h);
+  switch (t->kind) {
+    case SCR_CYC_KIND_CLOSURE:
+    case SCR_CYC_KIND_BOX:
+    case SCR_CYC_KIND_ARRAY:
+    case SCR_CYC_KIND_MAP:
+    case SCR_CYC_KIND_UNION:
+      return true;
+    case SCR_CYC_KIND_DYN: {
+      const ScrDyn *d = obj;
+      return d->kind == SCR_DYN_OBJ || d->kind == SCR_DYN_ARR || d->kind == SCR_DYN_FUNC;
+    }
+    default:
+      break;
+  }
+  if (t->kind < SCR_CYC_KIND_EMITTED) { scr_tenure_rejected[t->kind]++; return false; }
+#if SIZE_MAX > UINT32_MAX
+  /* The high half is 0, a class id, or 0x80000000 / 0x40000000 (a
+   * program-lifetime or frozen record, which keep their own rules). */
+  uint32_t high = (uint32_t)(*(const size_t *)obj >> 32);
+  if (high != 0 && scr_rc_class_id(obj) == 0) return false;
+#endif
+  return true;
+}
+
+static void scr_tenure_mark(ScrTenureWalk *w, void *obj) {
+  if (!obj || !scr_tenure_eligible(obj)) return;
+#if SIZE_MAX > UINT32_MAX
+  if (scr_rc_class_id(obj) != 0) SCR_RC_COUNT(obj) = SCR_RC_IMMORTAL;
+  else
+#endif
+    *(size_t *)obj = SIZE_MAX;
+  if (w->n == w->cap) {
+    w->cap = w->cap ? w->cap * 2 : 4096;
+    w->v = realloc(w->v, w->cap * sizeof *w->v);
+    if (!w->v) scr_trap("scriptc: out of memory\n");
+  }
+  scr_cyc_set_color(scr_cyc_hdr(obj), SCR_CYC_TENURED);
+  w->v[w->n++] = obj;
+  w->tenured++;
+}
+
+static void scr_tenure_visit(void *child, void *ctx) { scr_tenure_mark(ctx, child); }
+static void scr_tenure_root(void *obj, void *ctx) { scr_tenure_mark(ctx, obj); }
+
+bool scr_tenure(void) {
+  static bool done;
+  if (done || scr_published_any) return false;
+  done = true;
+  const char *off = getenv("SCRIPTC_NO_TENURE");
+  if (off && *off && *off != '0') return false;
+  ScrTenureWalk w = {0};
+  scr_cyc_each_candidate(scr_tenure_root, &w);
+  while (w.n > 0) {
+    void *obj = w.v[--w.n];
+    scr_cyc_type(scr_cyc_hdr(obj))->trace(obj, scr_tenure_visit, &w);
+  }
+  free(w.v);
+  scr_tenure_done = true;
+  size_t dropped = scr_cyc_drop_immortal();
+  if (getenv("SCRIPTC_TENURE_TRACE"))
+  {
+    fprintf(stderr, "scriptc: tenured %zu objects (%zu candidates dropped)\n", w.tenured, dropped);
+    for (int k = 0; k < 64; k++)
+      if (scr_tenure_rejected[k]) fprintf(stderr, "  rejected kind %d: %zu\n", k, scr_tenure_rejected[k]);
+  }
+  return true;
+}
+#else
+bool scr_tenure(void) { return false; }
+#endif

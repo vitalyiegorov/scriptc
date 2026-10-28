@@ -989,7 +989,7 @@ double scr_map_size(const ScrMap *m) { return (double)m->nlive; }
  * A map without entries has empty tables already: clearing it does no
  * work and keeps its storage for the next fill. */
 void scr_map_prevent_extensions(ScrMap *m) {
-  if (m->rc != SIZE_MAX) m->flags |= SCR_MAP_NOT_EXTENSIBLE;
+  if (m->rc != SIZE_MAX || scr_rc_tenured(m)) m->flags |= SCR_MAP_NOT_EXTENSIBLE;
 }
 
 bool scr_map_is_extensible(const ScrMap *m) { return (m->flags & SCR_MAP_NOT_EXTENSIBLE) == 0; }
@@ -1758,11 +1758,11 @@ void *scr_map_iter_val_ref(const ScrMap *m, double i) {
 /* A published (immortal) map never changes, so iterating it needs no
  * compaction guard, and it must not be written: other threads read it. */
 void scr_map_iter_enter(ScrMap *m) {
-  if (m->rc != SIZE_MAX) m->iter_depth++;
+  if (m->rc != SIZE_MAX || scr_rc_tenured(m)) m->iter_depth++;
 }
 
 void scr_map_iter_exit(ScrMap *m) {
-  if (m->rc == SIZE_MAX) return;
+  if (m->rc == SIZE_MAX && !scr_rc_tenured(m)) return;
   if (m->iter_depth > 0) m->iter_depth--;
   /* A churny callback may have left many tombstones; with no iteration
    * active they are safe to drop now (bounds memory under forEach-heavy
