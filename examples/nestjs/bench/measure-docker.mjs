@@ -34,7 +34,7 @@ const git = a => { try { return execFileSync('git', ['-C', repo, ...a], { encodi
 const diff = git(['diff', 'HEAD']);
 const env = { MEASURE_GIT_HEAD: git(['rev-parse', 'HEAD']), MEASURE_GIT_BRANCH: git(['rev-parse', '--abbrev-ref', 'HEAD']), MEASURE_GIT_DIFF: createHash('sha256').update(diff).digest('hex') };
 const dockerArgs = ['run', '--rm', '--network', 'none', '--cap-add', 'SYS_PTRACE', '--user', `${process.getuid()}:${process.getgid()}`,
-  '-e', 'HOME=/tmp', ...Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+  '-e', 'HOME=/tmp', ...(process.env.MEASURE_PASS ?? '').split(',').filter(Boolean).flatMap(k => ['-e', `${k}=${process.env[k] ?? ''}`]), ...(process.env.MEASURE_SOURCE ? ['-e', 'MEASURE_SOURCE=' + process.env.MEASURE_SOURCE] : []), ...(process.env.SCRIPTC_YOUNG_NURSERY ? ['-e', 'SCRIPTC_YOUNG_NURSERY=' + process.env.SCRIPTC_YOUNG_NURSERY] : []), ...Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
   ...[...mounts].flatMap(([p, m]) => ['-v', `${p}:${p}:${m}`]),
   '-w', join(repo, 'examples/nestjs'), image, 'node', 'bench/measure.mjs', ...argv];
 // `--cache-dir` defaults to ~/.cache inside measure.mjs; we always pass the absolute one.

@@ -23,7 +23,7 @@
 // at the end, also on failure.
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { arch, cpus, homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -92,7 +92,7 @@ if (o._build) {
   }
   const outDir = o._dir;
   mkdirSync(outDir, { recursive: true });
-  const r = await compiler.compile(entry, { outPath: join(outDir, 'program'), outDir, backend: 'llvm', npmStatic: 'auto', sanitize: false });
+  const r = await compiler.compile(entry, { outPath: join(outDir, 'program'), outDir, backend: 'llvm', npmStatic: 'auto', sanitize: process.env.MEASURE_SAN === '1' });
   if (!r.ok) throw new Error(compiler.renderDiagnostics(r.diagnostics, r.sourceTexts, { color: false }));
   result.binary = r.binaryPath;
   result.size = statSync(r.binaryPath).size;
@@ -116,7 +116,7 @@ process.on('exit', cleanup);
 
 const childEnv = () => {
   const env = { ...process.env };
-  for (const k of Object.keys(env)) if (k.startsWith('SCRIPTC_') && k !== 'SCRIPTC_PROVENANCE_CACHE' && k !== 'SCRIPTC_RUNTIME_PACK') delete env[k];
+  for (const k of Object.keys(env)) if (k.startsWith('SCRIPTC_') && k !== 'SCRIPTC_PROVENANCE_CACHE' && k !== 'SCRIPTC_RUNTIME_PACK' && k !== 'SCRIPTC_YOUNG_NURSERY') delete env[k];
   if (o['provenance-cache']) env.SCRIPTC_PROVENANCE_CACHE = o['provenance-cache'];
   return env;
 };
@@ -220,6 +220,7 @@ async function callgrind(label, cmd, args, { warmup, requests, cwd, valgrindArgs
     const f2 = await dump();
     const num = (f, key) => { const m = new RegExp(`^${key}: (\\d+)`, 'm').exec(readFileSync(f, 'utf8')); if (!m) throw new Error(`no ${key} in ${f}`); return Number(m[1]); };
     // Each dump file is one part: its summary is the cost since the previous dump (totals: equals summary per part).
+    if (process.env.MEASURE_KEEP) { mkdirSync(process.env.MEASURE_KEEP, { recursive: true }); copyFileSync(f2, join(process.env.MEASURE_KEEP, `${label}.callgrind.out`)); }
     const total = num(f2, 'summary');
     return { instrPerRequest: Math.round(total / requests), instrTotal: total, warmupRequests: warmup, measuredRequests: requests };
   } finally { c.close(); srv.kill(); await sleep(200); }
@@ -306,11 +307,12 @@ const result = { schema: 'scriptc.nest-measure.v1', timestamp: started.toISOStri
 let failure = null;
 try {
   log('building binaries from this worktree');
-  const builds = await Promise.all(lanes.flatMap(l => [build(l, false), build(l, true)]));
+  const SRC = process.env.MEASURE_SOURCE === '1'; // callgrind the source-built (stats) runtime: sees uncommitted runtime edits without a pack rebuild
+  const builds = await Promise.all(lanes.flatMap(l => SRC ? [build(l, true)] : [build(l, false), build(l, true)]));
   const bin = {}, statsBin = {};
-  for (const b of builds) { (b.stats ? statsBin : bin)[b.lane] = b.binary; result.lanes[b.lane] ??= {}; if (!b.stats) { result.lanes[b.lane].binarySizeBytes = b.size; if (b.provenance) result.lanes[b.lane].provenance = b.provenance; } }
+  for (const b of builds) { (b.stats ? statsBin : bin)[b.lane] = b.binary; result.lanes[b.lane] ??= {}; if (!b.stats || SRC) { result.lanes[b.lane].binarySizeBytes = b.size; if (b.provenance) result.lanes[b.lane].provenance = b.provenance; } }
   for (const l of lanes) {
-    result.lanes[l].callgrind = await callgrind(l, bin[l], [], { warmup: Number(o.warmup), requests: Number(o.requests), cwd: root });
+    result.lanes[l].callgrind = await callgrind(l, SRC ? statsBin[l] : bin[l], [], { warmup: Number(o.warmup), requests: Number(o.requests), cwd: root });
     result.lanes[l].counters = await counters(statsBin[l]);
     log(`${l}: ${result.lanes[l].callgrind.instrPerRequest} instr/req`);
   }
