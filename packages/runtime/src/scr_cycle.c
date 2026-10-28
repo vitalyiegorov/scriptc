@@ -352,10 +352,10 @@ void *scr_rc_destroy_seg(void *obj, void *(*destroy_seg)(void *, void *),
 /* Live cycle-headered objects and the running count of OLD objects freed.
  * The inline allocation/free paths (scr_runtime.h, llvm/alloc.ts) maintain
  * both counters so full passes can measure old-generation reclamation. */
-#ifndef SCR_WORKERS /* worker executables keep them in scr_thread_hot */
-SCR_TL size_t scr_cyc_live = 0;
 /* Set once scr_tenure (scr_publish.c) has run; scr_rc_tenured reads it. */
 bool scr_tenure_done = false;
+#ifndef SCR_WORKERS /* worker executables keep them in scr_thread_hot */
+SCR_TL size_t scr_cyc_live = 0;
 SCR_TL size_t scr_cyc_old_freed = 0;
 #endif
 
