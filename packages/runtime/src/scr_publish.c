@@ -567,7 +567,6 @@ void scr_throw_published_collection(bool set) {
  * objects, arrays and function values, emitted records and classes);
  * promises, errors, emitters, streams, maps (iteration depth), handles and
  * capsules are left counted, and the walk does not pass through them. */
-bool scr_tenure_done;
 #if !defined(SCR_WORKERS) && !defined(SCR_YIN) && !defined(SCR_RC_AUDIT)
 typedef struct {
   void **v;
