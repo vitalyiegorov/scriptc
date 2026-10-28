@@ -32,7 +32,7 @@ if (out) { abs('--out'); mkdirSync(dirname(out), { recursive: true }); mounts.se
 
 const git = a => { try { return execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return ''; } };
 const diff = git(['diff', 'HEAD']);
-const env = { MEASURE_GIT_HEAD: git(['rev-parse', 'HEAD']), MEASURE_GIT_BRANCH: git(['rev-parse', '--abbrev-ref', 'HEAD']), MEASURE_GIT_DIFF: createHash('sha256').update(diff).digest('hex') };
+const env = { MEASURE_GIT_HEAD: git(['rev-parse', 'HEAD']), MEASURE_GIT_BRANCH: git(['rev-parse', '--abbrev-ref', 'HEAD']), MEASURE_GIT_DIFF: createHash('sha256').update(diff).digest('hex'), ...(process.env.MEASURE_KEEP_CG ? { MEASURE_KEEP_CG: process.env.MEASURE_KEEP_CG } : {}) };
 const dockerArgs = ['run', '--rm', '--network', 'none', '--cap-add', 'SYS_PTRACE', '--user', `${process.getuid()}:${process.getgid()}`,
   '-e', 'HOME=/tmp', ...Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
   ...[...mounts].flatMap(([p, m]) => ['-v', `${p}:${p}:${m}`]),

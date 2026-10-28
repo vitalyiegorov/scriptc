@@ -4210,10 +4210,12 @@ static ScrDyn *scr_dyn_typed_ref_new(
         value->v.typed_ref.type_key_len == type_key_len && !memcmp(value->v.typed_ref.type_key, type_key, type_key_len)) {
       if (traced) value->v.typed_ref.traced = true;
       if (observed) value->v.typed_ref.observed = true;
+      SCR_STAT(typed_ref_reused);
       return scr_dyn_retain(value);
     }
   }
   if (type_key_len >= (size_t)1 << 27) scr_trap("scriptc: typed reference key too long\n");
+  SCR_STAT(typed_ref_new);
   ScrDyn *d = scr_dyn_alloc(SCR_DYN_TYPED_REF);
   d->v.typed_ref.ptr = retain(ptr);
   d->v.typed_ref.retain = retain;

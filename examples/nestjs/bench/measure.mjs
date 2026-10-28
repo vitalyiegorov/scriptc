@@ -23,7 +23,7 @@
 // at the end, also on failure.
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { arch, cpus, homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -218,6 +218,8 @@ async function callgrind(label, cmd, args, { warmup, requests, cwd, valgrindArgs
     const f1 = await dump();
     await c.drive(requests);
     const f2 = await dump();
+    // MEASURE_KEEP_CG=1: keep the measured part's callgrind dump (callers and callees) next to --out.
+    if (process.env.MEASURE_KEEP_CG === '1' && o.out) copyFileSync(f2, join(dirname(o.out), `${label}.cg.out`));
     const num = (f, key) => { const m = new RegExp(`^${key}: (\\d+)`, 'm').exec(readFileSync(f, 'utf8')); if (!m) throw new Error(`no ${key} in ${f}`); return Number(m[1]); };
     // Each dump file is one part: its summary is the cost since the previous dump (totals: equals summary per part).
     const total = num(f2, 'summary');
@@ -255,8 +257,9 @@ async function counters(bin) {
       warmupRequests: Number(o['counter-warmup']), measuredRequests: n,
       allocations: sum(['dyn_alloc_object', 'dyn_alloc_array', 'dyn_alloc_closure', 'dyn_alloc_box', 'dyn_alloc_string']),
       frees: per.dyn_free,
+      capsulesReused: hasCapsule ? (per.typed_ref_reused ?? 0) : null,
       capsules: hasCapsule ? sum(Object.keys(per).filter(k => /typed_ref_new/.test(k))) : null,
-      capsulesNote: hasCapsule ? undefined : 'MISSING: no typed_ref_new/capsule counter in packages/runtime/src/scr_stats.h',
+      capsulesNote: hasCapsule ? undefined : 'MISSING: no typed_ref_new counter in the runtime stats build',
       cyclePasses: per.cyc_pass,
       raw: per,
     };
@@ -330,7 +333,8 @@ if (failure === null) {
     ['requests warm-up+measured', c => `${c.cg.warmupRequests}+${c.cg.measuredRequests}`],
     ['allocations/request', c => c.ct ? f(c.ct.allocations, 2) : '-'],
     ['frees/request', c => c.ct ? f(c.ct.frees, 2) : '-'],
-    ['capsules/request', c => c.ct ? f(c.ct.capsules, 2) : '-'],
+    ['capsules created/request', c => c.ct ? f(c.ct.capsules, 2) : '-'],
+    ['capsules reused/request', c => c.ct ? f(c.ct.capsulesReused, 2) : '-'],
     ['cycle passes/request', c => c.ct ? f(c.ct.cyclePasses, 3) : '-'],
     ...(o.rps ? [['req/s (run.mjs)', c => f(result.rps?.[c.name]?.reqPerSecMedian)]] : []),
   ];

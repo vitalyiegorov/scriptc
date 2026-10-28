@@ -31,7 +31,8 @@
   X(dyn_class_is_key) X(dyn_construct) X(cyc_pass) X(cyc_candidates) X(weak_disposed)              \
   X(weak_filter_pass) X(fiber_start) X(promise_new) X(sys_read) X(sys_write) X(sys_sendmsg)                         \
   X(cyc_freed) X(yin_collect) X(yin_entered) X(yin_dead)                 \
-  X(cand_closure) X(cand_box) X(cand_dyn) X(cand_other)
+  X(cand_closure) X(cand_box) X(cand_dyn) X(cand_other)                       \
+  X(typed_ref_new) X(typed_ref_reused)
 
 #ifdef SCR_STATS
 #include <stdint.h>
