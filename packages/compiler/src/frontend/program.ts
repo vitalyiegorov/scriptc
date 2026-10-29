@@ -902,20 +902,18 @@ function loadProgram7(
   if (provenance !== null || externalTypes.size > 0) {
     const paths: Record<string, string[]> = {
       ...(configuredPaths as Record<string, string[]> | undefined),
-      // Keep an index-signature source for native lowering when provenance is absent.
-      // oxlint-disable-next-line unicorn/no-useless-fallback-in-spread
-      ...(provenance === null
-        ? {}
-        : {
-            // Exact mappings for the externals the source trees import;
-            // the registry's wildcard stays as the fallback.
-            ...provenanceExternalPaths(
-              (from, spec) => resolveBareModule(from, spec)?.typesFile ?? null,
-              (spec) => canonicalBuiltinModule(spec) !== null,
-            ),
-            ...provenance,
-          }),
     };
+    if (provenance !== null) {
+      // Exact mappings for the externals the source trees import; the
+      // registry's wildcard stays as the fallback. Written as assignments:
+      // the self-hosted frontend lowers no conditional spread of two arms.
+      const exact = provenanceExternalPaths(
+        (from, spec) => resolveBareModule(from, spec)?.typesFile ?? null,
+        (spec) => canonicalBuiltinModule(spec) !== null,
+      );
+      for (const [specifier, targets] of Object.entries(exact)) paths[specifier] = targets;
+      for (const [specifier, targets] of Object.entries(provenance)) paths[specifier] = targets;
+    }
     for (const [specifier, declarationPath] of externalTypes) {
       paths[specifier] = [declarationPath];
     }

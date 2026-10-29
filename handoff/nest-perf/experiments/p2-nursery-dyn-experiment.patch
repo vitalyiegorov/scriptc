@@ -1,0 +1,171 @@
+diff --git a/packages/runtime/src/scr_closure.c b/packages/runtime/src/scr_closure.c
+index c6fa6e7d1..96fe2815b 100644
+--- a/packages/runtime/src/scr_closure.c
++++ b/packages/runtime/src/scr_closure.c
+@@ -76,6 +76,9 @@ ScrBox *scr_box_new(ScrBoxKind kind) {
+   b->kind = kind;
+ #ifdef SCR_RC_AUDIT
+   scr_live_boxes++;
++#endif
++#ifdef SCR_YIN
++  scr_yin_enter_inline(b);
+ #endif
+   return b;
+ }
+@@ -198,6 +201,7 @@ static void scr_closure_trace(void *o, ScrTraceVisit visit, void *ctx) {
+         /* An embedded box is not a collectable object: its payload is the
+          * closure's own child (the box trace, one level up). */
+         ScrBox *b = c->caps[i];
++        if (!b) continue; /* a young closure traced before its captures are stored */
+         void *p = scr_box_ptr(b);
+         if (p && (b->kind == SCR_BOX_FUNC || (b->kind == SCR_BOX_OBJ && b->obj_trace))) visit(p, ctx);
+       }
+@@ -214,6 +218,7 @@ static void scr_closure_gcfree(void *o) {
+     for (size_t i = 0; i < c->ncaps && i < 32; i++) {
+       if ((c->embedded >> i & 1u) == 0) continue;
+       ScrBox *b = c->caps[i];
++      if (!b) continue;
+       void *p = scr_box_ptr(b);
+       if (!p) continue;
+       switch (b->kind) {
+@@ -265,6 +270,11 @@ static inline __attribute__((always_inline)) ScrClosure *scr_closure_alloc(void
+   c->embedded = 0;
+ #ifdef SCR_RC_AUDIT
+   scr_live_closures++;
++#endif
++#ifdef SCR_YIN
++  /* Enters before the caller stores the captures: the nursery traces only
++   * at a later entry or collection, and every trace skips empty slots. */
++  scr_yin_enter_inline(c);
+ #endif
+   return c;
+ }
+diff --git a/packages/runtime/src/scr_cycle.c b/packages/runtime/src/scr_cycle.c
+index 2b413e887..286a4c8bc 100644
+--- a/packages/runtime/src/scr_cycle.c
++++ b/packages/runtime/src/scr_cycle.c
+@@ -503,6 +503,17 @@ static SCR_TL size_t scr_yin_counts_cap;
+ static SCR_TL bool scr_yin_busy;
+ static void scr_yin_leave(ScrCycHdr *h, void *obj);
+ static size_t scr_yin_collect(void);
++/* The nursery size at which a collection point collects it (SCR_YIN_TICK_MIN,
++ * default 1: any young object). */
++static size_t scr_yin_tick_min(void) {
++  static SCR_TL long cached = -1;
++  if (cached < 0) {
++    const char *env = scr_getenv("SCR_YIN_TICK_MIN");
++    cached = env ? strtol(env, NULL, 10) : 1;
++    if (cached < 1) cached = 1;
++  }
++  return (size_t)cached;
++}
+ #endif
+ static void scr_cyc_route_bypassed(void);
+ /* A limited pass (scr_cyc_collect_set) takes only the candidates in this
+@@ -929,7 +940,7 @@ void scr_cyc_collect_scheduled(void) {
+   /* A collection point also collects the nursery when anything entered it
+    * since its last collection, so young garbage does not wait for the
+    * allocation trigger in a program that has gone idle. */
+-  if (scr_yin.n != 0) scr_yin_collect();
++  if (scr_yin.n >= scr_yin_tick_min()) scr_yin_collect();
+ #endif
+   scr_cyc_route_bypassed();
+   scr_cyc_note_fall();
+@@ -1736,7 +1747,7 @@ static void scr_yin_leave(ScrCycHdr *h, void *obj) {
+   if (last != obj) scr_cyc_set_buffered(scr_cyc_hdr(last), (uint32_t)i);
+   scr_cyc_clear_buffered(h);
+   scr_cyc_set_gen(h, SCR_CYC_NURSERY);
+-  scr_yin_met(h->id, false);
++  if (!scr_yin_all()) scr_yin_met(h->id, false);
+ }
+ 
+ static void scr_yin_count_visit(void *child, void *ctx) {
+@@ -1853,7 +1864,12 @@ static __attribute__((noinline)) size_t scr_yin_collect(void) {
+   SCR_STAT_ADD(yin_dead, freed);
+   for (size_t i = 0; i < scr_yin_dead.n; i++) {
+     void *obj = scr_yin_dead.v[i];
+-    scr_cyc_type(scr_cyc_hdr(obj))->free_fn(obj);
++    ScrCycHdr *dh = scr_cyc_hdr(obj);
++    /* Out of the nursery before teardown: a pooled node (dyn nodes) keeps
++     * its header, and must not carry a stale position into its next life. */
++    scr_cyc_clear_buffered(dh);
++    scr_cyc_set_gen(dh, SCR_CYC_NURSERY);
++    scr_cyc_type(dh)->free_fn(obj);
+   }
+   scr_yin_dead.n = 0;
+   scr_xg_freed = 0;
+diff --git a/packages/runtime/src/scr_json.c b/packages/runtime/src/scr_json.c
+index 105816f8a..51451d8dc 100644
+--- a/packages/runtime/src/scr_json.c
++++ b/packages/runtime/src/scr_json.c
+@@ -1208,6 +1208,16 @@ static void scr_dyn_region_leave(ScrDyn *d) {
+ #define SCR_STAT_DYN_ALLOC(kind) ((void)0)
+ #endif
+ 
++/* Young-in nursery membership (scr_cycle.c, SCR_YIN): objects, arrays and
++ * function values enter the nursery at allocation, after their count is
++ * stored. A young node is never a cycle candidate; the nursery collection
++ * frees young cycles and promotes the rest. */
++#ifdef SCR_YIN
++static inline void scr_dyn_young(ScrDyn *d) { scr_yin_enter_inline(d); }
++#else
++#define scr_dyn_young(d) ((void)0)
++#endif
++
+ static ScrDyn *scr_dyn_alloc(ScrDynKind kind) {
+   SCR_STAT_DYN_ALLOC(kind);
+ #ifndef SCR_RC_AUDIT
+@@ -1250,6 +1260,7 @@ static ScrDyn *scr_dyn_alloc(ScrDynKind kind) {
+       /* Number and string boxes set their one payload word. */
+       memset(&d->v, 0, sizeof d->v);
+     }
++    if (kind == SCR_DYN_ARR || kind == SCR_DYN_OBJ || kind == SCR_DYN_FUNC) scr_dyn_young(d);
+     return d;
+   }
+ #endif
+@@ -1269,6 +1280,7 @@ static ScrDyn *scr_dyn_alloc(ScrDynKind kind) {
+ #ifdef SCR_RC_AUDIT
+   scr_live_dyns++;
+ #endif
++  if (kind == SCR_DYN_ARR || kind == SCR_DYN_OBJ || kind == SCR_DYN_FUNC) scr_dyn_young(fresh);
+   return fresh;
+ }
+ 
+@@ -1319,6 +1331,7 @@ static inline ScrDyn *scr_dyn_func_alloc(void) {
+     d->null_proto = false;
+     d->copied_from_native = false;
+     d->non_extensible = false;
++    scr_dyn_young(d);
+     return d;
+   }
+ #endif
+diff --git a/packages/runtime/src/scr_rc.h b/packages/runtime/src/scr_rc.h
+index b74598010..8d8417853 100644
+--- a/packages/runtime/src/scr_rc.h
++++ b/packages/runtime/src/scr_rc.h
+@@ -801,6 +801,25 @@ typedef struct ScrYin {
+   size_t cap;
+ } ScrYin;
+ extern SCR_TL ScrYin scr_yin;
++/* The runtime's own allocation paths (dyn nodes, closures, boxes) enter the
++ * nursery through this inline half, as the emitted constructors do; its
++ * fallback is the whole entry. */
++#if !defined(SCR_WORKERS) && !(defined(SCR_LIB) && defined(SCR_THREAD_INSTANCES)) && defined(SCR_YIN)
++static inline void scr_yin_enter_inline(void *obj) {
++  ScrCycHdr *h = scr_cyc_hdr(obj);
++  size_t n = scr_yin.n;
++  if (__builtin_expect(scr_yin_skip[h->id] == 0 && n < scr_yin.lim, 1)) {
++    scr_yin.v[n] = obj;
++    scr_yin.n = n + 1;
++    h->gen = SCR_CYC_YOUNG;
++    h->buf = SCR_CYC_BUFFERED_BIT | (uint32_t)n;
++    return;
++  }
++  scr_yin_enter(obj);
++}
++#else
++#define scr_yin_enter_inline(obj) scr_yin_enter(obj)
++#endif
+ #if UINTPTR_MAX == UINT64_MAX
+ _Static_assert(offsetof(ScrYin, n) == 8 && offsetof(ScrYin, lim) == 16,
+                "llvm/shapes.ts appends to the nursery at these offsets");

@@ -1,0 +1,589 @@
+--- packages/compiler/src/ir/validate.ts	2026-10-27 15:55:36.627131263 +0000
++++ /tmp/ulv/mine/packages/compiler/src/ir/validate.ts	2026-10-27 15:55:07.246199092 +0000
+@@ -828,7 +828,6 @@
+       if (
+         arm.kind === "void" ||
+         arm.kind === "union" ||
+-        arm.kind === "dyn" ||
+         (arm.kind === "generator" && iterableArmsElem(u.arms) === null)
+       ) {
+         errors.push({ message: `union ${u.id}: arm ${i} is ${arm.kind}`, loc: noLoc });
+@@ -1196,7 +1195,7 @@
+       return;
+     }
+     for (const arm of def.arms) {
+-      if (arm.kind === "dyn" || arm.kind === "caught" || arm.kind === "void") {
++      if (arm.kind === "caught" || arm.kind === "void") {
+         err(`truthiness of union with ${arm.kind} arm`, loc);
+       }
+     }
+--- packages/compiler/src/frontend/type-mapper.ts	2026-10-27 15:55:18.283122625 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/type-mapper.ts	2026-10-27 15:55:07.207455146 +0000
+@@ -5232,7 +5232,22 @@
+       // checked-dynamic representation. Class instances box at their class
+       // with identity and functions box by reference; narrowing tests
+       // (`instanceof`, `typeof x === "function"`) dispatch on the dyn value.
++      const protocolUnionArm =
++        process.env["SCRIPTC_NO_STRUCT_UNION"] !== "1" &&
++        protocolViewArm &&
++        arms.filter((a) => a.kind === "dyn").length === 1 &&
++        arms.every(
++          (a) =>
++            a.kind === "dyn" ||
++            a.kind === "object" ||
++            a.kind === "func" ||
++            a.kind === "undefinedT" ||
++            a.kind === "nullT",
++        ) &&
++        arms.some((a) => a.kind === "object" || a.kind === "func") &&
++        !unions.recursivePending(widened);
+       if (
++        !protocolUnionArm &&
+         protocolViewArm &&
+         arms.every(
+           (a) =>
+@@ -5263,7 +5278,7 @@
+           (a) =>
+             a.kind === "void" ||
+             a.kind === "union" ||
+-            a.kind === "dyn" ||
++            (a.kind === "dyn" && !protocolUnionArm) ||
+             // A generator arm only comes from an Iterable<T> (an optional
+             // one keeps its unit arms beside the iterable union's).
+             (a.kind === "generator" && iterableArmsElem(arms) === null),
+--- packages/compiler/src/backend/llvm/expr-dynamic.ts	2026-10-27 15:55:36.630995506 +0000
++++ /tmp/ulv/mine/packages/compiler/src/backend/llvm/expr-dynamic.ts	2026-10-27 15:55:07.308398623 +0000
+@@ -1028,6 +1028,16 @@
+             B.line(`store i1 ${t}, ptr ${slot}`);
+             break;
+           }
++          case "dyn": {
++            // A structural arm compares as checked-dynamic values do.
++            host.declare(`declare zeroext i1 @scr_dyn_strict_eq(ptr, ptr)`);
++            const a = host.unionPeek(l.name, def.id);
++            const b = host.unionPeek(r.name, def.id);
++            const t = B.tmp();
++            B.line(`${t} = call zeroext i1 @scr_dyn_strict_eq(ptr ${a}, ptr ${b})`);
++            B.line(`store i1 ${t}, ptr ${slot}`);
++            break;
++          }
+           default: {
+             // Ref arms: pointer identity, exactly JS object equality.
+             // Function arms compare identity roots (adapters included).
+--- packages/compiler/src/backend/llvm/dyn.ts	2026-10-27 15:55:36.629905722 +0000
++++ /tmp/ulv/mine/packages/compiler/src/backend/llvm/dyn.ts	2026-10-27 15:55:07.254199036 +0000
+@@ -497,6 +497,10 @@
+       return ry - rx || fy - fx || x - y;
+     });
+     records.forEach((slot, k) => (order[slot] = widest[k]!));
++    // A structural (dyn) arm matches every value: it takes only what the
++    // typed arms rejected, so it is tried last.
++    const dynArms = order.filter((i) => def.arms[i]!.kind === "dyn");
++    if (dynArms.length > 0) return [...order.filter((i) => def.arms[i]!.kind !== "dyn"), ...dynArms];
+     return order;
+   }
+ 
+--- packages/compiler/src/frontend/lowering/union-retag.ts	2026-10-27 15:55:51.093835823 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/union-retag.ts	2026-10-27 15:55:07.291198780 +0000
+@@ -30,6 +30,9 @@
+ 
+ export type UnionRetagArm =
+   | { kind: "trap" }
++  /** A structural (dyn) arm's value re-enters the destination union through
++   * the checked classification, which picks a typed arm the source lacked. */
++  | { kind: "reclassify" }
+   | { kind: "direct"; route: UnionRetagRoute }
+   | { kind: "discriminant"; field: string; fieldType: IrType; routes: UnionRetagRoute[] };
+ 
+@@ -166,12 +169,61 @@
+       );
+       continue;
+     }
++    // A structural (dyn) source arm can hold any value, whatever the
++    // checker proved: it is never stranded. It copies into an equal
++    // destination arm that sees the same typed arms; otherwise it
++    // re-classifies through the checked extraction into the destination.
++    if (source.kind === "dyn") {
++      const dynDest = to.arms.some((arm) => arm.kind === "dyn");
++      const lacksTyped = to.arms.some(
++        (arm) =>
++          (arm.kind === "object" || arm.kind === "func") &&
++          !from.arms.some((candidate) => typeEquals(candidate, arm)),
++      );
++      const classifiable = to.arms.every(
++        (arm) =>
++          isUnitType(arm) ||
++          arm.kind === "dyn" ||
++          arm.kind === "object" ||
++          arm.kind === "func" ||
++          arm.kind === "f64" ||
++          arm.kind === "string" ||
++          arm.kind === "bool",
++      );
++      if (classifiable && (!dynDest || lacksTyped)) {
++        result.push({ kind: "reclassify" });
++        continue;
++      }
++    }
+     // A checker-proven absent arm retains any exact representation, as
+     // before. Otherwise the narrowing path needs no structural conversion.
+     if (identity < 0 && trappable?.has(tag)) {
+       result.push({ kind: "trap" });
+       continue;
+     }
++    // Destination with a structural (dyn) arm: typed arms keep their own
++    // representation (identity, then base-class widening), anything else
++    // crosses into dyn once; a source dyn arm holding values the
++    // destination gives a typed arm re-classifies.
++    if (to.arms.some((arm) => arm.kind === "dyn")) {
++      const dynTag = to.arms.findIndex((arm) => arm.kind === "dyn");
++      if (source.kind !== "dyn" && identity < 0) {
++        const lift = widthLift(source, target);
++        const inner = lift?.how === "liftWrap" ? widthLift(source, lift.arm) : null;
++        if (
++          lift?.how === "liftWrap" &&
++          inner &&
++          (inner.how === "upcast" || inner.how === "funcAdapt" || inner.how === "copy")
++        )
++          result.push({ kind: "direct", route: { tag: lift.tag, lift: inner, values: [] } });
++        else
++          result.push({
++            kind: "direct",
++            route: { tag: dynTag, lift: { how: "dynIn" }, values: [] },
++          });
++        continue;
++      }
++    }
+     if (useDiscriminant && discriminant && owners && source.kind === "record") {
+       const entry = discriminant.cases.find((candidate) => candidate.tag === tag);
+       const fieldType = discriminantField(shapeOf(source.shapeId), discriminant.field);
+@@ -436,7 +488,13 @@
+             loc,
+           }
+         : { kind: "unionNarrow", unionId: from.id, tag, value: input, type: arm, loc };
+-      if (armPlan.kind === "direct") {
++      if (armPlan.kind === "reclassify") {
++        statements.push({
++          kind: "return",
++          value: { kind: "dynCheck", value: payload, type: toType, loc },
++          loc,
++        });
++      } else if (armPlan.kind === "direct") {
+         const route = armPlan.route;
+         statements.push({
+           kind: "return",
+--- packages/compiler/src/frontend/lowering/lower-calls.ts	2026-10-27 15:55:36.638995450 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/lower-calls.ts	2026-10-27 15:55:07.282421349 +0000
+@@ -3759,9 +3759,10 @@
+       probed?.type.kind === "union" ? lowerer.stripUndefinedArm(probed.type) : null;
+     if (presentArm?.kind === "object" && typeEquals(presentArm, lowerer.mapTypeOf(recvTs) ?? DYN))
+       return null;
++    // A union with a structural (dyn) arm holds values only their own
++    // members describe, in any source: the call dispatches on the boxed value.
+     if (
+       probed?.type.kind === "union" &&
+-      isJsSourceFile(ts.getSourceFileOfNode(call)) &&
+       lowerer.unions
+         .get(probed.type.unionId)
+         ?.arms.every(
+@@ -3769,8 +3770,11 @@
+             isUnitType(arm) ||
+             arm.kind === "object" ||
+             arm.kind === "record" ||
+-            arm.kind === "func",
++            arm.kind === "func" ||
++            (arm.kind === "dyn" && !isJsSourceFile(ts.getSourceFileOfNode(call))),
+         ) &&
++      (isJsSourceFile(ts.getSourceFileOfNode(call)) ||
++        lowerer.unions.get(probed.type.unionId)?.arms.some((arm) => arm.kind === "dyn")) &&
+       lowerer.dynConvertible(probed.type)
+     ) {
+       recv = lowerer.coerceToExpected(probed, DYN);
+--- packages/compiler/src/frontend/lowering/lowerer.ts	2026-10-27 15:55:51.091895317 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/lowerer.ts	2026-10-27 15:55:07.263198974 +0000
+@@ -10320,6 +10320,21 @@
+       const result = this.coerceToExpected(expr.result, expected);
+       return { ...expr, result, type: result.type };
+     }
++    // A union with a structural (dyn) arm flowing into a type that is none
++    // of its arms (a type guard's class, a union without that arm): the
++    // value crosses into dyn and the checked extraction classifies it.
++    if (
++      expr.type.kind === "union" &&
++      expected.kind !== "dyn" &&
++      !typeEquals(expr.type, expected) &&
++      this.armTag(expr.type.unionId, expected) < 0 &&
++      this.unions.get(expr.type.unionId)?.arms.some((arm) => arm.kind === "dyn") &&
++      !(expected.kind === "union" && this.unionRetagMappable(expr.type.unionId, expected.unionId)) &&
++      this.dynConvertible(expr.type)
++    ) {
++      const boxed = this.coerceToExpected(expr, DYN);
++      if (boxed.type.kind === "dyn") return this.coerceToExpected(boxed, expected);
++    }
+     // A destination that holds undefined takes an unassigned deferred-init
+     // field's slot as is (Node passes the undefined along).
+     if (expected.kind === "union" && this.armTag(expected.unionId, UNDEFINED_T) >= 0) {
+@@ -10981,6 +10996,41 @@
+           }
+         }
+       }
++      // A closure whose signature only differs covariantly from the union's
++      // function arm (`() => number` into `() => void`) keeps the function
++      // arm: closures never ride the structural arm.
++      if (expr.type.kind === "func" && this.armTag(expected.unionId, DYN) >= 0) {
++        for (const funcArm of (this.unions.get(expected.unionId)?.arms ?? []).filter(
++          (arm) => arm.kind === "func",
++        )) {
++          const covariant = this.coerceCovariantFunction(expr, funcArm);
++          const armTag = this.armTag(expected.unionId, funcArm);
++          if (covariant && typeEquals(covariant.type, funcArm) && armTag >= 0)
++            return {
++              kind: "unionWrap",
++              unionId: expected.unionId,
++              tag: armTag,
++              value: covariant,
++              type: expected,
++              loc: expr.loc,
++            };
++        }
++      }
++      // A value no typed arm takes, flowing into a union with a structural
++      // (dyn) arm: it crosses into dyn once and rides that arm.
++      const dynTag = this.armTag(expected.unionId, DYN);
++      if (dynTag >= 0 && expr.type.kind !== "dyn") {
++        const boxed = this.coerceToExpected(expr, DYN);
++        if (boxed.type.kind === "dyn")
++          return {
++            kind: "unionWrap",
++            unionId: expected.unionId,
++            tag: dynTag,
++            value: boxed,
++            type: expected,
++            loc: expr.loc,
++          };
++      }
+       // A derived CLASS VALUE against a union with a base classval arm
+       // (`typeof Base | undefined` slots receiving D): the same nearest-
+       // ancestor widening, gated by the constructor-ABI rule; a mismatch
+--- packages/compiler/src/frontend/lowering/lower-exprs.ts	2026-10-27 15:55:18.287181422 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/lower-exprs.ts	2026-10-27 15:55:07.217365159 +0000
+@@ -1662,7 +1662,7 @@
+ 
+ export function requireTruthyUnion(lowerer: Lowerer, unionId: string, node: ts.Expression): void {
+   const def = lowerer.unions.get(unionId);
+-  if (def && def.arms.every((a) => a.kind !== "dyn" && a.kind !== "caught")) return;
++  if (def && def.arms.every((a) => a.kind !== "caught")) return;
+   lowerer.unsupported(
+     "SC1090",
+     node,
+@@ -1672,7 +1672,7 @@
+ 
+ export function eqComparableUnion(lowerer: Lowerer, unionId: string): boolean {
+   const def = lowerer.unions.get(unionId);
+-  return !!def && def.arms.every((a) => a.kind !== "dyn" && a.kind !== "caught");
++  return !!def && def.arms.every((a) => a.kind !== "caught");
+ }
+ 
+ /** Convert an undefined-armed numeric value at an arithmetic use. Ordinary
+@@ -2394,6 +2394,45 @@
+   return null;
+ }
+ 
++/** `typeof u === literal` for a union's structural (dyn) arm: the runtime
++ * kind test over the arm's payload, true only when the union holds that arm. */
++export function dynArmTypeofTest(
++  unionId: string,
++  tag: number,
++  arm: IrType,
++  value: IrExpr,
++  literal: string,
++  loc: SrcLoc,
++): IrExpr {
++  const tests = [
++    "string",
++    "number",
++    "boolean",
++    "undefined",
++    "bigint",
++    "symbol",
++    "object",
++    "function",
++  ] as const;
++  const test = tests.find((t) => t === literal);
++  const isTag: IrExpr = { kind: "unionIsTag", unionId, tag, negated: false, value, type: BOOL, loc };
++  if (test === undefined) return { kind: "boolLit", value: false, type: BOOL, loc };
++  return {
++    kind: "logical",
++    op: "&&",
++    left: isTag,
++    right: {
++      kind: "dynTest",
++      test,
++      value: { kind: "unionNarrow", unionId, tag, value, type: arm, loc },
++      type: BOOL,
++      loc,
++    },
++    type: BOOL,
++    loc,
++  };
++}
++
+ export function typeofAnswer(arm: IrType): string | null {
+   switch (arm.kind) {
+     case "f64":
+--- packages/compiler/src/frontend/lowering/coercions/unions.ts	2026-10-27 15:55:51.094085431 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/coercions/unions.ts	2026-10-27 15:55:07.299999212 +0000
+@@ -374,9 +374,10 @@
+     plan.every(
+       (arm) =>
+         arm.kind === "trap" ||
+-        (arm.kind === "direct"
+-          ? arm.route.lift.how === "copy"
+-          : arm.routes.every((route) => route.lift.how === "copy")),
++        (arm.kind !== "reclassify" &&
++          (arm.kind === "direct"
++            ? arm.route.lift.how === "copy"
++            : arm.routes.every((route) => route.lift.how === "copy"))),
+     )
+   ) {
+     lowerer.coercions.copyRetags.set(request, {
+--- packages/compiler/src/frontend/lowering/expressions/narrowing.ts	2026-10-27 15:55:51.094736772 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/expressions/narrowing.ts	2026-10-27 15:55:07.318920452 +0000
+@@ -8,6 +8,7 @@
+   DYN_HANDLE_KINDS,
+   type IrExpr,
+   type IrLocal,
++  type IrStmt,
+   type IrType,
+   NULL_T,
+   STRING,
+@@ -37,6 +38,7 @@
+ import { literalValues } from "../../literal-values.js";
+ import { literalUnionArm } from "../../union-discriminants.js";
+ import { checkedArmExtraction } from "../coercions/unions.js";
++import { isSafeToRepeat } from "./evaluation-safety.js";
+ import { hostedStorageView, hostsAll } from "./hosted-narrowing.js";
+ import { nodeThrowExpr, varRef } from "../../../ir/build.js";
+ import { InternalCompilerError } from "../../../errors.js";
+@@ -856,6 +858,8 @@
+     }
+     return expr;
+   }
++  const withDyn = dynArmNarrowing(lowerer, expr, tag, narrowed);
++  if (withDyn) return withDyn;
+   const checked = checkedStaleArm(lowerer, node, expr, tag, narrowed);
+   if (checked) return checked;
+   return {
+@@ -868,6 +872,84 @@
+   };
+ }
+ 
++/** A narrowing read of a union with a structural (dyn) arm. The checker's
++ * proof does not fix the stored arm: a type predicate cannot tell a closure
++ * or class instance held by the structural arm from the typed arm, and a
++ * narrowing to the structural type covers every arm. So the read never
++ * trusts the tag: the structural type takes the whole union through dyn;
++ * a typed arm is read in place under its own tag and re-checked
++ * (dynCheck, catchable TypeError) when the structural arm holds the value.
++ * Null when the union has no structural arm. */
++function dynArmNarrowing(
++  lowerer: Lowerer,
++  expr: IrExpr,
++  tag: number,
++  narrowed: IrType,
++): IrExpr | null {
++  if (expr.type.kind !== "union") return null;
++  const unionId = expr.type.unionId;
++  const def = lowerer.unions.get(unionId);
++  const dynTag = def ? def.arms.findIndex((arm) => arm.kind === "dyn") : -1;
++  if (!def || dynTag < 0) return null;
++  const loc = expr.loc;
++  if (narrowed.kind === "dyn") {
++    return lowerer.dynConvertible(expr.type) ? lowerer.coerceToExpected(expr, DYN) : null;
++  }
++  if (isUnitType(narrowed) || narrowed.kind === "void") return null;
++  if (
++    !canDynCheckTo(
++      narrowed,
++      (id) => lowerer.shapes.get(id),
++      (id) => lowerer.unions.get(id),
++    )
++  )
++    return null;
++  let source = expr;
++  const prelude: IrStmt[] = [];
++  if (!isSafeToRepeat(source)) {
++    const local = lowerer.declareHiddenLocal("%dynArmNarrow", expr.type);
++    prelude.push({ kind: "varDecl", localId: local.id, init: expr, loc });
++    source = varRef(local.id, expr.type, loc);
++  }
++  const isTag = (t: number): IrExpr => ({
++    kind: "unionIsTag",
++    unionId,
++    tag: t,
++    negated: false,
++    value: source,
++    type: BOOL,
++    loc,
++  });
++  const failure = nodeThrowExpr(
++    1,
++    "",
++    "a value of another type is not representable in the target union (a value narrowed or asserted past it still held it)",
++    narrowed,
++    loc,
++  );
++  const result: IrExpr = {
++    kind: "ternary",
++    cond: isTag(tag),
++    then: { kind: "unionNarrow", unionId, tag, value: source, type: narrowed, loc },
++    else_: {
++      kind: "ternary",
++      cond: isTag(dynTag),
++      then: {
++        kind: "dynCheck",
++        value: { kind: "unionNarrow", unionId, tag: dynTag, value: source, type: DYN, loc },
++        type: narrowed,
++        loc,
++      },
++      else_: failure,
++      type: narrowed,
++      loc,
++    },
++    type: narrowed,
++    loc,
++  };
++  return prelude.length > 0 ? { kind: "seqExpr", stmts: prelude, result, type: narrowed, loc } : result;
++}
++
+ /** A getter read whose runtime result can be undefined (an unchecked
+  * element read in its body, or in another member of its override family)
+  * although its declared type cannot. The checker's type for the read is
+--- packages/compiler/src/frontend/lowering/expressions/property-access.ts	2026-10-27 15:55:36.635294411 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/expressions/property-access.ts	2026-10-27 15:55:07.273281981 +0000
+@@ -3610,7 +3610,10 @@
+   // instance argument (e.g. Matrix4.makeTranslation). Preserve primitive
+   // missing-property semantics and dispatch class data through its native
+   // capsule instead of demanding a field shared by every union arm.
+-  if (isJsSourceFile(ts.getSourceFileOfNode(expr)) && lowerer.dynConvertible(value.type)) {
++  if (
++    (isJsSourceFile(ts.getSourceFileOfNode(expr)) || def.arms.some((arm) => arm.kind === "dyn")) &&
++    lowerer.dynConvertible(value.type)
++  ) {
+     return {
+       kind: "dynKeyGet",
+       value: lowerer.coerceToExpected(value, DYN),
+--- packages/compiler/src/frontend/lowering/expressions/binary.ts	2026-10-27 15:55:36.607908768 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/expressions/binary.ts	2026-10-27 15:55:07.235199168 +0000
+@@ -47,6 +47,7 @@
+   runtimeOptionalStorageOperand,
+   symbolFieldInfo,
+   typeofAnswer,
++  dynArmTypeofTest,
+ } from "../lower-exprs.js";
+ import { COMPOUND_ASSIGN_OPS, type CompoundOp, NARROW_FIRST } from "../surfaces.js";
+ import { lowerElementCompoundParts } from "./element-access.js";
+@@ -3171,8 +3172,32 @@
+     const unionId = value.type.unionId;
+     const def = lowerer.unions.get(unionId);
+     const answers = def?.arms.map(typeofAnswer);
+-    if (!def || !answers || !answers.every((s): s is string => s !== null)) continue;
++    const dynTags = def?.arms.flatMap((arm, i) => (arm.kind === "dyn" ? [i] : [])) ?? [];
++    if (!def || !answers || !answers.every((s, i) => s !== null || dynTags.includes(i))) continue;
+     const tags = answers.flatMap((s, i) => (s === b.text ? [i] : []));
++    if (dynTags.length > 0) {
++      // A structural (dyn) arm answers by its runtime kind: the typed arms
++      // that answer the literal, or the dyn arm holding such a value.
++      if (!isSafeToRepeat(value)) {
++        lowerer.unsupported(
++          "SC1090",
++          expr,
++          "'typeof' tests over a union with a structural arm need a plain read (bind the value to a const first)",
++        );
++      }
++      let positive: IrExpr | null = null;
++      const add = (test: IrExpr): void => {
++        positive =
++          positive === null
++            ? test
++            : { kind: "logical", op: "||", left: positive, right: test, type: BOOL, loc };
++      };
++      for (const t of tags)
++        add({ kind: "unionIsTag", unionId, tag: t, negated: false, value, type: BOOL, loc });
++      for (const t of dynTags) add(dynArmTypeofTest(unionId, t, def.arms[t]!, value, b.text, loc));
++      const result: IrExpr = positive ?? { kind: "boolLit", value: false, type: BOOL, loc };
++      return negated ? { kind: "unary", op: "!", operand: result, type: BOOL, loc } : result;
++    }
+     if (tags.length === 0 || tags.length === def.arms.length) {
+       if (!isSafeToRepeat(value)) {
+         lowerer.unsupported(
+--- packages/compiler/src/frontend/lowering/expressions/relational.ts	2026-10-27 15:55:36.624995547 +0000
++++ /tmp/ulv/mine/packages/compiler/src/frontend/lowering/expressions/relational.ts	2026-10-27 15:55:07.226199230 +0000
+@@ -831,6 +831,8 @@
+           arm.kind === "bool" ||
+           arm.kind === "bigint" ||
+           arm.kind === "symbol" ||
++          arm.kind === "func" ||
++          (arm.kind === "dyn" && dynInstanceOfOk(target)) ||
+           isUnitType(arm),
+       )
+     ) {
+@@ -842,6 +844,29 @@
+         const value: IrExpr = { kind: "varRef", localId: "value.0", type: left.type, loc };
+         const body: IrStmt[] = [];
+         arms.forEach((arm, tag) => {
++          if (arm.kind === "dyn") {
++            // The structural arm holds any value the typed arms do not: a
++            // class instance there answers through the capsule's class test.
++            body.push({
++              kind: "if",
++              cond: { kind: "unionIsTag", unionId, tag, negated: false, value, type: BOOL, loc },
++              then: [
++                {
++                  kind: "return",
++                  value: classInstanceOf(
++                    lowerer,
++                    { kind: "unionNarrow", unionId, tag, value, type: arm, loc },
++                    target,
++                    loc,
++                  ),
++                  loc,
++                },
++              ],
++              else_: null,
++              loc,
++            });
++            return;
++          }
+           if (arm.kind !== "object") return;
+           const lhsInfo = lowerer.classes.get(arm.className);
+           if (!lhsInfo)
+@@ -1820,6 +1845,12 @@
+   if (recv.type.kind === "union") {
+     const unionId = recv.type.unionId;
+     const arms = lowerer.unions.get(unionId)?.arms ?? [];
++    // A structural (dyn) arm decides by the value's own members: the union
++    // crosses into dyn and the keyed presence test answers.
++    if (arms.some((arm) => arm.kind === "dyn")) {
++      const boxed = lowerer.coerceToExpected(recv, DYN);
++      if (boxed.type.kind === "dyn") return { kind: "dynHasKey", key, value: boxed, type: BOOL, loc };
++    }
+     const answers: { tag: number; has: boolean | "slot"; arm: IrType }[] = [];
+     let staticAnswers = arms.length > 0;
+     for (const arm of arms) {
+@@ -2283,3 +2314,15 @@
+     );
+   });
+ }
++
++/** Whether `x instanceof target` can be answered on a checked-dynamic value
++ * (the same classes the plain dyn operand accepts). */
++function dynInstanceOfOk(target: ClassInfo): boolean {
++  return (
++    !target.def.runtime &&
++    !target.builtinError &&
++    !target.builtinEmitter &&
++    !target.builtinStream &&
++    !target.localClass
++  );
++}

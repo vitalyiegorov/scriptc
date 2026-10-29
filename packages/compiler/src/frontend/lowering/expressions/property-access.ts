@@ -372,6 +372,20 @@ export function lowerPropertyAccessExpr(
   expr: ts.PropertyAccessExpression,
   loc: SrcLoc,
 ): IrExpr {
+  if (ts.isIdentifier(expr.expression) && lowerer.dynBoundParams.size > 0) {
+    const bound = lowerer.resolveValueSymbol(expr.expression);
+    if (bound && lowerer.dynBoundParams.has(bound)) {
+      const recv = lowerer.lowerExpr(expr.expression);
+      if (recv.type.kind === "dyn")
+        return {
+          kind: "dynKeyGet",
+          key: { kind: "strLit", value: expr.name.text, type: STRING, loc: locOf(expr.name) },
+          value: recv,
+          type: DYN,
+          loc,
+        };
+    }
+  }
   // `value.#x` on a checked-dynamic value, or on a checked extraction of
   // one: the field of the brand-checked receiver (checkedPrivateValue).
   if (ts.isPrivateIdentifier(expr.name)) {

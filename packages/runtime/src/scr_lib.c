@@ -2112,7 +2112,9 @@ static void scr_detach_teardown(void) {
 extern int __llvm_profile_write_file(void) __attribute__((weak));
 /* The JS-level type feedback writer (scr_js_object.c), linked into
  * dynamic-tier programs. Written at the same moments as the profile above. */
+#ifndef SCR_LIB
 extern void scr_pgo_write_feedback(void) __attribute__((weak));
+#endif
 #endif
 
 void scr_process_exit(double code) {
@@ -2138,7 +2140,11 @@ void scr_process_exit(double code) {
    * expected). scr_init's flush-at-exit is also skipped — flush here. */
   fflush(stdout);
 #if defined(__linux__)
+#ifndef SCR_LIB
+  /* A library archive has no JS-level type feedback, and a weak reference to
+   * the writer would stay an undefined unprefixed runtime symbol in it. */
   if (scr_pgo_write_feedback != NULL) scr_pgo_write_feedback();
+#endif
   if (__llvm_profile_write_file != NULL) (void)__llvm_profile_write_file();
   scr_detach_teardown();
 #endif

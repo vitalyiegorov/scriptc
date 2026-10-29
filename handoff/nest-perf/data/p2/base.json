@@ -1,0 +1,192 @@
+{
+  "schema": "scriptc.nest-measure.v1",
+  "timestamp": "2026-10-28T08:02:37.663Z",
+  "args": {
+    "lane": "both",
+    "route": "/hello/native",
+    "node": false,
+    "rps": false
+  },
+  "attribution": {
+    "worktree": "/home/vitalii/scriptc/.claude/worktrees/agent-a1eb9c98e92d345f0",
+    "gitHead": "a27cd8ea6f6c34e93bb709c3682d8c4be2cb6853",
+    "gitBranch": "worktree-agent-a1eb9c98e92d345f0",
+    "gitDiffSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "compilerDistSha256": "869fecb747012964a04ee73bcc956b883336f99e7c53c16dae2dbfd84750d54c",
+    "runtimePackSha256": "665144c8fc80cf477f6ca30a351391f4704cb8bb6f102428d76e0c6641983e91",
+    "runtimePackDir": "/home/vitalii/scriptc/.claude/worktrees/agent-a1eb9c98e92d345f0/packages/runtime-linux-x64-gnu",
+    "runtimeSourceSha256": "0c36b9e82bcc302ad65e0adbcc67cce9af5d534a5b58f15f0714f8164b969122",
+    "appSourceSha256": "06f57c13334c9fc49ace141dcaa21a209c63b7fdc6a8d627a3e2ccb33f5769b8",
+    "nodeVersion": "v24.22.0",
+    "machine": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M, 24 threads"
+  },
+  "lanes": {
+    "default": {
+      "binarySizeBytes": 31575248,
+      "callgrind": {
+        "instrPerRequest": 256320,
+        "instrTotal": 76895860,
+        "warmupRequests": 100,
+        "measuredRequests": 300
+      },
+      "counters": {
+        "warmupRequests": 500,
+        "measuredRequests": 2000,
+        "allocations": 175,
+        "frees": 159,
+        "capsules": null,
+        "capsulesNote": "MISSING: no typed_ref_new/capsule counter in packages/runtime/src/scr_stats.h",
+        "cyclePasses": 2,
+        "raw": {
+          "dyn_alloc_object": 31,
+          "dyn_alloc_array": 31,
+          "dyn_alloc_closure": 76,
+          "dyn_alloc_box": 21,
+          "dyn_alloc_string": 16,
+          "dyn_alloc_fresh": 0,
+          "dyn_free": 159,
+          "dyn_rc_zero": 154,
+          "dyn_invoke": 41,
+          "prop_read_ic_hit": 2,
+          "prop_read_ic_miss": 2,
+          "js_load_probe": 139,
+          "js_load_probe_hit": 75,
+          "js_load_probe_miss": 0,
+          "js_store_probe": 67,
+          "js_store_probe_hit": 66,
+          "find_hint_hit": 61,
+          "find_linear": 49,
+          "find_hashed": 2,
+          "obj_put": 28,
+          "js_transition": 22,
+          "js_shape_new": 0,
+          "dyn_class_is_key": 0,
+          "dyn_construct": 12,
+          "cyc_pass": 2,
+          "cyc_candidates": 16.72,
+          "weak_disposed": 159,
+          "weak_filter_pass": 0,
+          "fiber_start": 8,
+          "promise_new": 11,
+          "sys_read": 1,
+          "sys_write": 0,
+          "sys_sendmsg": 1,
+          "cyc_freed": 42,
+          "yin_collect": 0,
+          "yin_entered": 0,
+          "yin_dead": 0,
+          "cand_closure": 1.072,
+          "cand_box": 1.008,
+          "cand_dyn": 14.544,
+          "cand_other": 0.096
+        }
+      }
+    },
+    "ts": {
+      "binarySizeBytes": 26512800,
+      "provenance": {
+        "packages": [
+          {
+            "name": "@nestjs/core",
+            "version": "12.2.0",
+            "repo": "https://github.com/nestjs/nest.git",
+            "commit": "af37111368de7fd2dfab0bdec2f530c7845510c2",
+            "files": 1
+          },
+          {
+            "name": "@nestjs/common",
+            "version": "12.2.0",
+            "repo": "https://github.com/nestjs/nest.git",
+            "commit": "af37111368de7fd2dfab0bdec2f530c7845510c2",
+            "files": 2
+          },
+          {
+            "name": "rxjs",
+            "version": "7.8.2",
+            "repo": "(installed package)",
+            "commit": "7.8.2",
+            "files": 6
+          }
+        ],
+        "notes": [
+          "reflect-metadata@0.2.2: fetch failed; published package resolution used",
+          "@nestjs/core: source from the package.json-declared gitHead af37111368 (no attestation); 203/204 published files have a TypeScript twin",
+          "iterare@1.2.1: declared source v1.2.1 covers 0/9 published files; not trusted; published package resolution used",
+          "@nestjs/platform-express: not installed under the entry's node_modules; published package resolution used",
+          "@nestjs/microservices: not installed under the entry's node_modules; published package resolution used",
+          "@nestjs/websockets: not installed under the entry's node_modules; published package resolution used",
+          "uid@2.0.2: source repository is not a github URL (lukeed/uid); published package resolution used",
+          "path-to-regexp@8.4.2: declared source v8.4.2 covers 0/1 published files; not trusted; published package resolution used",
+          "fast-safe-stringify@2.1.1: declared source v2.1.1 covers 0/4 published files; not trusted; published package resolution used",
+          "@nestjs/common: source from the package.json-declared gitHead af37111368 (no attestation); 202/202 published files have a TypeScript twin",
+          "class-validator: not installed under the entry's node_modules; published package resolution used",
+          "class-transformer: not installed under the entry's node_modules; published package resolution used",
+          "file-type@22.1.1: source repository is not a github URL (sindresorhus/file-type); published package resolution used"
+        ]
+      },
+      "callgrind": {
+        "instrPerRequest": 221899,
+        "instrTotal": 66569630,
+        "warmupRequests": 100,
+        "measuredRequests": 300
+      },
+      "counters": {
+        "warmupRequests": 500,
+        "measuredRequests": 2000,
+        "allocations": 167,
+        "frees": 155.014,
+        "capsules": null,
+        "capsulesNote": "MISSING: no typed_ref_new/capsule counter in packages/runtime/src/scr_stats.h",
+        "cyclePasses": 2.0005,
+        "raw": {
+          "dyn_alloc_object": 41,
+          "dyn_alloc_array": 8,
+          "dyn_alloc_closure": 64,
+          "dyn_alloc_box": 42,
+          "dyn_alloc_string": 12,
+          "dyn_alloc_fresh": 0,
+          "dyn_free": 155.014,
+          "dyn_rc_zero": 155.0095,
+          "dyn_invoke": 10,
+          "prop_read_ic_hit": 1,
+          "prop_read_ic_miss": 1,
+          "js_load_probe": 76,
+          "js_load_probe_hit": 44,
+          "js_load_probe_miss": 0,
+          "js_store_probe": 16,
+          "js_store_probe_hit": 15,
+          "find_hint_hit": 42,
+          "find_linear": 44,
+          "find_hashed": 2,
+          "obj_put": 30,
+          "js_transition": 4,
+          "js_shape_new": 0,
+          "dyn_class_is_key": 0,
+          "dyn_construct": 0,
+          "cyc_pass": 2.0005,
+          "cyc_candidates": 26.573,
+          "weak_disposed": 155.014,
+          "weak_filter_pass": 0,
+          "fiber_start": 8,
+          "promise_new": 11,
+          "sys_read": 1,
+          "sys_write": 0,
+          "sys_sendmsg": 1,
+          "cyc_freed": 53.0265,
+          "yin_collect": 0,
+          "yin_entered": 0,
+          "yin_dead": 0,
+          "cand_closure": 8.068,
+          "cand_box": 1.0085,
+          "cand_dyn": 3.3935,
+          "cand_other": 14.103
+        }
+      }
+    }
+  },
+  "caveats": [
+    "capsules (typed_ref_new) counter does not exist in scr_stats.h; reported as null",
+    "counters come from the SCRIPTC_RUNTIME_STATS=1 flavor (source-built runtime); callgrind and rps use the normal release pack"
+  ],
+  "table": "| metric | default | ts |\n|---|---:|---:|\n| instr/request (callgrind) | 256,320 | 221,899 |\n| requests warm-up+measured | 100+300 | 100+300 |\n| allocations/request | 175.00 | 167.00 |\n| frees/request | 159.00 | 155.01 |\n| capsules/request | missing | missing |\n| cycle passes/request | 2.000 | 2.001 |"
+}

@@ -14598,6 +14598,11 @@ export class Lowerer {
   readonly deferredGetterReads = new Set<IrExpr>();
   /** Classes that copy a computed object onto their instance (lower-classes.ts). */
   readonly instanceAssigningClasses = new Map<ts.ClassLikeDeclaration, boolean>();
+  /** Parameters of an override's `$dyn` entry (lower-classes.ts): declared at
+   * a subclass type but holding any inherited-typed value, so member reads on
+   * them are plain dynamic reads that answer undefined where the object has
+   * no such property. */
+  readonly dynBoundParams = new Set<ts.Symbol>();
   /** The Proxy dataflow answer for this pass (proxy-flow.ts). */
   proxyFlow: ProxyFlow | undefined;
 

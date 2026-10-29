@@ -11,7 +11,8 @@
   },
   "files": [
     "src",
-    "vendor"
+    "vendor",
+    "!vendor/.cache"
   ],
   "publishConfig": {
     "access": "public"

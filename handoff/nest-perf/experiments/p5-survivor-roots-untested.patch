@@ -1,0 +1,106 @@
+diff --git a/packages/runtime/src/scr_cycle.c b/packages/runtime/src/scr_cycle.c
+index d192c286f..404ad2fff 100644
+--- a/packages/runtime/src/scr_cycle.c
++++ b/packages/runtime/src/scr_cycle.c
+@@ -448,6 +448,10 @@ static SCR_TL bool scr_collecting = false;
+  * collects so the phases can walk them without re-filtering the buffers. */
+ #ifndef SCR_WORKERS
+ static SCR_TL ScrVec scr_cands;
++#if !defined(SCR_WORKERS) && !defined(SCR_YIN)
++static SCR_TL ScrVec scr_tenure_survivors;
++static SCR_TL bool scr_tenure_capture;
++#endif
+ #endif
+ 
+ /* Nursery survivors awaiting promotion (see scr_scan_black). */
+@@ -1230,12 +1234,22 @@ void scr_cyc_pub_fill(void) {
+  * from their buffers, as scr_cyc_pub_fill does for published ones. Nothing
+  * buffers or collects in between. */
+ #if !defined(SCR_WORKERS) && !defined(SCR_YIN)
+-void scr_cyc_each_candidate(void (*fn)(void *obj, void *ctx), void *ctx) {
+-  for (unsigned gen = 0; gen < SCR_CYC_NGENS; gen++) {
+-    ScrVec *b = &scr_roots[gen];
+-    for (size_t i = 0; i < b->n; i++)
+-      if (b->v[i]) fn(b->v[i], ctx);
+-  }
++/* Runs a full collection and hands `fn` each candidate that pass found
++ * alive. The objects are pinned during the walk: `fn` must leave their
++ * count to scr_cyc_tenure_unpin. */
++void scr_cyc_collect_survivors(void) {
++  scr_tenure_survivors.n = 0;
++  scr_tenure_capture = true;
++  scr_collect_cycles();
++  scr_tenure_capture = false;
++}
++
++size_t scr_cyc_survivor_count(void) { return scr_tenure_survivors.n; }
++void *scr_cyc_survivor(size_t i) { return scr_tenure_survivors.v[i]; }
++void scr_cyc_survivors_done(void) {
++  free(scr_tenure_survivors.v);
++  scr_tenure_survivors.v = NULL;
++  scr_tenure_survivors.n = scr_tenure_survivors.cap = 0;
+ }
+ 
+ size_t scr_cyc_drop_immortal(void) {
+@@ -2005,6 +2019,20 @@ static SCR_CYC_COMPACT size_t scr_cyc_settle(unsigned gen_limit, bool doomed) {
+     }
+   }
+ 
++#if !defined(SCR_WORKERS) && !defined(SCR_YIN)
++  /* Tenure's root set: the candidates a full pass found externally
++   * referenced. Pinned (+1) so a later pass of the same collection cannot
++   * free one; scr_cyc_tenure_unpin undoes the pin. */
++  if (scr_tenure_capture && gen_limit >= SCR_CYC_OLD) {
++    for (size_t i = 0; i < scr_cands.n; i++) {
++      void *obj = scr_cands.v[i];
++      if (scr_cyc_color(scr_cyc_hdr(obj)) == SCR_CYC_DOOMED || SCR_RC(obj) == SCR_RC_IMMORTAL) continue;
++      SCR_RC(obj) += 1;
++      scr_cyc_push(&scr_tenure_survivors, obj);
++    }
++  }
++#endif
++
+   /* Teardowns run after the full walk. They may release untraced children
+    * (plain RC) — which can re-buffer survivors for the NEXT pass — but
+    * never touch traced (white, already-accounted) edges.
+diff --git a/packages/runtime/src/scr_publish.c b/packages/runtime/src/scr_publish.c
+index 35e9ca38f..4c4bf490d 100644
+--- a/packages/runtime/src/scr_publish.c
++++ b/packages/runtime/src/scr_publish.c
+@@ -623,7 +623,6 @@ static void scr_tenure_mark(ScrTenureWalk *w, void *obj) {
+ }
+ 
+ static void scr_tenure_visit(void *child, void *ctx) { scr_tenure_mark(ctx, child); }
+-static void scr_tenure_root(void *obj, void *ctx) { scr_tenure_mark(ctx, obj); }
+ 
+ bool scr_tenure(void) {
+   static bool done;
+@@ -632,7 +631,11 @@ bool scr_tenure(void) {
+   const char *off = getenv("SCRIPTC_NO_TENURE");
+   if (off && *off && *off != '0') return false;
+   ScrTenureWalk w = {0};
+-  scr_cyc_each_candidate(scr_tenure_root, &w);
++  scr_cyc_collect_survivors();
++  size_t nsurv = scr_cyc_survivor_count();
++  for (size_t i = 0; i < nsurv; i++) SCR_RC_COUNT(scr_cyc_survivor(i)) -= 1; /* the pin */
++  for (size_t i = 0; i < nsurv; i++) scr_tenure_mark(&w, scr_cyc_survivor(i));
++  scr_cyc_survivors_done();
+   while (w.n > 0) {
+     void *obj = w.v[--w.n];
+     scr_cyc_type(scr_cyc_hdr(obj))->trace(obj, scr_tenure_visit, &w);
+diff --git a/packages/runtime/src/scr_rc.h b/packages/runtime/src/scr_rc.h
+index ac90fdd03..12e88640a 100644
+--- a/packages/runtime/src/scr_rc.h
++++ b/packages/runtime/src/scr_rc.h
+@@ -631,7 +631,10 @@ extern bool scr_tenure_done;
+ static inline bool scr_rc_tenured(void *obj) {
+   return scr_tenure_done && scr_cyc_color(scr_cyc_hdr(obj)) == SCR_CYC_TENURED;
+ }
+-void scr_cyc_each_candidate(void (*fn)(void *obj, void *ctx), void *ctx);
++void scr_cyc_collect_survivors(void);
++size_t scr_cyc_survivor_count(void);
++void *scr_cyc_survivor(size_t i);
++void scr_cyc_survivors_done(void);
+ size_t scr_cyc_drop_immortal(void);
+ /* Marks the long-lived heap as tenured (immortal); false when it declined. */
+ bool scr_tenure(void);

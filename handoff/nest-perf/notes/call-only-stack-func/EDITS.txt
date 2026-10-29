@@ -1,0 +1,8 @@
+Reverted hooks (measured +0.79% only, below the 1% bar). Re-apply by hand:
+1. emitter.ts: import StackFuncNodes; field `readonly stackFuncNodes: StackFuncNodes;`;
+   `this.stackFuncNodes = new StackFuncNodes(this.fnByName);` after stackCallbacks construction.
+2. emit-function.ts: `emitter.stackFuncNodes.reset(emitter.streamingSplitsEnabled);` after stackCallbacks.reset.
+3. expr-calls.ts, case "call": at the start of the args map, `const f = host.stackFuncNodes.emit(host, e.callee, index, a); if (f) return f;`
+   case "callValue": in the known+direct (guarded) path, build stack nodes for call-only args before the branch
+   (stackNodes map) and, in ownedArgs() (fallback block), re-emit the heap value (host.emitExpr + host.toFrame).
+4. scr_dyn.h: _Static_assert on sizeof(ScrDyn) <= 160 and fn offsets (16/24/32/40/48).

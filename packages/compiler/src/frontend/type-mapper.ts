@@ -2636,8 +2636,12 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     // hook owns the instance table (monomorphization by flow).
     if (classDecl.typeParameters?.nodes) {
       const instance =
-        ctx.genericClassInstance?.(classDecl, widened, (argument) => mapType(argument, ctx)) ??
-        null;
+        ctx.genericClassInstance?.(
+          classDecl,
+          widened,
+          (argument) => mapType(argument, ctx),
+          false,
+        ) ?? null;
       // Before the generic declaration's collection turn, the hook can only
       // return its family shell; after collection the same checker type names
       // a concrete registered instance. Never memoize either phase's answer.

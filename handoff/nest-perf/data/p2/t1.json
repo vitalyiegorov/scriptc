@@ -1,0 +1,91 @@
+{
+  "schema": "scriptc.nest-measure.v1",
+  "timestamp": "2026-10-28T09:10:10.063Z",
+  "args": {
+    "lane": "default",
+    "route": "/hello/native",
+    "node": false,
+    "rps": false
+  },
+  "attribution": {
+    "worktree": "/home/vitalii/scriptc/.claude/worktrees/agent-a1eb9c98e92d345f0",
+    "gitHead": "a27cd8ea6f6c34e93bb709c3682d8c4be2cb6853",
+    "gitBranch": "worktree-agent-a1eb9c98e92d345f0",
+    "gitDiffSha256": "fb2f86efbce911abfdaacdc8f6739d19896d3f0ab08103abdd617debd48ce6e3",
+    "compilerDistSha256": "869fecb747012964a04ee73bcc956b883336f99e7c53c16dae2dbfd84750d54c",
+    "runtimePackSha256": "665144c8fc80cf477f6ca30a351391f4704cb8bb6f102428d76e0c6641983e91",
+    "runtimePackDir": "/home/vitalii/scriptc/.claude/worktrees/agent-a1eb9c98e92d345f0/packages/runtime-linux-x64-gnu",
+    "runtimeSourceSha256": "3e3e86d2e664a1f10d8430426786f82891501e4eb6d9ef34d5a9df48af47006d",
+    "appSourceSha256": "06f57c13334c9fc49ace141dcaa21a209c63b7fdc6a8d627a3e2ccb33f5769b8",
+    "nodeVersion": "v24.22.0",
+    "machine": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M, 24 threads"
+  },
+  "lanes": {
+    "default": {
+      "binarySizeBytes": 31495672,
+      "callgrind": {
+        "instrPerRequest": 273317,
+        "instrTotal": 27331652,
+        "warmupRequests": 50,
+        "measuredRequests": 100
+      },
+      "counters": {
+        "warmupRequests": 500,
+        "measuredRequests": 2000,
+        "allocations": 175,
+        "frees": 159,
+        "capsules": null,
+        "capsulesNote": "MISSING: no typed_ref_new/capsule counter in packages/runtime/src/scr_stats.h",
+        "cyclePasses": 2,
+        "raw": {
+          "dyn_alloc_object": 31,
+          "dyn_alloc_array": 31,
+          "dyn_alloc_closure": 76,
+          "dyn_alloc_box": 21,
+          "dyn_alloc_string": 16,
+          "dyn_alloc_fresh": 0,
+          "dyn_free": 159,
+          "dyn_rc_zero": 154,
+          "dyn_invoke": 41,
+          "prop_read_ic_hit": 2,
+          "prop_read_ic_miss": 2,
+          "js_load_probe": 139,
+          "js_load_probe_hit": 75,
+          "js_load_probe_miss": 0,
+          "js_store_probe": 67,
+          "js_store_probe_hit": 66,
+          "find_hint_hit": 61,
+          "find_linear": 49,
+          "find_hashed": 2,
+          "obj_put": 28,
+          "js_transition": 22,
+          "js_shape_new": 0,
+          "dyn_class_is_key": 0,
+          "dyn_construct": 12,
+          "cyc_pass": 2,
+          "cyc_candidates": 2.152,
+          "weak_disposed": 159,
+          "weak_filter_pass": 0,
+          "fiber_start": 8,
+          "promise_new": 11,
+          "sys_read": 1,
+          "sys_write": 0,
+          "sys_sendmsg": 1,
+          "cyc_freed": 42,
+          "yin_collect": 0,
+          "yin_entered": 0,
+          "yin_dead": 0,
+          "cand_closure": 1.072,
+          "cand_box": 1.008,
+          "cand_dyn": 0.064,
+          "cand_other": 0.008
+        }
+      }
+    }
+  },
+  "caveats": [
+    "capsules (typed_ref_new) counter does not exist in scr_stats.h; reported as null",
+    "counters come from the SCRIPTC_RUNTIME_STATS=1 flavor (source-built runtime); callgrind and rps use the normal release pack"
+  ],
+  "table": "| metric | default |\n|---|---:|\n| instr/request (callgrind) | 273,317 |\n| requests warm-up+measured | 50+100 |\n| allocations/request | 175.00 |\n| frees/request | 159.00 |\n| capsules/request | missing |\n| cycle passes/request | 2.000 |"
+}

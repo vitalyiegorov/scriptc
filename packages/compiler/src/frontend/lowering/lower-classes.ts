@@ -9452,6 +9452,46 @@ function lowerClassMethodMemberInner(
     const own = lowerClassMethodBody(lowerer, info, fnLike, `%${className}.${mName}$own`, ownSig);
     if (!own) return null;
     lowerer.liftedFns.push(own);
+    // A parameter the override narrows to a subclass cannot assume the
+    // inherited slot's argument is that subclass (TypeScript's bivariant
+    // method parameters): a base-class value arrives through the base
+    // signature too. The slot tests each narrowed argument; when one is not
+    // an instance, the body runs again as `%C.m$dyn` with those parameters
+    // taken as dynamic values, whose reads go to the actual object's own
+    // properties (undefined where it has none), as in JS.
+    const narrowedAt = (i: number): boolean => {
+      const ownType = adapter.params[i]!.type;
+      const inherited = sig.params[i]!.type;
+      return (
+        ownType.kind === "object" &&
+        inherited.kind === "object" &&
+        !typeEquals(ownType, inherited) &&
+        lowerer.isSubclassOf(ownType.className, inherited.className)
+      );
+    };
+    const narrowed = adapter.params.map((_, i) => i).filter(narrowedAt);
+    let dynName: string | null = null;
+    if (narrowed.length > 0) {
+      const dynSig: ClassMethodSignature = {
+        ...ownSig,
+        params: adapter.params.map((shape, i) => (narrowedAt(i) ? { ...shape, type: DYN } : shape)),
+      };
+      const bound = narrowed
+        .map((i) => fnLike.parameters.nodes[i]?.name)
+        .filter((name): name is ts.Identifier => name !== undefined && ts.isIdentifier(name))
+        .map((name) => lowerer.checker.getSymbolAtLocation(name))
+        .filter((symbol): symbol is ts.Symbol => symbol !== undefined);
+      for (const symbol of bound) lowerer.dynBoundParams.add(symbol);
+      let dyn: IrFunction | null;
+      try {
+        dyn = lowerClassMethodBody(lowerer, info, fnLike, `%${className}.${mName}$dyn`, dynSig);
+      } finally {
+        for (const symbol of bound) lowerer.dynBoundParams.delete(symbol);
+      }
+      if (!dyn) return null;
+      lowerer.liftedFns.push(dyn);
+      dynName = dyn.name;
+    }
     const loc = locOf(fnLike);
     const params: IrParam[] = [
       { localId: "this.0", name: "this", type: thisType },
@@ -9460,45 +9500,65 @@ function lowerClassMethodMemberInner(
     const fnCtx = newFnCtx(false, null, null, sig.ret);
     lowerer.fnStack.push(fnCtx);
     try {
-      const call: IrExpr = {
+      const makeCall = (callee: string, dynamic: boolean): IrExpr => ({
         kind: "call",
-        callee: own.name,
+        callee,
         args: params.map((p, i): IrExpr => {
           const ref: IrExpr = { kind: "varRef", localId: p.localId, type: p.type, loc };
           // `this` passes through; each inherited argument converts into
           // the override's declared parameter (checked where it narrows).
           if (i === 0) return ref;
-          const own = adapter.params[i - 1]!.type;
-          // A subclass-typed override parameter takes a verified downcast.
-          if (
-            own.kind === "object" &&
-            p.type.kind === "object" &&
-            lowerer.isSubclassOf(own.className, p.type.className)
-          )
-            return { kind: "downcast", value: ref, type: own, loc };
-          return lowerer.coerceInto(fnLike.name, ref, own);
+          if (narrowedAt(i - 1))
+            return dynamic
+              ? lowerer.coerceInto(fnLike.name, ref, DYN)
+              : { kind: "downcast", value: ref, type: adapter.params[i - 1]!.type, loc };
+          return lowerer.coerceInto(fnLike.name, ref, adapter.params[i - 1]!.type);
         }),
         type: adapter.ret,
         loc,
-      };
+      });
+      const guard = narrowed.reduce<IrExpr | null>((acc, i) => {
+        const test: IrExpr = {
+          kind: "instanceOf",
+          value: { kind: "varRef", localId: `p.${i}`, type: sig.params[i]!.type, loc },
+          className: (adapter.params[i]!.type as { className: string }).className,
+          type: BOOL,
+          loc,
+        };
+        return acc ? { kind: "logical", op: "&&", left: acc, right: test, type: BOOL, loc } : test;
+      }, null);
       // A void slot discards the override's result after running it. A
       // toString slot hands on what every ToString consumer of the result
       // makes of it (`String(err)`, templates): undefined reads
       // "undefined", as in Node. Other slots check the result into the
       // inherited type.
-      const result = (): IrExpr =>
-        mName === "toString" && sig.ret.kind === "string"
-          ? call.type.kind === "dyn"
-            ? { kind: "libCall", fn: "dyn.stringConstructor", args: [call], type: STRING, loc }
-            : lowerer.ensureString(call, fnLike.name)
-          : lowerer.coerceInto(fnLike.name, call, sig.ret);
+      const finish = (call: IrExpr): IrStmt[] => {
+        if (sig.ret.kind === "void")
+          return [
+            { kind: "exprStmt", expr: call, loc },
+            { kind: "return", value: null, loc },
+          ];
+        const value: IrExpr =
+          mName === "toString" && sig.ret.kind === "string"
+            ? call.type.kind === "dyn"
+              ? { kind: "libCall", fn: "dyn.stringConstructor", args: [call], type: STRING, loc }
+              : lowerer.ensureString(call, fnLike.name)
+            : lowerer.coerceInto(fnLike.name, call, sig.ret);
+        return [{ kind: "return", value, loc }];
+      };
       const body: IrStmt[] =
-        sig.ret.kind === "void"
+        guard && dynName
           ? [
-              { kind: "exprStmt", expr: call, loc },
-              { kind: "return", value: null, loc },
+              {
+                kind: "if",
+                cond: guard,
+                then: finish(makeCall(own.name, false)),
+                else_: null,
+                loc,
+              },
+              ...finish(makeCall(dynName, true)),
             ]
-          : [{ kind: "return", value: result(), loc }];
+          : finish(makeCall(own.name, false));
       return {
         name: `%${className}.${mName}`,
         params,

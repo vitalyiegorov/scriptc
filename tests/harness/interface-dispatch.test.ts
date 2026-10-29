@@ -139,7 +139,9 @@ console.log(size(new Box()));
 }
 console.log(sum([circle, new Rect(1)]));`),
     );
-    expect(bodies(lent, "sc_bf_sum")).not.toContain("@scr_dyn_retain_v");
+    // Release builds inline the dynamic retain (sc_rc_retain_dyn); others call the runtime's.
+    const retains = /@(?:scr_dyn_retain_v|sc_rc_retain_dyn)\b/;
+    expect(bodies(lent, "sc_bf_sum")).not.toMatch(retains);
     // A method that can empty the array keeps the owned element read.
     const owned = await emittedLlvm(
       "owned",
@@ -158,7 +160,7 @@ function sum(list: Shape[]): number {
 }
 console.log(sum(kept));`),
     );
-    expect(bodies(owned, "sc_bf_sum")).toContain("@scr_dyn_retain_v");
+    expect(bodies(owned, "sc_bf_sum")).toMatch(retains);
   });
 
   test("a method an instance can replace keeps the checked dynamic call", async () => {
